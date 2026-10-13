@@ -1,0 +1,123 @@
+# -*- mode: python ; coding: utf-8 -*-
+"""
+PyInstaller spec file for Flow口播工具
+Generates a one-folder distributable with all dependencies.
+"""
+
+import os, sys
+
+block_cipher = None
+project_dir = os.path.abspath('.')
+
+a = Analysis(
+    ['main.py'],
+    pathex=[project_dir],
+    binaries=[],
+    datas=[
+        ('logo.ico', '.'),
+        ('camera_motions.json', '.'),
+        ('prompt_templates.json', '.'),
+        ('plugin_script_adapter.js', '.'),
+        ('FLOW_PLUGIN_OPEN_API.md', '.'),
+        ('README.md', '.'),
+        ('LICENSE', '.'),
+    ],
+    hiddenimports=[
+        'PyQt6',
+        'PyQt6.QtWidgets',
+        'PyQt6.QtCore',
+        'PyQt6.QtGui',
+        'PyQt6.sip',
+        'PIL',
+        'PIL.Image',
+        'bs4',
+        'gdown',
+        'requests',
+        'websockets',
+        'websockets.server',
+        'websockets.legacy',
+        'websockets.legacy.server',
+        'websockets.asyncio',
+        'asyncio',
+        'json',
+        'pathlib',
+        'uuid',
+        'base64',
+        'logging',
+        'traceback',
+        'ctypes',
+        'models',
+        'models.config_manager',
+        'models.project_model',
+        'models.storage_manager',
+        'models.template_manager',
+        'services',
+        'services.downloader',
+        'services.browser_closer',
+        'services.pipeline_scheduler',
+        'services.plugin_server',
+        'services.speech_extractor',
+        'services.text_processor',
+        'services.video_checker',
+        'views',
+        'views.main_window',
+        'views.account_monitor_widget',
+        'views.batch_generate_tab',
+        'views.pipeline_tab_widget',
+        'views.project_detail_widget',
+        'views.import_dialog',
+        'views.settings_dialog',
+        'views.template_config_dialog',
+        'views.video_check_dialog',
+        'views.video_compare_widget',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        'tkinter',
+        'matplotlib',
+        'numpy',
+        'scipy',
+        'pandas',
+        'IPython',
+        'notebook',
+        'pytest',
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='FlowCue',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,         # No console window (GUI app)
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon='logo.ico',       # Application icon
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='FlowCue',
+)

@@ -1,0 +1,132 @@
+# -*- coding: utf-8 -*-
+import sys
+import os
+import traceback
+
+# Force PyInstaller static analysis to bundle third-party packages
+import PIL
+import bs4
+import gdown
+import requests
+
+def get_workspace_dir():
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        if exe_dir.endswith("Contents/MacOS"):
+            return os.path.dirname(os.path.dirname(os.path.dirname(exe_dir)))
+        return exe_dir
+    return os.path.dirname(os.path.abspath(__file__))
+
+# 用户设置文件（模板配置 / 规则设置 / 账号备注等）
+USER_SETTINGS_FILES = [
+    ".app_config.json",        # 规则设置、存储路径、API Key 等
+    "prompt_templates.json",   # 模板配置
+    "camera_motions.json",     # 运镜模板
+    "account_aliases.json",    # 账号备注
+    "account_monitor.json",    # 积分阈值
+]
+
+def get_data_dir():
+    """
+    用户设置的固定保存目录：%APPDATA%\\Flow口播工具
+    与程序安装目录分离，重新安装 / 覆盖 / 卸载程序都不会丢失设置。
+    首次使用时自动把程序目录中已有的设置迁移过来（已存在的文件不会被覆盖）。
+    """
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    data_dir = os.path.join(base, "Flow口播工具")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        import shutil
+        old_dir = get_workspace_dir()
+        for name in USER_SETTINGS_FILES:
+            dst = os.path.join(data_dir, name)
+            src = os.path.join(old_dir, name)
+            if not os.path.exists(dst) and os.path.isfile(src):
+                shutil.copy2(src, dst)
+        return data_dir
+    except Exception as e:
+        log_error(f"无法使用用户设置目录 {data_dir}，回退到程序目录: {e}")
+        return get_workspace_dir()
+
+def log_error(err_str):
+    try:
+        ws = get_workspace_dir()
+        log_path = os.path.join(ws, "error.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("=" * 50 + "\n")
+            f.write(err_str + "\n\n")
+    except Exception:
+        pass
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    err_str = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    log_error(err_str)
+    try:
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+        if not QApplication.instance():
+            _app = QApplication(sys.argv)
+        QMessageBox.critical(
+            None,
+            "程序运行异常 (Error)",
+            f"应用发生异常：\n\n{exc_value}\n\n详细日志已保存至 error.log"
+        )
+    except Exception:
+        pass
+
+sys.excepthook = handle_exception
+
+def qt_message_handler(mode, context, message):
+    if "Point size <= 0" in message:
+        return
+    if sys.stderr is not None:
+        try:
+            sys.stderr.write(f"{message}\n")
+        except Exception:
+            pass
+
+def main():
+    try:
+        # Set Windows taskbar icon (AppUserModelID) so the taskbar shows our custom icon
+        # instead of the default Python icon
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("flow.oral.video.tool")
+        except Exception:
+            pass
+
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import qInstallMessageHandler
+        from PyQt6.QtGui import QIcon
+        from views.main_window import MainWindow
+
+        qInstallMessageHandler(qt_message_handler)
+        app = QApplication(sys.argv)
+        
+        # Set application icon from logo.ico
+        workspace_dir = get_workspace_dir()
+        icon_path = None
+        # 打包后 logo.ico 在 _internal 目录中 (PyInstaller datas)
+        candidates = [
+            os.path.join(workspace_dir, "logo.ico"),
+            os.path.join(workspace_dir, "_internal", "logo.ico"),
+        ]
+        if getattr(sys, '_MEIPASS', None):
+            candidates.insert(0, os.path.join(sys._MEIPASS, "logo.ico"))
+        for p in candidates:
+            if os.path.exists(p):
+                icon_path = p
+                break
+        if icon_path:
+            app_icon = QIcon(icon_path)
+            app.setWindowIcon(app_icon)
+        
+        window = MainWindow(get_data_dir())
+        window.show()
+        
+        sys.exit(app.exec())
+    except Exception as e:
+        handle_exception(type(e), e, e.__traceback__)
+
+if __name__ == "__main__":
+    main()
+
