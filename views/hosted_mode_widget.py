@@ -8,7 +8,7 @@
 步骤 2：按浏览器分组上传图片（默认每组 5 个浏览器），一组全部完成或超时后再进入下一组；
         精确记录每张失败的图片，支持「重新上传失败图片」
 步骤 3：把每批任务 JSON 直接发送给对应插件并自动开始生成，实时监控每个任务成功/失败，
-        成功的视频自动从 Chrome 下载目录归位到项目 downloads/videos
+        视频保存在 Flow 临时下载目录，后续由用户在「批量检查视频」中核对并手动完成归位
 """
 import json
 import time
@@ -992,49 +992,8 @@ class HostedModeWidget(QWidget):
         b["done_paths"].add(dl_path)
         b["fail_msgs"].pop(dl_path, None)
         b["ok"] = len(b["done_paths"])
-        self._archive_video(b, dl_path, attempt=0)
-
-    def _download_roots(self):
-        roots = []
-        try:
-            bp = self.mw.storage_manager.get_base_path()
-            if bp:
-                roots.append(Path(bp))
-        except Exception:
-            pass
-        roots.append(Path.home() / "Downloads")
-        return roots
-
-    def _archive_video(self, b, dl_path, attempt):
-        """把 Chrome 下载目录里的 Flow/<项目文件夹>/<NN>.mp4 移动到项目 downloads/videos/<NN>.mp4"""
-        target = Path(dl_path)
-        if target.exists() and target.stat().st_size > 1024:
-            self._after_project_change(b["project_path"])
-            return
-        parts = [p for p in Path(dl_path).parts]
-        folder = ""
-        if "downloads" in parts:
-            i = parts.index("downloads")
-            if i > 0:
-                folder = parts[i - 1]
-        candidates = []
-        for root in self._download_roots():
-            if folder:
-                candidates.append(root / "Flow" / folder / target.name)
-        src = next((p for p in candidates if p.exists() and p.is_file() and p.stat().st_size > 1024), None)
-        if src:
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(target))
-                self._log(f"   📁 已归位 {folder}/{target.name}")
-                self._after_project_change(b["project_path"])
-                return
-            except Exception as e:
-                self._log(f"   ⚠️ 归位失败 {target.name}: {e}")
-        if attempt < 4:
-            QTimer.singleShot([1500, 4000, 10000, 20000][attempt], lambda: self._archive_video(b, dl_path, attempt + 1))
-        else:
-            self._log(f"   ⚠️ 未在下载目录找到 {folder}/{target.name}，请稍后在项目中手动「归位」")
+        name = Path(dl_path).name
+        self._log(f"   🎬 视频已下载: {name}（保留在 Flow 目录，待后续批量检查归位）")
 
     def _after_project_change(self, project_path, reload_list=False):
         try:
