@@ -3074,9 +3074,32 @@ class BatchExportDialog(QDialog):
         quick_bar = QHBoxLayout()
         quick_bar.setSpacing(8)
         
-        lbl_quick_hint = QLabel("💡 插件表格对接：")
+        lbl_quick_hint = QLabel("💡 快捷导出：")
         lbl_quick_hint.setStyleSheet("font-size: 12px; color: #78350F; font-weight: bold;")
         quick_bar.addWidget(lbl_quick_hint)
+
+        btn_copy_all_vids = QPushButton(f"🎬 复制全部任务 JSON (Vids 无积分限制 · 共 {total_segments} 条)")
+        btn_copy_all_vids.setToolTip(
+            f"Google Vids 没有 50 积分限制！\n"
+            f"点击一键复制全部 {total_segments} 条待生成分镜的完整 JSON（自动保持原始时长不降级）。\n"
+            "复制后切换到 Google Vids 页面点击悬浮胶囊的【🎬】按钮即可自动逐个上传图片、生成并下载视频！"
+        )
+        btn_copy_all_vids.setStyleSheet("""
+            QPushButton {
+                background-color: #2563EB;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+        """)
+        btn_copy_all_vids.clicked.connect(lambda: self.copy_all_vids_json(btn_copy_all_vids))
+        quick_bar.addWidget(btn_copy_all_vids)
         
         btn_copy_all_end = QPushButton(f"🎬 复制全部待生成尾帧列 (共 {total_segments} 行)")
         btn_copy_all_end.setToolTip(
@@ -3347,6 +3370,47 @@ class BatchExportDialog(QDialog):
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "错误", f"复制TSV表格失败: {e}")
+
+    def copy_all_vids_json(self, button):
+        """Copies all tasks across all batches as a single chronological JSON array for Google Vids (no 50-credit limit)."""
+        import json
+        all_tasks = [task for batch in self.batches for task in batch]
+        all_tasks.sort(key=lambda t: t.get("_original_index", 0))
+
+        cleaned_all = []
+        for item in all_tasks:
+            c_item = {k: v for k, v in item.items() if not k.startswith("_")}
+            if "_raw_duration" in item:
+                c_item["duration"] = item["_raw_duration"]
+            cleaned_all.append(c_item)
+
+        try:
+            json_str = json.dumps(cleaned_all, indent=2, ensure_ascii=False)
+            from PyQt6.QtGui import QGuiApplication, QCursor
+            from PyQt6.QtWidgets import QToolTip
+            clipboard = QGuiApplication.clipboard()
+            clipboard.setText(json_str)
+
+            button.setText(f"✓ 已复制全部 {len(cleaned_all)} 条 (Vids)")
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #10B981;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 6px 12px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+            """)
+            msg = (
+                f"✓ 已复制全部 {len(cleaned_all)} 条待生成任务 JSON（无 50 积分限制）！\n"
+                "现在只需切换到 Google Vids 页面，点击插件悬浮胶囊的【🎬】按钮即可自动逐条上传图片、生成并下载视频！"
+            )
+            QToolTip.showText(QCursor.pos(), msg, button)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "错误", f"复制全部 Vids 任务 JSON 失败: {e}")
 
     def copy_all_end_frames(self, button):
         all_tasks = [task for batch in self.batches for task in batch]

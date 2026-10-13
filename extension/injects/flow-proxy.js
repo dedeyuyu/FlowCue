@@ -24,6 +24,12 @@
     }
   }
 
+  // Google Vids (docs.google.com) 使用 DOM 级自动化且包含 Object.prototype SEAL 检测，无需注入 Flow 专属的网络/原型钩子
+  if (location.hostname === "docs.google.com") {
+    console.log("[FlowProxy] 检测到 Google Vids 页面，跳过 Flow 专属原型钩子，交由 ui.js Vids 引擎接管。");
+    return;
+  }
+
   // ----------------------------------------------------
   // 1. Hook Object.prototype.hasOwnProperty
   // ----------------------------------------------------

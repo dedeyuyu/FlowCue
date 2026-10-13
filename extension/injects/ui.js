@@ -163,9 +163,18 @@
     retryCount: 0          // 单个任务失败刷新重试计数
   };
 
-  // 生成缓存 KEY 规则：工程ID + 合集ID
+  // 检测当前是否为 Google Vids 页面
+  function isVidsPage() {
+    return location.hostname === "docs.google.com" && location.pathname.includes("/videos/");
+  }
+
+  // 生成缓存 KEY 规则：工程ID + 合集ID (或 Vids 文档 ID)
   function getStorageKey() {
     const url = location.href;
+    if (isVidsPage()) {
+      const vidsMatch = url.match(/\/videos\/d\/([^/]+)/);
+      return vidsMatch ? `vids_${vidsMatch[1]}` : "default-vids-project";
+    }
     const projectMatch = url.match(/\/project\/([^/]+)/);
     const collectionMatch = url.match(/\/collection\/([^/]+)/);
     const pId = projectMatch ? projectMatch[1] : "";
@@ -249,8 +258,8 @@
   function createUI() {
     const targetParent = document.body || document.documentElement;
     let existingFab = document.getElementById("flow-batch-fab");
-    if (existingFab && !existingFab.querySelector("#flow-batch-fab-quick")) {
-      // 旧版单按钮（或独立世界兜底按钮）→ 替换为双按钮框
+    if (existingFab && (!existingFab.querySelector("#flow-batch-fab-quick") || !existingFab.querySelector("#flow-batch-fab-vids"))) {
+      // 旧版单/双按钮（或独立世界兜底按钮）→ 替换为三按钮胶囊框 (⚡ + 🎬 Vids + ➕)
       existingFab.remove();
       existingFab = null;
     }
@@ -262,22 +271,24 @@
     console.log("[FlowUI] 正在创建控制台 UI 界面...", location.href);
 
     if (!existingFab) {
-      // 双按钮悬浮框：上 ⚡ 一键导入剪贴板并开始；下 + 打开控制面板
+      // 三按钮悬浮胶囊框：上 ⚡ 一键导入剪贴板并开始；中 🎬 Google Vids 逐个生成模式；下 + 打开控制面板
+      // 在 Vids 页面上，右侧是 AI 视频片段侧边栏，因此自动将悬浮胶囊框置于页面左侧，绝不遮挡右侧生成栏！
+      const horizontalPos = isVidsPage() ? "left: 24px !important;" : "right: 24px !important;";
       fabEl = document.createElement("div");
       fabEl.id = "flow-batch-fab";
-      fabEl.style.cssText = "position: fixed !important; bottom: 120px !important; right: 24px !important; width: 56px !important; height: 116px !important; border-radius: 28px !important; background: linear-gradient(180deg, #8b5cf6, #3b82f6) !important; box-shadow: 0 8px 32px rgba(139, 92, 246, 0.6), inset 0 2px 4px rgba(255, 255, 255, 0.3) !important; display: flex !important; flex-direction: column !important; align-items: stretch !important; justify-content: stretch !important; cursor: default !important; z-index: 2147483647 !important; border: 2px solid rgba(255, 255, 255, 0.2) !important; box-sizing: border-box !important; overflow: hidden !important; padding: 0 !important; transform: none !important;";
+      fabEl.style.cssText = `position: fixed !important; bottom: 120px !important; ${horizontalPos} width: 56px !important; height: 168px !important; border-radius: 28px !important; background: linear-gradient(180deg, #8b5cf6, #3b82f6) !important; box-shadow: 0 8px 32px rgba(139, 92, 246, 0.6), inset 0 2px 4px rgba(255, 255, 255, 0.3) !important; display: flex !important; flex-direction: column !important; align-items: stretch !important; justify-content: stretch !important; cursor: default !important; z-index: 2147483647 !important; border: 2px solid rgba(255, 255, 255, 0.2) !important; box-sizing: border-box !important; overflow: hidden !important; padding: 0 !important; transform: none !important;`;
 
       const makeFabBtn = (title, pathD, color, viewBox) => {
         const btn = document.createElement("div");
         btn.title = title;
-        btn.style.cssText = "flex: 1 1 50% !important; display: flex !important; align-items: center !important; justify-content: center !important; cursor: pointer !important; transition: background 0.15s ease !important; background: transparent !important;";
+        btn.style.cssText = "flex: 1 1 33.33% !important; display: flex !important; align-items: center !important; justify-content: center !important; cursor: pointer !important; transition: background 0.15s ease !important; background: transparent !important;";
         btn.addEventListener("mouseenter", () => btn.style.setProperty("background", "rgba(255,255,255,0.18)", "important"));
         btn.addEventListener("mouseleave", () => btn.style.setProperty("background", "transparent", "important"));
         const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.setAttribute("viewBox", viewBox || "0 0 24 24");
-        svg.setAttribute("width", "26");
-        svg.setAttribute("height", "26");
-        svg.style.cssText = `width: 26px !important; height: 26px !important; fill: ${color} !important; pointer-events: none !important; transform: none !important;`;
+        svg.setAttribute("width", "24");
+        svg.setAttribute("height", "24");
+        svg.style.cssText = `width: 24px !important; height: 24px !important; fill: ${color} !important; pointer-events: none !important; transform: none !important;`;
         const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
         path.setAttribute("d", pathD);
         path.setAttribute("fill", color);
@@ -286,25 +297,35 @@
         return btn;
       };
 
+      const makeDivider = () => {
+        const div = document.createElement("div");
+        div.style.cssText = "height: 1px !important; margin: 0 10px !important; background: rgba(255,255,255,0.35) !important; flex: 0 0 1px !important;";
+        return div;
+      };
+
       const quickBtn = makeFabBtn("⚡ 一键执行：读取剪贴板 JSON → 导入 → 开始批量生成",
         "M13 2L4.5 13.5H11L10 22L19.5 10.5H13L13 2Z", "#FDE047");
       quickBtn.id = "flow-batch-fab-quick";
       quickBtn.addEventListener("click", (e) => { e.stopPropagation(); quickRunFromClipboard(); });
 
-      const divider = document.createElement("div");
-      divider.style.cssText = "height: 1px !important; margin: 0 10px !important; background: rgba(255,255,255,0.35) !important; flex: 0 0 1px !important;";
+      const vidsBtn = makeFabBtn("🎬 Vids 专属一键生成：自动打开 AI 视频侧边栏 → 切换「添加动画」→ 逐个任务上传图片、生成并下载视频 (无 50 积分限制)",
+        "M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4zm-6.75 11.25L10 18l-1.25-2.75L6 14l2.75-1.25L10 10l1.25 2.75L14 14l-2.75 1.25zm5.69-3.31L16 14l-.94-2.06L13 11l2.06-.94L16 8l.94 2.06L19 11l-2.06.94z", "#67E8F9");
+      vidsBtn.id = "flow-batch-fab-vids";
+      vidsBtn.addEventListener("click", (e) => { e.stopPropagation(); vidsQuickRunFromClipboard(); });
 
-      const openBtn = makeFabBtn("打开批量生成助手", "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z", "#ffffff");
+      const openBtn = makeFabBtn("打开批量生成助手控制面板", "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z", "#ffffff");
       openBtn.id = "flow-batch-fab-open";
       openBtn.addEventListener("click", (e) => { e.stopPropagation(); openPanel(); });
 
       fabEl.appendChild(quickBtn);
-      fabEl.appendChild(divider);
+      fabEl.appendChild(makeDivider());
+      fabEl.appendChild(vidsBtn);
+      fabEl.appendChild(makeDivider());
       fabEl.appendChild(openBtn);
 
       if (targetParent) {
         targetParent.appendChild(fabEl);
-        console.log("[FlowUI] FAB 双按钮已挂载至:", targetParent.tagName);
+        console.log("[FlowUI] FAB 三按钮已挂载至:", targetParent.tagName);
       }
     } else {
       fabEl = existingFab;
@@ -318,12 +339,15 @@
     // 创建控制面板遮罩层 (使用 setSafeHTML 安全注入)
     overlayEl = document.createElement("div");
     overlayEl.id = "flow-batch-overlay";
+    const panelTitleText = isVidsPage()
+      ? "FlowCue · Google Vids 逐个生成与自动下载助手 (无 50 积分限制)"
+      : "Flow 批量生成与自动下载助手";
     setSafeHTML(overlayEl, `
       <div id="flow-batch-panel">
         <div id="flow-batch-panel-header">
           <h2>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #a78bfa;"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
-            Flow 批量生成与自动下载助手
+            ${panelTitleText}
           </h2>
           <div class="flow-close-btn" id="flow-panel-close">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
@@ -703,10 +727,85 @@
       const btnStart = document.getElementById("btn-start-batch");
       if (!btnStart) { showToast("⚡ 未找到「开始批量生成」按钮"); return; }
       btnStart.click();
-      showToast(`⚡ 已导入 ${added} 个任务并开始批量生成`, 4000);
+      if (isVidsPage()) {
+        await delay(400);
+        closePanel();
+        showToast(`🎬 [Vids 模式] 已导入 ${added} 个任务，开始逐个上传图片并生成视频！`, 5000);
+      } else {
+        showToast(`⚡ 已导入 ${added} 个任务并开始批量生成`, 4000);
+      }
     } catch (e) {
       console.error("[FlowUI] 一键执行异常:", e);
       showToast(`⚡ 一键执行出错：${e.message}`, 6000);
+    } finally {
+      quickRunBusy = false;
+    }
+  }
+
+  // 🎬 Google Vids 专属一键生成：自动打开右侧 AI 视频片段侧边栏 → 切换「添加动画」→ 读取剪贴板 JSON（或已有任务）逐个上传图片、生成并下载
+  async function vidsQuickRunFromClipboard() {
+    if (quickRunBusy) return;
+    if (batchPromise) {
+      await openPanel();
+      showToast("🎬 Vids 队列正在运行中，您可在控制面板查看进度或点击「停止生成」", 4000);
+      return;
+    }
+    if (!isVidsPage()) {
+      showToast("🎬 正在为您打开 Google Vids 页面，进入视频项目后再次点击 🎬 按钮即可开始！", 6000);
+      window.open("https://docs.google.com/videos/", "_blank");
+      return;
+    }
+    quickRunBusy = true;
+    try {
+      let text = "";
+      try {
+        text = ((await navigator.clipboard.readText()) || "").trim();
+      } catch (e) {
+        console.warn("[FlowUI] [Vids] 读取剪贴板提示:", e);
+      }
+
+      if (text && text.startsWith("[")) {
+        let parsedList = null;
+        try {
+          parsedList = JSON.parse(text);
+        } catch (err) {
+          showToast(`🎬 剪贴板 JSON 解析失败：${err.message}`, 5000);
+          return;
+        }
+        if (Array.isArray(parsedList) && parsedList.length > 0) {
+          state.tasks = [];
+          state.taskRecord = {};
+          state.activeTasksQueue = [];
+          state.currentIndex = 0;
+          state.currentLineIndex = 0;
+          state.retryCount = 0;
+          const added = importTaskList(parsedList);
+          try { renderTable(); } catch (_) {}
+          await saveState();
+          closePanel();
+          showToast(`🎬 [Vids 模式] 已导入 ${added} 个任务（无 50 积分限制），正在逐个上传图片并生成视频...`, 5000);
+          startBatch();
+          return;
+        }
+      }
+
+      // 若剪贴板不是新 JSON，但当前列表已有待执行任务，则直接启动 Vids 逐个生成
+      const hasPending = Array.isArray(state.tasks) && state.tasks.some(t =>
+        splitTextToLines(t.text).length > 0 && (!Array.isArray(t.status) || t.status.some(s => s !== "success"))
+      );
+      if (hasPending) {
+        closePanel();
+        showToast(`🎬 [Vids 模式] 开始执行列表中的 ${state.tasks.length} 个任务...`, 4000);
+        startBatch();
+        return;
+      }
+
+      await openPanel();
+      openImportDialog();
+      showToast("🎬 请先在 FlowCue 软件中点击「复制任务 JSON」，然后粘贴导入或再次点击 🎬 按钮", 6000);
+    } catch (e) {
+      console.error("[FlowUI] [Vids] 一键执行异常:", e);
+      showToast(`🎬 Vids 一键执行出错：${e.message}`, 6000);
     } finally {
       quickRunBusy = false;
     }
@@ -1896,7 +1995,724 @@
     return batchPromise;
   }
 
+  // ====================================================
+  // 7.5 Google Vids 专属逐个任务自动化生成与下载引擎
+  // ====================================================
+  async function ensureVidsSidebarAndAnimateTab() {
+    // 1. 若存在初始模板欢迎弹窗，自动点击“生成 AI 视频片段”或按 Escape 关闭
+    const welcomeDialog = document.querySelector('#insertabletemplates-dialog-notforstyling[role="dialog"]');
+    if (welcomeDialog && welcomeDialog.offsetParent !== null && getComputedStyle(welcomeDialog).display !== "none") {
+      const videogenEntryBtn = welcomeDialog.querySelector("button.appsDocsGettingStartedEntryPointSelectionViewButton.videogen");
+      if (videogenEntryBtn) {
+        console.log("[Vids] 检测到欢迎弹窗，自动点击 [生成 AI 视频片段] 入口...");
+        simulateClick(videogenEntryBtn);
+      } else {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+      }
+      await delay(700);
+    }
+
+    // 2. 确保右侧“AI 视频片段”侧边栏处于打开状态
+    const isSidebarOpen = () => {
+      const sb = document.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogensidebarSidebarContent, .appsDocsAiGenerativeaiVideoUiSidebarWizVideogensidebarWideSideSheet");
+      return !!(sb && sb.offsetParent !== null && sb.getBoundingClientRect().width > 100);
+    };
+
+    if (!isSidebarOpen()) {
+      const railBtn = document.getElementById("content-library-rail-video-generation-element") ||
+                      document.querySelector('[aria-label="生成 AI 视频片段"], [data-tooltip="AI 视频片段"]');
+      if (railBtn) {
+        console.log("[Vids] 正在点击右侧边栏按钮打开 [AI 视频片段] 面板...");
+        simulateClick(railBtn);
+        for (let w = 0; w < 12; w++) {
+          await delay(500);
+          if (isSidebarOpen()) break;
+        }
+      }
+    }
+
+    // 3. 确保切换到“添加动画”标签页
+    let animateTab = null;
+    for (let w = 0; w < 8; w++) {
+      animateTab = document.querySelector('button.collapsiblePromptBoxTabButton[aria-label="添加动画"]') ||
+                   Array.from(document.querySelectorAll('button.collapsiblePromptBoxTabButton[role="tab"], button[role="tab"]'))
+                     .find(b => (b.textContent || "").includes("添加动画") || (b.getAttribute("aria-label") || "").includes("添加动画"));
+      if (animateTab) break;
+      await delay(400);
+    }
+
+    if (animateTab && animateTab.getAttribute("aria-selected") !== "true") {
+      console.log("[Vids] 正在切换到 [添加动画] 标签页...");
+      simulateClick(animateTab);
+      await delay(500);
+    }
+  }
+
+  async function ensureVidsPromptBoxExpanded() {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const container = document.querySelector(".collapsiblePromptBoxContainerWithTabs");
+      const toggleBtn = document.querySelector("button.collapsiblePromptBoxToggleExpansionButton");
+      const genBtn = document.querySelector("button.collapsiblePromptBoxGenerateButton");
+      const genBtnVisible = !!(genBtn && genBtn.offsetParent !== null && genBtn.getBoundingClientRect().height > 0);
+      const isExpandedClass = container ? container.classList.contains("collapsiblePromptBoxContainerWithTabsExpanded") : true;
+      const toggleLabel = toggleBtn ? (toggleBtn.getAttribute("aria-label") || "") : "";
+
+      if (isExpandedClass && genBtnVisible && toggleLabel !== "展开") {
+        return true;
+      }
+      if (toggleBtn && toggleBtn.offsetParent !== null) {
+        console.log(`[Vids] 提示词框当前处于收起状态 (aria-label="${toggleLabel}")，点击展开...`);
+        simulateClick(toggleBtn);
+        await delay(500);
+      } else if (container) {
+        simulateClick(container);
+        await delay(500);
+      } else {
+        await delay(400);
+      }
+    }
+    return true;
+  }
+
+  async function expandAndClearVidsPromptBox() {
+    // 1. 先确保提示词框已展开（Vids 每次提交生成后会自动收起提示词框）
+    await ensureVidsPromptBoxExpanded();
+    await delay(250);
+
+    // 2. 点击“清除”按钮（同时清除上一次的提示词与已上传图片）
+    const clearBtn = document.querySelector("button.promptTextAreaMenuBarClearLabel") ||
+                     Array.from(document.querySelectorAll(".promptTextAreaMenuBarRightActions button, .promptTextAreaMenuBarV2Container button"))
+                       .find(b => (b.textContent || "").trim() === "清除" || (b.getAttribute("data-tooltip") || "").includes("清除"));
+    if (clearBtn && clearBtn.offsetParent !== null && !clearBtn.disabled && clearBtn.getAttribute("aria-disabled") !== "true") {
+      console.log("[Vids] 点击 [清除] 按钮清空上一任务的提示词与图片...");
+      simulateClick(clearBtn);
+      await delay(500);
+    }
+
+    // 3. 保底检查：若仍有残留图片预览，点击“移除图片”按钮
+    const removeImgBtn = document.querySelector('button.removeInputButtonButton[aria-label="移除图片"], .removeInputButtonContainer button');
+    if (removeImgBtn && removeImgBtn.offsetParent !== null) {
+      console.log("[Vids] 点击 [移除图片] 按钮清理残留图片...");
+      simulateClick(removeImgBtn);
+      await delay(400);
+    }
+
+    // 4. 保底检查：若输入框仍有残留文字，清空输入框
+    const editor = document.querySelector("div.promptTextAreaPromptRichTextInputInternal[contenteditable='true'], [jsname='ZeIRi'][role='textbox']");
+    if (editor && (editor.textContent || "").trim().length > 0) {
+      try {
+        editor.focus();
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand("delete", false, null);
+      } catch (_) {}
+      if ((editor.textContent || "").trim().length > 0) {
+        editor.textContent = "";
+      }
+      editor.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "deleteContentBackward" }));
+      await delay(250);
+    }
+  }
+
+  async function syncVidsVideoSettings({ aspectRatio, resolution, duration }) {
+    await ensureVidsPromptBoxExpanded();
+    const settingsBtn = document.querySelector(
+      "button.appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonGenerationSettingsButton, button[aria-label^='生成设置']"
+    );
+    if (!settingsBtn) {
+      console.warn("[Vids] 未找到 Vids 生成设置按钮，跳过设置同步");
+      return;
+    }
+
+    const wantPortrait = !String(aspectRatio || "").includes("16_9") && !String(aspectRatio || "").includes("16:9");
+    const targetAspectLabel = wantPortrait ? "竖屏" : "横屏";
+    const targetResLabel = String(resolution || "").includes("1080") ? "1080p" : "720p";
+    const targetDuration = Math.min(10, Math.max(3, Math.round(Number(duration) || 8)));
+
+    const ariaSummary = settingsBtn.getAttribute("aria-label") || "";
+    const textSummary = (settingsBtn.textContent || "").replace(/\s+/g, "");
+    const aspectAlreadyOk = ariaSummary.includes(targetAspectLabel);
+    const resAlreadyOk = ariaSummary.includes(targetResLabel) || textSummary.includes(targetResLabel);
+    const durAlreadyOk = ariaSummary.includes(`${targetDuration} 秒`) || textSummary.includes(`${targetDuration}s`);
+
+    if (aspectAlreadyOk && resAlreadyOk && durAlreadyOk) {
+      console.log(`[Vids] 当前生成设置 (${ariaSummary}) 已符合目标要求，无需打开设置菜单`);
+      return;
+    }
+
+    console.log(`[Vids] 同步生成设置: 目标比例=${targetAspectLabel}, 分辨率=${targetResLabel}, 时长=${targetDuration}s (当前=${ariaSummary})`);
+    simulateClick(settingsBtn);
+    await delay(500);
+
+    const popover = document.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonPopoverContainer");
+    if (popover) {
+      // (a) 宽高比：横屏 / 竖屏
+      const aspectBtns = Array.from(popover.querySelectorAll(
+        ".appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonAspectRatioButtonGroup button[role='radio'], button[role='radio']"
+      ));
+      const targetAspectBtn = aspectBtns.find(b => (b.textContent || "").includes(targetAspectLabel));
+      if (targetAspectBtn && targetAspectBtn.getAttribute("aria-checked") !== "true") {
+        console.log(`[Vids] 切换宽高比 -> ${targetAspectLabel}`);
+        simulateClick(targetAspectBtn);
+        await delay(300);
+      }
+
+      // (b) 分辨率：720p / 1080p
+      const resSection = popover.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonResolutionSection");
+      if (resSection) {
+        const resDropBtn = resSection.querySelector("button");
+        if (resDropBtn && !(resDropBtn.textContent || "").includes(targetResLabel)) {
+          simulateClick(resDropBtn);
+          await delay(350);
+          const menuItems = Array.from(document.querySelectorAll("li[role='menuitemradio'], [role='menuitemradio']"));
+          const targetItem = menuItems.find(li => (li.textContent || "").includes(targetResLabel));
+          if (targetItem) {
+            console.log(`[Vids] 切换分辨率 -> ${targetResLabel}`);
+            simulateClick(targetItem);
+            await delay(350);
+          }
+        }
+      }
+
+      // (c) 视频时长滑块 (3s - 10s)
+      const sliderInput = popover.querySelector("input.javascriptMaterialdesignGm3WizSlider-slider__input[type='range'], input[type='range']");
+      if (sliderInput && Number(sliderInput.value) !== targetDuration) {
+        console.log(`[Vids] 调整视频时长滑块: ${sliderInput.value}s -> ${targetDuration}s`);
+        try {
+          const track = popover.querySelector(".javascriptMaterialdesignGm3WizSlider-slider__track");
+          if (track) {
+            const rect = track.getBoundingClientRect();
+            if (rect.width > 20) {
+              const ratio = (targetDuration - 3) / (10 - 3);
+              const clientX = Math.round(rect.left + ratio * rect.width);
+              const clientY = Math.round(rect.top + rect.height / 2);
+              const pInit = { bubbles: true, cancelable: true, view: window, clientX, clientY, pointerId: 1, isPrimary: true };
+              track.dispatchEvent(new PointerEvent("pointerdown", pInit));
+              track.dispatchEvent(new PointerEvent("pointermove", pInit));
+              track.dispatchEvent(new PointerEvent("pointerup", pInit));
+              track.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window, clientX, clientY }));
+              await delay(200);
+            }
+          }
+          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (nativeSetter) {
+            nativeSetter.call(sliderInput, String(targetDuration));
+          } else {
+            sliderInput.value = String(targetDuration);
+          }
+          sliderInput.setAttribute("value", String(targetDuration));
+          sliderInput.setAttribute("aria-valuetext", `${targetDuration} 秒`);
+          sliderInput.dispatchEvent(new Event("focus", { bubbles: true }));
+          sliderInput.dispatchEvent(new Event("input", { bubbles: true }));
+          sliderInput.dispatchEvent(new Event("change", { bubbles: true }));
+          sliderInput.dispatchEvent(new Event("blur", { bubbles: true }));
+          await delay(300);
+        } catch (sErr) {
+          console.warn("[Vids] 调整时长滑块异常:", sErr);
+        }
+      }
+    }
+
+    // 关闭设置菜单
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+    await delay(250);
+  }
+
+  function hasVidsUploadedImagePreview() {
+    const img = document.querySelector("img.inputPreviewItemPreview, .inputPreviewItemPreviewContainer img");
+    if (!img || img.offsetParent === null) return false;
+    const src = img.getAttribute("src") || img.src || "";
+    return src.length > 10;
+  }
+
+  function getVidsDropTargetPoint() {
+    const candidates = [
+      document.querySelector(".promptTextAreaPromptRichTextInput"),
+      document.querySelector(".videoGenCreationViewFileInputsContainerV2"),
+      document.querySelector(".collapsiblePromptBoxTabPanelContent"),
+      document.querySelector(".collapsiblePromptBoxContainerWithTabs")
+    ].filter(Boolean);
+
+    for (const el of candidates) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 50 && r.height > 20 && r.top >= 0 && r.bottom <= window.innerHeight) {
+        return {
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + Math.min(r.height / 2, 48))
+        };
+      }
+    }
+    return { x: Math.round(window.innerWidth - 200), y: Math.round(window.innerHeight - 220) };
+  }
+
+  async function uploadSingleImageToVids(task) {
+    const localPath = String(task.image?.localImagePath || task.local_image_path || "").trim();
+    const imgSrc = String(task.image?.src || "").trim();
+    const imgName = task.image?.displayName || getFilenameFromPath(localPath) || "image.png";
+
+    if (!localPath && !imgSrc) {
+      console.log("[Vids] 当前任务未指定图片，跳过图片上传");
+      return true;
+    }
+
+    await ensureVidsPromptBoxExpanded();
+
+    // 策略 1：使用后台 Chrome Debugger 原生文件拖放 (Input.dispatchDragEvent) 把本地路径图片直接拖入 Vids 提示词框
+    if (localPath && /^([a-zA-Z]:[\\/]|\/|\\\\)/.test(localPath)) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (isStopRequested) return false;
+        const pt = getVidsDropTargetPoint();
+        console.log(`[Vids] 正在通过原生拖放上传本地图片 (尝试 ${attempt + 1}/2) @(${pt.x}, ${pt.y}): ${localPath}`);
+        setOverlayHiddenForUpload(true);
+        await delay(150);
+        let res = null;
+        try {
+          res = await sendToExtension("nativeFileDrag", { paths: [localPath], x: pt.x, y: pt.y });
+        } finally {
+          setOverlayHiddenForUpload(false);
+        }
+
+        if (res && res.ok !== false && !res.error) {
+          for (let w = 0; w < 18; w++) {
+            if (isStopRequested) return false;
+            await delay(400);
+            if (hasVidsUploadedImagePreview()) {
+              console.log(`[Vids] ✅ 本地图片上传成功，已检测到预览缩略图: ${imgName}`);
+              await delay(600);
+              return true;
+            }
+          }
+        } else {
+          console.warn("[Vids] 原生文件拖放返回异常:", res?.error);
+        }
+      }
+    }
+
+    // 策略 2：若存在 Base64 / Blob / 网络图片 src，通过 ClipboardEvent('paste') 与 DragEvent('drop') 注入
+    if (imgSrc) {
+      try {
+        console.log("[Vids] 尝试通过剪贴板 Paste / Drop 注入图片数据...");
+        let blob = null;
+        if (imgSrc.startsWith("data:image/")) {
+          const byteString = atob(imgSrc.split(",")[1]);
+          const mimeString = imgSrc.split(",")[0].split(":")[1].split(";")[0];
+          const ab = new ArrayBuffer(byteString.length);
+          const ia = new Uint8Array(ab);
+          for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
+          blob = new Blob([ab], { type: mimeString });
+        } else {
+          const resp = await fetch(imgSrc);
+          blob = await resp.blob();
+        }
+        if (blob) {
+          const file = new File([blob], imgName, { type: blob.type || "image/png" });
+          const dt = new DataTransfer();
+          dt.items.add(file);
+
+          const editor = document.querySelector("div.promptTextAreaPromptRichTextInputInternal[contenteditable='true']") ||
+                         document.querySelector(".promptTextAreaPromptRichTextInput");
+          if (editor) {
+            editor.focus();
+            editor.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt }));
+            editor.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+          }
+          for (let w = 0; w < 12; w++) {
+            await delay(400);
+            if (hasVidsUploadedImagePreview()) {
+              console.log("[Vids] ✅ Paste/Drop 图片上传成功！");
+              await delay(500);
+              return true;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("[Vids] Paste/Drop 注入图片失败:", e);
+      }
+    }
+
+    return hasVidsUploadedImagePreview();
+  }
+
+  async function fillVidsPromptAndSubmit(finalPrompt) {
+    await ensureVidsPromptBoxExpanded();
+    const editor = document.querySelector("div.promptTextAreaPromptRichTextInputInternal[contenteditable='true']") ||
+                   document.querySelector("[jsname='ZeIRi'][role='textbox']");
+    if (!editor) {
+      throw new Error("未找到 Google Vids 提示词输入框，请确认右侧 [AI 视频片段] 侧边栏已打开");
+    }
+
+    editor.focus();
+    simulateClick(editor);
+    await delay(150);
+
+    let injected = false;
+    try {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      injected = document.execCommand("insertText", false, finalPrompt);
+    } catch (e) {
+      console.warn("[Vids] execCommand 注入提示词异常:", e);
+    }
+
+    if (!injected || (editor.textContent || "").trim() !== finalPrompt.trim()) {
+      editor.textContent = finalPrompt;
+    }
+    editor.classList.remove("promptTextAreaPromptRichTextInputInternalIsEmpty");
+
+    editor.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: finalPrompt }));
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: finalPrompt }));
+    editor.dispatchEvent(new KeyboardEvent("keyup", { key: " ", code: "Space", bubbles: true }));
+    editor.dispatchEvent(new Event("change", { bubbles: true }));
+    await delay(400);
+
+    // 等待生成按钮可用并点击
+    const findGenBtn = () => document.querySelector(
+      "button.collapsiblePromptBoxGenerateButton[aria-label='生成'], button.collapsiblePromptBoxGenerateButton"
+    );
+    let genBtn = null;
+    for (let i = 0; i < 20; i++) {
+      if (isStopRequested) throw new Error("用户已停止任务");
+      genBtn = findGenBtn();
+      if (genBtn && !genBtn.disabled && !genBtn.hasAttribute("disabled") && genBtn.getAttribute("aria-disabled") !== "true") {
+        break;
+      }
+      if (editor) {
+        editor.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: finalPrompt }));
+      }
+      genBtn = null;
+      await delay(350);
+    }
+
+    if (!genBtn) {
+      genBtn = findGenBtn();
+      if (!genBtn) throw new Error("未找到 Google Vids [生成] 按钮");
+      genBtn.removeAttribute("disabled");
+      genBtn.disabled = false;
+      genBtn.setAttribute("aria-disabled", "false");
+    }
+
+    console.log("[Vids] 🚀 点击 [生成] 按钮提交当前任务...");
+    simulateClick(genBtn);
+    await delay(600);
+  }
+
+  async function runVidsBatch(singleRowIndex = null) {
+    state.isSuspended = false;
+    enableTabKeepAlive();
+
+    const validTasks = state.tasks.filter(t => splitTextToLines(t.text).length > 0);
+    if (!validTasks.length) {
+      alert("无可执行生成任务！(任务列表为空或提示词未填)");
+      return;
+    }
+
+    if (isStopRequested) return;
+    state.isRunning = true;
+    document.getElementById("btn-start-batch")?.style.setProperty("display", "none", "important");
+    document.getElementById("btn-stop-batch")?.style.setProperty("display", "inline-flex", "important");
+
+    // 在 Vids 模式下自动收起全屏面板遮罩，方便右侧侧边栏交互与实时查看生成过程
+    closePanel();
+
+    const isSingle = singleRowIndex !== null && typeof singleRowIndex === "number";
+    showToast(isSingle ? `🎬 [Vids] 开始执行单项任务 #${singleRowIndex + 1}...` : `🎬 [Vids] 开始逐个任务生成队列 (共 ${state.tasks.length} 项)...`, 4000);
+
+    // 1. 打开右侧 AI 视频片段侧边栏并切换到“添加动画”
+    await ensureVidsSidebarAndAnimateTab();
+
+    const startRow = isSingle ? singleRowIndex : (state.currentIndex || 0);
+    const endRow = isSingle ? (singleRowIndex + 1) : state.tasks.length;
+
+    for (let rIdx = startRow; rIdx < endRow; rIdx++) {
+      state.currentIndex = rIdx;
+      await saveState();
+
+      const task = state.tasks[rIdx];
+      const lines = splitTextToLines(task.text);
+      if (!lines.length) continue;
+      if (!task.image) task.image = { displayName: `任务_${rIdx + 1}`, primaryMediaKey: "" };
+
+      for (let lIdx = state.currentLineIndex || 0; lIdx < lines.length; lIdx++) {
+        state.currentLineIndex = lIdx;
+        await saveState();
+
+        if (isStopRequested) {
+          showToast("🎬 用户中断了 Vids 批量任务！");
+          onBatchFinished();
+          return;
+        }
+
+        if (task.status[lIdx] === "success" || (Array.isArray(task.downloaded) && task.downloaded[lIdx])) {
+          continue;
+        }
+
+        const lineText = lines[lIdx];
+        const duration = normalizeDuration(task.duration, calculateDuration(lineText));
+        const preset = state.presets.find(p => p.name === task.preset);
+        const parsedPreset = parsePreset(preset?.content);
+        const finalPrompt = `${parsedPreset.before || ""}\n${lineText || ""}\n${parsedPreset.after || ""}`.trim();
+
+        const targetDownloadPath = resolveDownloadPath(task.download_path, {
+          image: task.image,
+          rowIndex: rIdx,
+          lineIndex: lIdx
+        });
+
+        updateLineStatus(rIdx, lIdx, "pending", "正在展开并清空 Vids 输入框...");
+        showToast(`🎬 [Vids ${rIdx + 1}/${state.tasks.length}] 准备任务: ${task.image?.displayName || `#${rIdx + 1}`}`, 3500);
+
+        // Step A: 确保侧边栏与“添加动画”标签页打开，点击“展开”并点击“清除”
+        await ensureVidsSidebarAndAnimateTab();
+        await expandAndClearVidsPromptBox();
+
+        // Step B: 同步生成设置 (宽高比、分辨率、时长 3-10s)
+        try {
+          await syncVidsVideoSettings({
+            aspectRatio: task.aspectRatio || state.settings.aspectRatio,
+            resolution: task.resolution || state.settings.resolution,
+            duration: duration
+          });
+        } catch (settErr) {
+          console.warn("[Vids] 同步生成设置提示:", settErr);
+        }
+
+        // Step C: 上传当前任务的单张图片
+        if (task.image && (task.image.localImagePath || task.local_image_path || task.image.src)) {
+          updateLineStatus(rIdx, lIdx, "pending", `正在上传图片: ${task.image.displayName || ""}...`);
+          showToast(`📤 [Vids ${rIdx + 1}/${state.tasks.length}] 正在上传图片: ${task.image.displayName || ""}`, 3500);
+          const upOk = await uploadSingleImageToVids(task);
+          if (!upOk) {
+            updateLineStatus(rIdx, lIdx, "failed", "图片上传到 Vids 失败或超时，未检测到图片预览");
+            showToast(`❌ [Vids ${rIdx + 1}/${state.tasks.length}] 图片上传失败，跳过本项`, 5000);
+            continue;
+          }
+        }
+
+        // Step D: 拍摄提交前已有视频与错误卡片快照
+        const existingGenIds = new Set(
+          Array.from(document.querySelectorAll("[data-generation-id]"))
+            .map(el => el.getAttribute("data-generation-id"))
+            .filter(Boolean)
+        );
+        const existingVideoUrls = new Set(
+          Array.from(document.querySelectorAll(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogenerationthumbnailsContainer video, video"))
+            .map(v => (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&"))
+            .filter(Boolean)
+        );
+        const existingFailedEls = new Set(
+          Array.from(document.querySelectorAll(".appsDocsAiGenerativeaiVideoUiSidebarWizFailedvideogenerationthumbnailContainer"))
+        );
+
+        // Step E: 输入提示词并点击“生成”
+        const submissionId = crypto.randomUUID();
+        task.taskId = task.taskId || crypto.randomUUID();
+        task.mediaBindings = task.mediaBindings || [];
+        task.downloadIds = task.downloadIds || [];
+        task.downloadIds[lIdx] = null;
+        task.videoUrls = task.videoUrls || [];
+        task.videoUrls[lIdx] = null;
+        task.mediaBindings[lIdx] = {
+          schema: 2,
+          submissionId,
+          taskId: task.taskId,
+          mediaIds: [],
+          readyIds: [],
+          downloadPath: targetDownloadPath
+        };
+        await saveState();
+
+        try {
+          updateLineStatus(rIdx, lIdx, "generating", "正在填入提示词并点击生成...");
+          await fillVidsPromptAndSubmit(finalPrompt);
+          updateLineStatus(rIdx, lIdx, "generating", "已提交到 Google Vids，等待视频生成完成...");
+          showToast(`🚀 [Vids ${rIdx + 1}/${state.tasks.length}] 已提交生成，正在等待视频渲染完成...`, 4000);
+        } catch (subErr) {
+          console.error("[Vids] 提交任务失败:", subErr);
+          updateLineStatus(rIdx, lIdx, "failed", `提交失败: ${subErr.message}`);
+          continue;
+        }
+
+        // Step F: 轮询等待新视频出现并下载完成
+        const maxWaitSec = Math.max(180, Number(state.settings.maxWaitTime) || 360);
+        const waitStartTime = Date.now();
+        let isTaskCompleted = false;
+        let downloadTriggered = false;
+
+        while ((Date.now() - waitStartTime) / 1000 < maxWaitSec) {
+          if (isStopRequested) break;
+          const waitedSec = Math.round((Date.now() - waitStartTime) / 1000);
+
+          // 1. 检查是否已有下载任务完成
+          if (task.downloadIds?.[lIdx] && !task.downloaded[lIdx]) {
+            const dlState = await sendToExtension("getDownloadStatus", { downloadId: task.downloadIds[lIdx] });
+            if (dlState?.state === "complete") {
+              task.downloaded[lIdx] = true;
+              updateLineStatus(rIdx, lIdx, "success", `自动下载成功: ${targetDownloadPath}`);
+              isTaskCompleted = true;
+              break;
+            } else if (dlState?.state === "interrupted") {
+              updateLineStatus(rIdx, lIdx, "failed", `下载中断: ${dlState.error || "未知原因"}`);
+              break;
+            }
+          }
+
+          if (task.status[lIdx] === "success" && task.downloaded?.[lIdx]) {
+            isTaskCompleted = true;
+            break;
+          }
+          if (task.status[lIdx] === "failed") {
+            break;
+          }
+
+          // 2. 检查是否新增了生成失败提示卡片（如违反条款拦截）
+          if (!downloadTriggered) {
+            const currentFailedEls = Array.from(document.querySelectorAll(".appsDocsAiGenerativeaiVideoUiSidebarWizFailedvideogenerationthumbnailContainer"));
+            const newFailedEl = currentFailedEls.find(el => !existingFailedEls.has(el));
+            if (newFailedEl) {
+              const errMsgEl = newFailedEl.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizFailedvideogenerationthumbnailErrorMessage");
+              const errMsg = (errMsgEl ? errMsgEl.textContent : newFailedEl.textContent || "视频生成被拦截或失败").trim();
+              console.warn(`[Vids] ❌ 检测到 Vids 生成失败卡片: ${errMsg}`);
+              updateLineStatus(rIdx, lIdx, "failed", `Vids 生成失败: ${errMsg}`);
+              showToast(`⚠️ [Vids ${rIdx + 1}/${state.tasks.length}] 生成失败: ${errMsg.substring(0, 45)}`, 5000);
+              break;
+            }
+          }
+
+          // 3. 扫描侧边栏视频列表，寻找新生成的 <video>
+          if (!downloadTriggered) {
+            let foundVideoUrl = null;
+            let foundGenId = null;
+
+            const thumbContainers = Array.from(document.querySelectorAll(
+              ".appsDocsAiGenerativeaiVideoUiSidebarWizSuccessfulvideogenerationthumbnailVideoGenerationThumbnailWithPromptContainer[data-generation-id], " +
+              ".appsDocsAiGenerativeaiVideoUiSidebarWizVideogenerationthumbnailsContainer [data-generation-id]"
+            ));
+
+            for (const c of thumbContainers) {
+              const gId = c.getAttribute("data-generation-id") || "";
+              const v = c.querySelector("video");
+              const rawSrc = v ? (v.getAttribute("src") || v.currentSrc || v.src || "") : "";
+              const cleanSrc = rawSrc.trim().replace(/&amp;/g, "&");
+              if (cleanSrc && cleanSrc.startsWith("https://")) {
+                if ((gId && !existingGenIds.has(gId)) || !existingVideoUrls.has(cleanSrc)) {
+                  foundVideoUrl = cleanSrc;
+                  foundGenId = gId || `vids_${Date.now()}`;
+                  break;
+                }
+              }
+            }
+
+            // 兜底：直接扫描侧边栏内所有 video 标签
+            if (!foundVideoUrl) {
+              const allVideos = Array.from(document.querySelectorAll(
+                ".appsDocsAiGenerativeaiVideoUiSidebarWizVideogenerationthumbnailsContainer video, " +
+                "video.appsDocsAiGenerativeaiVideoUiSidebarWizSuccessfulvideogenerationthumbnailVideoGenerationThumbnail"
+              ));
+              for (const v of allVideos) {
+                const rawSrc = v.getAttribute("src") || v.currentSrc || v.src || "";
+                const cleanSrc = rawSrc.trim().replace(/&amp;/g, "&");
+                if (cleanSrc && cleanSrc.startsWith("https://") && !existingVideoUrls.has(cleanSrc) && !downloadedUrlsSet.has(cleanSrc)) {
+                  const parentGenId = v.closest("[data-generation-id]")?.getAttribute("data-generation-id");
+                  foundVideoUrl = cleanSrc;
+                  foundGenId = parentGenId || `vids_${Date.now()}`;
+                  break;
+                }
+              }
+            }
+
+            if (foundVideoUrl && foundGenId) {
+              console.log(`[Vids] 🎯 检测到新生成的视频! generationId=${foundGenId}, URL=${foundVideoUrl.substring(0, 100)}`);
+              downloadedUrlsSet.add(foundVideoUrl);
+              existingVideoUrls.add(foundVideoUrl);
+              existingGenIds.add(foundGenId);
+
+              const binding = task.mediaBindings[lIdx];
+              binding.mediaIds = [foundGenId];
+              binding.readyIds = [foundGenId];
+              binding.urls = { [foundGenId]: foundVideoUrl };
+              task.videoUrls[lIdx] = foundVideoUrl;
+              await saveState();
+
+              const dlRes = await sendToExtension("download", {
+                url: foundVideoUrl,
+                filename: targetDownloadPath,
+                task: {
+                  rowIndex: rIdx,
+                  lineIndex: lIdx,
+                  taskId: task.taskId,
+                  submissionId: binding.submissionId,
+                  mediaId: foundGenId,
+                  projectId: getStorageKey(),
+                  download_path: targetDownloadPath,
+                  isVids: true
+                }
+              });
+
+              if (dlRes?.success) {
+                downloadTriggered = true;
+                task.downloadIds[lIdx] = dlRes.downloadId;
+                updateLineStatus(rIdx, lIdx, "generating", `视频已生成，正在下载保存至 ${targetDownloadPath}...`);
+                showToast(`📥 [Vids ${rIdx + 1}/${state.tasks.length}] 视频生成完成，正在下载: ${targetDownloadPath}`, 3500);
+                await saveState();
+              } else {
+                updateLineStatus(rIdx, lIdx, "failed", `视频下载失败: ${dlRes?.error || "未知错误"}`);
+                break;
+              }
+            } else {
+              updateLineStatus(rIdx, lIdx, "generating", `Google Vids 正在生成视频 (${waitedSec}s)...`);
+            }
+          }
+
+          await delay(2000);
+        }
+
+        if (!isTaskCompleted && !isStopRequested && task.status[lIdx] !== "failed") {
+          updateLineStatus(rIdx, lIdx, "failed", `Vids 生成或下载超时 (已等待 ${maxWaitSec} 秒)`);
+        }
+
+        state.currentLineIndex = 0;
+        await saveState();
+
+        if (isStopRequested) {
+          showToast("🎬 用户中断了 Vids 批量任务！");
+          onBatchFinished();
+          return;
+        }
+
+        if (isSingle) {
+          showToast(`🎬 [Vids] 单项任务 #${rIdx + 1} 执行完成！`, 4000);
+          onBatchFinished();
+          return;
+        }
+
+        // 任务间隔等待
+        const intervalSec = Math.max(2, Number(state.settings.interval) || 5);
+        const intervalRand = Math.max(0, Number(state.settings.intervalRandom) || 3);
+        const waitTime = Math.round(intervalSec + Math.random() * intervalRand);
+        const targetEndTime = Date.now() + waitTime * 1000;
+        while (Date.now() < targetEndTime) {
+          if (isStopRequested) break;
+          const rem = Math.max(1, Math.round((targetEndTime - Date.now()) / 1000));
+          showToast(`✅ [Vids ${rIdx + 1}/${state.tasks.length}] 已完成！${rem} 秒后自动展开清空并开始下一项...`, 1500);
+          await delay(1000);
+        }
+      }
+    }
+
+    showToast("🎉 [Vids] 所有队列任务的逐个生成与自动下载已全部完成！", 6000);
+    onBatchFinished();
+  }
+
   async function runBatch(singleRowIndex = null) {
+    if (isVidsPage()) {
+      return await runVidsBatch(singleRowIndex);
+    }
     state.isSuspended = false;
     if (alarmDialogEl) alarmDialogEl.style.setProperty("display", "none", "important");
     if (alarmTimer) {
@@ -3756,6 +4572,18 @@ ${presetAfter || ""}`.trim();
   }
 
   function getProjectName() {
+    if (isVidsPage()) {
+      try {
+        const titleInput = document.querySelector("input.docs-title-input");
+        if (titleInput && titleInput.value && titleInput.value.trim()) return titleInput.value.trim();
+        const titleLabel = document.querySelector("#docs-title-input-label-inner");
+        if (titleLabel && titleLabel.textContent && titleLabel.textContent.trim()) return titleLabel.textContent.trim();
+        const vidsMatch = location.pathname.match(/\/videos\/d\/([a-zA-Z0-9_-]+)/);
+        if (vidsMatch) return vidsMatch[1];
+      } catch (e) {}
+      return "Vids_Project";
+    }
+
     try {
       const inputEl = document.querySelector("flow-editable-text input.editable-text-input");
       if (inputEl && inputEl.value) return inputEl.value.trim();
@@ -4001,14 +4829,13 @@ ${presetAfter || ""}`.trim();
   console.log("%c[FlowUI] 界面控制器加载完毕！", "background: #8b5cf6; color: white; padding: 2px 6px; border-radius: 4px;");
 
   // ====================================================================
-  // 轻量账号桥接 (仅用于桌面软件的「账号积分管理」)
+  // 轻量账号桥接 (用于桌面软件的「全局托管模式」通信)
+  // - 支持 Google Flow 与 Google Vids (docs.google.com/videos/*)
   // - 只保持一个 WebSocket 连接，不做任何定时 DOM 读取
-  // - 只有桌面软件点击「刷新积分」时才点击头像读取一次积分
-  // - 支持桌面软件发送 close_browser 指令关闭本浏览器
   // ====================================================================
   (function initAccountBridge() {
     const host = location.hostname;
-    if (!(host.endsWith("labs.google") || host.endsWith("flow.google.com"))) return;
+    if (!(host.endsWith("labs.google") || host.endsWith("flow.google.com") || isVidsPage())) return;
     if (window.__flowAccountBridgeLoaded) return;
     window.__flowAccountBridgeLoaded = true;
 
@@ -4029,6 +4856,12 @@ ${presetAfter || ""}`.trim();
     function readEmailCheap() {
       if (cachedEmail) return cachedEmail;
       try {
+        // Google Vids 页面在 head meta[name="og-profile-acct"] 中直接带有登录邮箱
+        const metaAcct = document.querySelector('meta[name="og-profile-acct"]');
+        if (metaAcct && metaAcct.content) {
+          const m = metaAcct.content.match(EMAIL_RE);
+          if (m) return (cachedEmail = m[1]);
+        }
         const panel = document.querySelector("flow-account-panel");
         if (panel) {
           const m = panel.textContent.match(EMAIL_RE);
@@ -4044,6 +4877,7 @@ ${presetAfter || ""}`.trim();
     }
 
     function readPointsFromDom() {
+      if (isVidsPage()) return 9999; // Google Vids 无 50 积分限制
       try {
         const span = document.querySelector("span.credits-count");
         if (span) {
@@ -4074,6 +4908,10 @@ ${presetAfter || ""}`.trim();
     }
 
     async function doProbe() {
+      if (isVidsPage()) {
+        readEmailCheap();
+        return 9999; // Google Vids 无积分上限限制
+      }
       // 菜单已打开时直接读
       let pts = readPointsFromDom();
       if (pts !== null) { readEmailCheap(); return pts; }
@@ -4209,7 +5047,9 @@ ${presetAfter || ""}`.trim();
           data: {
             remaining_points: pts,
             email: cachedEmail || readEmailCheap(),
-            client_id: clientId
+            client_id: clientId,
+            mode: isVidsPage() ? "vids" : "flow",
+            unlimited: isVidsPage()
           }
         });
         return;
@@ -4252,10 +5092,15 @@ ${presetAfter || ""}`.trim();
       if (action === "upload_images") {
         const p = msg.params || {};
         let data;
-        try {
-          data = await uploadPathsToFlow(p.paths || [], { timeoutMs: Math.max(10, Number(p.timeout_seconds) || 60) * 1000 });
-        } catch (e) {
-          data = { uploaded: [], skipped: [], failed: p.paths || [], errors: { _all: String(e && e.message || e) } };
+        if (isVidsPage()) {
+          // Google Vids 模式下无需预先批量上传图片，而是在执行任务时逐个上传到「添加动画」输入框
+          data = { uploaded: p.paths || [], skipped: [], failed: [], errors: {}, mode: "vids" };
+        } else {
+          try {
+            data = await uploadPathsToFlow(p.paths || [], { timeoutMs: Math.max(10, Number(p.timeout_seconds) || 60) * 1000 });
+          } catch (e) {
+            data = { uploaded: [], skipped: [], failed: p.paths || [], errors: { _all: String(e && e.message || e) } };
+          }
         }
         send({ action: "upload_images_response", request_id: msg.request_id, success: !data.failed.length,
                client_id: clientId, data: { ...data, upload_id: p.upload_id || "" } });
@@ -4268,7 +5113,7 @@ ${presetAfter || ""}`.trim();
         const reply = (ok, error, extra = {}) => send({ action: "run_tasks_response", request_id: msg.request_id, success: ok,
                                                        error: error || "", client_id: clientId, data: { batch_id: batchId, ...extra } });
         if (typeof batchPromise !== "undefined" && batchPromise) { reply(false, "插件队列正在运行，请先停止"); return; }
-        if (!location.href.includes("/project/")) { reply(false, "浏览器当前不在 Flow 项目页面"); return; }
+        if (!location.href.includes("/project/") && !isVidsPage()) { reply(false, "浏览器当前不在 Flow 或 Google Vids 项目页面"); return; }
         let count = 0;
         try {
           if (p.clear_existing !== false) {

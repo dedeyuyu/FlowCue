@@ -167,10 +167,15 @@ async function handleDownload(url, filename, task) {
       throw new Error("缺少媒体 ID 或任务文件名绑定，拒绝下载");
     }
     const parsed = new URL(url);
+    const isVidsHost = parsed.hostname.endsWith(".usercontent.google.com") ||
+      parsed.hostname.endsWith(".googleusercontent.com") ||
+      parsed.hostname === "docs.google.com" ||
+      !!task.isVids;
     const mediaId = parsed.hostname === "flow-content.google" ? parsed.pathname.match(/^\/video\/([a-zA-Z0-9_-]+)$/)?.[1] :
       parsed.hostname === "labs.google" && parsed.pathname === "/fx/api/trpc/media.getMediaUrlRedirect" ?
-        ((parsed.searchParams.get("name") || "").split("/media/").pop().replace(/^media\//, "")) : null;
-    console.log(`[Background] URL 解析出的 mediaId: ${mediaId}, task.mediaId: ${task.mediaId}`);
+        ((parsed.searchParams.get("name") || "").split("/media/").pop().replace(/^media\//, "")) :
+      isVidsHost ? task.mediaId : null;
+    console.log(`[Background] URL 解析出的 mediaId: ${mediaId}, task.mediaId: ${task.mediaId}, isVidsHost: ${isVidsHost}`);
     if (mediaId !== task.mediaId) {
       console.error(`[Background] ❌ 拒绝下载: 下载地址的媒体 ID (${mediaId}) 与任务 (${task.mediaId}) 不一致`);
       throw new Error("下载地址的媒体 ID 与任务不一致");
@@ -220,8 +225,10 @@ async function handleDownload(url, filename, task) {
 // 只处理本扩展发起、精确 URL/下载 ID 已登记的下载。
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   if (item.byExtensionId !== chrome.runtime.id) { suggest(); return; }
-  chrome.storage.session.get([`download_${item.id}`, `filename_${item.url}`]).then(saved => {
-    const filename = saved[`download_${item.id}`]?.filename || saved[`filename_${item.url}`];
+  const keys = [`download_${item.id}`, `filename_${item.url}`];
+  if (item.finalUrl) keys.push(`filename_${item.finalUrl}`);
+  chrome.storage.session.get(keys).then(saved => {
+    const filename = saved[`download_${item.id}`]?.filename || saved[`filename_${item.url}`] || (item.finalUrl ? saved[`filename_${item.finalUrl}`] : null);
     console.log(`[Background] 📝 onDeterminingFilename: ID=${item.id}, URL=${item.url}, 匹配目标文件名=${filename}`);
     if (filename) suggest({ filename, conflictAction: "uniquify" });
     else suggest();
