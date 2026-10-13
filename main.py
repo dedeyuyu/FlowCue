@@ -40,9 +40,12 @@ def get_data_dir():
         old_dir = get_workspace_dir()
         for name in USER_SETTINGS_FILES:
             dst = os.path.join(data_dir, name)
-            src = os.path.join(old_dir, name)
-            if not os.path.exists(dst) and os.path.isfile(src):
-                shutil.copy2(src, dst)
+            if os.path.exists(dst):
+                continue  # 用户已有设置，永不覆盖（升级安装不会丢失预设/规则）
+            for src in (os.path.join(old_dir, name), os.path.join(old_dir, "_internal", name)):
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                    break
         return data_dir
     except Exception as e:
         log_error(f"无法使用用户设置目录 {data_dir}，回退到程序目录: {e}")

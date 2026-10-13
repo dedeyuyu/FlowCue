@@ -25,3 +25,4 @@ dump.py
 *.zip
 *.db
 
+build.log

@@ -5,9 +5,20 @@ Generates a one-folder distributable with all dependencies.
 """
 
 import os, sys
+from PyInstaller.utils.hooks import copy_metadata
 
 block_cipher = None
 project_dir = os.path.abspath('.')
+
+# gdown 等库在导入时会用 importlib.metadata 读取自身版本，必须把包元数据一起打包，
+# 否则运行时报 "No package metadata was found for gdown"
+_meta = []
+for _pkg in ['gdown', 'requests', 'urllib3', 'beautifulsoup4', 'tqdm', 'filelock',
+             'certifi', 'idna', 'charset-normalizer', 'soupsieve', 'pillow', 'PySocks']:
+    try:
+        _meta += copy_metadata(_pkg)
+    except Exception:
+        pass
 
 a = Analysis(
     ['main.py'],
@@ -21,7 +32,8 @@ a = Analysis(
         ('FLOW_PLUGIN_OPEN_API.md', '.'),
         ('README.md', '.'),
         ('LICENSE', '.'),
-    ],
+        ('extension', 'extension'),
+    ] + _meta,
     hiddenimports=[
         'PyQt6',
         'PyQt6.QtWidgets',
