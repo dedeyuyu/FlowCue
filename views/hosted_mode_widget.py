@@ -33,6 +33,9 @@ class HostedModeWidget(QWidget):
         self.plugin_server = plugin_server
         self.mw = main_window
         self.settings_file = Path(main_window.workspace_dir) / "hosted_mode.json"
+        self.aliases_file = Path(main_window.workspace_dir) / "account_aliases.json"
+        self.aliases = {}
+        self._load_aliases()
 
         # 设置
         self.threshold = 50
@@ -40,6 +43,12 @@ class HostedModeWidget(QWidget):
         self.group_size = 5
         self.upload_timeout = 60
         self._load_settings()
+
+        # 精准关闭管理
+        self._pending_closes = {}
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(400)
+        self._close_timer.timeout.connect(self._poll_pending_closes)
 
         # 运行数据
         self.batches = []            # list[dict]
@@ -67,6 +76,16 @@ class HostedModeWidget(QWidget):
         self.refresh_all()
 
     # ──────────────────────────────── 设置持久化
+    def _load_aliases(self):
+        try:
+            if self.aliases_file.exists():
+                self.aliases = json.loads(self.aliases_file.read_text(encoding="utf-8"))
+            else:
+                self.aliases = {}
+        except Exception as e:
+            logger.warning(f"读取账号备注失败: {e}")
+            self.aliases = {}
+
     def _load_settings(self):
         try:
             if self.settings_file.exists():
@@ -147,6 +166,18 @@ class HostedModeWidget(QWidget):
         self.btn_clear_plan = self._btn("🧹 清空分配", "#6B7280", "#4B5563")
         self.btn_clear_plan.clicked.connect(self.on_clear_plan)
         r.addWidget(self.btn_clear_plan)
+
+        r.addSpacing(15)
+        self.btn_clear_media = self._btn("🗑️ 清空Flow媒体", "#475569", "#334155")
+        self.btn_clear_media.setToolTip("在所有已连接浏览器中，删除当前 Flow 页面上的全部图片和视频（移入回收站）")
+        self.btn_clear_media.clicked.connect(self.on_clear_media_clicked)
+        r.addWidget(self.btn_clear_media)
+
+        self.btn_clear_tasks = self._btn("🧹 清空插件任务", "#475569", "#334155")
+        self.btn_clear_tasks.setToolTip("清空所有已连接浏览器插件中的全部任务列表")
+        self.btn_clear_tasks.clicked.connect(self.on_clear_tasks_clicked)
+        r.addWidget(self.btn_clear_tasks)
+
         r.addStretch()
         self.lbl_summary = QLabel("")
         r.addWidget(self.lbl_summary)
@@ -230,10 +261,7 @@ class HostedModeWidget(QWidget):
         return cid.split(" (W#")[0] if " (W#" in cid else cid
 
     def _alias(self, email):
-        try:
-            return self.mw.account_monitor.aliases.get(email, "")
-        except Exception:
-            return ""
+        return self.aliases.get(email, "")
 
     def _label(self, email):
         a = self._alias(email)
@@ -273,6 +301,7 @@ class HostedModeWidget(QWidget):
         self.refresh_all()
 
     def refresh_all(self):
+        self._load_aliases()
         self._refresh_browsers()
         self._refresh_batches()
 
@@ -442,8 +471,8 @@ class HostedModeWidget(QWidget):
 
         for c in selected:
             email = self._email(c)
-            self.mw.account_monitor._request_close(c["client_id"], f"{self._label(email)}（{c.get('remaining_points')} 积分）", email)
-        self._log(f"已发送关闭指令给 {len(selected)} 个低积分浏览器（详情见「账号积分管理」日志）")
+            self._request_close(c["client_id"], f"{self._label(email)}（{c.get('remaining_points')} 积分）", email)
+        self._log(f"已发送关闭指令给 {len(selected)} 个低积分浏览器")
 
     def _busy(self):
         return self.running or self.upload_group_active or bool(self.upload_queue)
@@ -455,6 +484,119 @@ class HostedModeWidget(QWidget):
         self.batches, self.plan = [], {}
         self.refresh_all()
         self._log("已清空分配")
+
+    # ──────────────────────────────────────────
+    # 批量清空：Flow 媒体 / 插件任务
+    # ──────────────────────────────────────────
+    def _label_for_client_id(self, client_id):
+        for c in self._clients():
+            if c.get("client_id") == client_id:
+                return self._label(self._email(c))
+        return client_id.split(" (W#")[0]
+
+    def _broadcast(self, action, what):
+        clients = self._clients()
+        if not clients:
+            QMessageBox.information(self, "提示", "当前没有已连接的浏览器。")
+            return
+        sent = 0
+        for c in clients:
+            if self.plugin_server.send_rpc_action(c.get("client_id"), action, {}):
+                sent += 1
+        self._log(f"⏳ 已向 {sent} 个浏览器发送「{what}」指令...")
+
+    def on_clear_media_clicked(self):
+        n = len(self._clients())
+        if not n:
+            QMessageBox.information(self, "提示", "当前没有已连接的浏览器。")
+            return
+        reply = QMessageBox.warning(
+            self, "确认清空 Flow 媒体",
+            f"将在 {n} 个浏览器当前打开的 Flow 项目中，删除页面上的【所有图片和视频】。\n\n"
+            "（相当于在每个 Flow 页面按 Ctrl+A 再按 Delete，删除的内容会进入 Flow 回收站）\n\n确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._broadcast("clear_media", "清空 Flow 媒体")
+
+    def on_clear_tasks_clicked(self):
+        n = len(self._clients())
+        if not n:
+            QMessageBox.information(self, "提示", "当前没有已连接的浏览器。")
+            return
+        reply = QMessageBox.question(
+            self, "确认清空插件任务",
+            f"将清空 {n} 个浏览器插件中的【全部任务列表】。\n\n（Flow 云端项目和已下载文件不受影响）\n\n确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._broadcast("clear_tasks", "清空插件任务")
+
+    # ──────────────────────────────────────────
+    # 关闭浏览器（定位该账号的 Chrome 窗口 → 精准关闭）
+    # ──────────────────────────────────────────
+    def _request_close(self, client_id, label, email=""):
+        self._log(f"⚡ 正在向插件发送精准关闭指令: {label}")
+        import uuid
+        token = "FLOWCLOSE-" + uuid.uuid4().hex[:10]
+        self.plugin_server.close_client_browser(client_id, token)
+
+        if not hasattr(self, "_pending_closes"):
+            self._pending_closes = {}
+            self._close_timer = QTimer(self)
+            self._close_timer.setInterval(400)
+            self._close_timer.timeout.connect(self._poll_pending_closes)
+        self._pending_closes[token] = {"label": label, "client_id": client_id, "email": email,
+                                       "start": time.time(), "hwnds": None, "closed_at": None, "retried": False}
+        if not self._close_timer.isActive():
+            self._close_timer.start()
+
+    def _client_connected(self, client_id):
+        return any(c.get("client_id") == client_id for c in self._clients())
+
+    def _poll_pending_closes(self):
+        from services import browser_closer as bc
+        now = time.time()
+        for token, p in list(self._pending_closes.items()):
+            try:
+                if not self._client_connected(p["client_id"]):
+                    self._log(f"✅ 浏览器已成功关闭: {p['label']}")
+                    del self._pending_closes[token]
+                    continue
+
+                if p["hwnds"] is None:
+                    hwnds, profile_dir, profile_email = bc.find_windows_for_email(p["email"])
+                    where = f"Chrome 用户「{profile_dir}」({profile_email})" if hwnds else ""
+                    if not hwnds:
+                        hwnds = bc.find_windows_by_title_token(token)
+                        where = "标题标记窗口" if hwnds else ""
+                    if hwnds:
+                        for h in hwnds:
+                            bc.close_window(h)
+                        p["hwnds"] = hwnds
+                        p["closed_at"] = now
+                        self._log(f"🪟 找到 {where} 的 {len(hwnds)} 个窗口，正在使用强制命令关闭: {p['label']}")
+                    elif now - p["start"] > 6:
+                        self._log(f"❌ 未找到该账号的浏览器窗口，且插件尝试自动关闭失败: {p['label']}")
+                        del self._pending_closes[token]
+                else:
+                    remaining = [h for h in p["hwnds"] if bc.window_exists(h)]
+                    if not remaining:
+                        self._log(f"✅ 浏览器已关闭: {p['label']}")
+                        del self._pending_closes[token]
+                    elif not p["retried"] and now - p["closed_at"] > 4:
+                        for h in remaining:
+                            bc.close_window(h)
+                        p["retried"] = True
+                        p["closed_at"] = now
+                    elif p["retried"] and now - p["closed_at"] > 5:
+                        self._log(f"❌ 窗口未能关闭（可能弹出了“确定离开”提示，请手动处理）: {p['label']}")
+                        del self._pending_closes[token]
+            except Exception as e:
+                self._log(f"❌ 关闭出错: {p['label']} - {e}")
+                self._pending_closes.pop(token, None)
+        if not self._pending_closes:
+            self._close_timer.stop()
 
     def _points_of(self, task):
         cm = getattr(self.mw, "config_manager", None)
@@ -740,6 +882,22 @@ class HostedModeWidget(QWidget):
                 self._log(f"❌ {b['short']} 发送失败：{msg.get('error')}")
                 QTimer.singleShot(500, lambda e=self.plan.get(b["cid"]): e and self._dispatch_next(e))
             self.refresh_all()
+        elif action == "clear_tasks_response":
+            label = self._label_for_client_id(payload.get("client_id", ""))
+            data = msg.get("data", {}) or {}
+            if msg.get("success"):
+                self._log(f"✅ 已清空插件任务（{data.get('cleared', 0)} 个）: {label}")
+            else:
+                self._log(f"❌ 清空插件任务失败: {label} - {msg.get('error', '')}")
+        elif action == "clear_media_response":
+            label = self._label_for_client_id(payload.get("client_id", ""))
+            data = msg.get("data", {}) or {}
+            before, after = data.get("before", "?"), data.get("after", "?")
+            if msg.get("success"):
+                note = data.get("note")
+                self._log(f"✅ 已清空 Flow 媒体: {label}" + (f"（{note}）" if note else f"（{before} → {after}）"))
+            else:
+                self._log(f"❌ 清空 Flow 媒体失败: {label} - {msg.get('error', '')}（{before} → {after}）")
 
     def _batch(self, bid):
         return next((b for b in self.batches if b["id"] == bid), None)

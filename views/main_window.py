@@ -385,7 +385,6 @@ class MainWindow(QMainWindow):
         splitter.setSizes([300, 900])
 
         from PyQt6.QtWidgets import QTabWidget
-        from views.account_monitor_widget import AccountMonitorWidget
         self.main_tab_widget = QTabWidget()
         self.main_tab_widget.setStyleSheet("""
             QTabWidget::pane { border: 1px solid #D7CCC8; border-radius: 4px; background-color: #F5EBE6; }
@@ -403,13 +402,10 @@ class MainWindow(QMainWindow):
         self.batch_generate_tab = BatchGenerateTabWidget(self.plugin_server, self)
         self.main_tab_widget.addTab(self.batch_generate_tab, "🚀 批量生成")
 
-        from views.account_monitor_widget import AccountMonitorWidget
-        self.account_monitor = AccountMonitorWidget(self.plugin_server, self.workspace_dir, self)
-        self.main_tab_widget.addTab(self.account_monitor, "💳 账号积分管理")
-
         from views.hosted_mode_widget import HostedModeWidget
         self.hosted_mode = HostedModeWidget(self.plugin_server, self)
         self.main_tab_widget.addTab(self.hosted_mode, "🤖 全局托管")
+        self.account_monitor = None
         main_layout.addWidget(self.main_tab_widget, stretch=1)
 
     def load_initial_state(self):
