@@ -27,6 +27,7 @@ class AccountMonitorWidget(QWidget):
 
     def __init__(self, plugin_server, workspace_dir, parent=None):
         super().__init__(parent)
+        self.mw = parent
         self.plugin_server = plugin_server
         self.workspace_dir = Path(workspace_dir)
         self.settings_file = self.workspace_dir / "account_monitor.json"
@@ -353,17 +354,41 @@ class AccountMonitorWidget(QWidget):
             QMessageBox.information(self, "提示", msg)
             return
 
-        lines = "\n".join(f"  • {self._alias_label(self._short_email(c))}：{c.get('remaining_points', 0)} 积分" for c in targets)
-        extra = f"\n\n⚠️ 另有 {len(unknown)} 个浏览器未读取到积分，不会被关闭。" if unknown else ""
-        reply = QMessageBox.question(
-            self, "确认一键关闭",
-            f"以下 {len(targets)} 个浏览器积分低于 {self.threshold}，将被关闭：\n\n{lines}{extra}\n\n确定关闭吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
+        # 检查是否有浏览器在托管模式中已分配任务
+        busy_cids = set()
+        hosted = getattr(self.mw, "hosted_tab", None) if hasattr(self, "mw") else None
+        if hosted and hasattr(hosted, "plan") and isinstance(hosted.plan, dict):
+            busy_cids = {cid for cid, p in hosted.plan.items() if p.get("batch_ids")}
+
+        items = []
+        for c in targets:
+            cid = c.get("client_id")
+            items.append({
+                "client": c,
+                "client_id": cid,
+                "label": self._alias_label(self._short_email(c)),
+                "points": c.get("remaining_points", 0),
+                "is_busy": cid in busy_cids,
+            })
+
+        extra = f"⚠️ 另有 {len(unknown)} 个浏览器未读取到积分，不会被关闭。" if unknown else None
+        from views.close_confirm_dialog import CloseConfirmDialog
+        from PyQt6.QtWidgets import QDialog
+        dlg = CloseConfirmDialog(
+            self,
+            title="确认一键关闭低积分浏览器",
+            header_text=f"以下 {len(targets)} 个浏览器积分低于 {self.threshold}：",
+            items=items,
+            extra_warning=extra
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        for c in targets:
+        selected = dlg.get_selected_clients()
+        if not selected:
+            return
+
+        for c in selected:
             label = f"{self._alias_label(self._short_email(c))}（{c.get('remaining_points', 0)} 积分）"
             self._request_close(c.get("client_id"), label, self._short_email(c))
 

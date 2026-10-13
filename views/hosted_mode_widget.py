@@ -412,17 +412,38 @@ class HostedModeWidget(QWidget):
         if not low:
             QMessageBox.information(self, "提示", f"没有积分低于 {self.threshold} 的浏览器（请先刷新积分）。")
             return
-        busy = [c for c in low if c.get("client_id") in self.plan and self.plan[c["client_id"]]["batch_ids"]]
-        lines = "\n".join(f"  • {self._label(self._email(c))}：{c.get('remaining_points')} 积分"
-                          + ("  ⚠️已分配任务" if c in busy else "") for c in low)
-        if QMessageBox.question(self, "确认关闭", f"将关闭以下 {len(low)} 个低积分浏览器：\n\n{lines}\n\n确定吗？",
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
-            return
+        busy_cids = {c["client_id"] for c in low if c.get("client_id") in self.plan and self.plan[c["client_id"]]["batch_ids"]}
+        items = []
         for c in low:
+            cid = c.get("client_id")
+            email = self._email(c)
+            items.append({
+                "client": c,
+                "client_id": cid,
+                "label": self._label(email),
+                "points": c.get("remaining_points", 0),
+                "is_busy": cid in busy_cids,
+            })
+
+        from views.close_confirm_dialog import CloseConfirmDialog
+        from PyQt6.QtWidgets import QDialog
+        dlg = CloseConfirmDialog(
+            self,
+            title="确认关闭低积分浏览器",
+            header_text=f"将关闭以下 {len(low)} 个低积分浏览器（阈值：<{self.threshold} 积分）：",
+            items=items,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = dlg.get_selected_clients()
+        if not selected:
+            return
+
+        for c in selected:
             email = self._email(c)
             self.mw.account_monitor._request_close(c["client_id"], f"{self._label(email)}（{c.get('remaining_points')} 积分）", email)
-        self._log(f"已发送关闭指令给 {len(low)} 个低积分浏览器（详情见「账号积分管理」日志）")
+        self._log(f"已发送关闭指令给 {len(selected)} 个低积分浏览器（详情见「账号积分管理」日志）")
 
     def _busy(self):
         return self.running or self.upload_group_active or bool(self.upload_queue)
