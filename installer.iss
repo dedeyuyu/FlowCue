@@ -48,4 +48,4 @@ Name: "{group}\卸载 FlowCue"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\FlowCue"; Filename: "{app}\FlowCue.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\FlowCue.exe"; Description: "启动 FlowCue"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\FlowCue.exe"; Description: "启动 FlowCue"; Flags: nowait postinstall

@@ -138,7 +138,8 @@ class MainWindow(QMainWindow):
         self.load_initial_state()
 
     def init_ui(self):
-        self.setWindowTitle("FlowCue v1.0.0")
+        from version import __version__
+        self.setWindowTitle(f"FlowCue v{__version__}")
         self.resize(1200, 800)
         self.setMinimumSize(1000, 600)
         
@@ -301,7 +302,18 @@ class MainWindow(QMainWindow):
         self.btn_refresh_points.setToolTip("向所有已连接的浏览器插件发送指令，模拟点击头像以获取最新真实点数")
         self.btn_refresh_points.clicked.connect(self.manual_refresh_plugin_points)
         top_layout.addWidget(self.btn_refresh_points)
-        
+
+        self.btn_check_update = QPushButton("⬆️ 检查更新")
+        self.btn_check_update.setStyleSheet("""
+            QPushButton { background-color: #2563EB; color: white; font-size: 12px;
+                          font-weight: bold; padding: 4px 10px; border-radius: 4px; }
+            QPushButton:hover { background-color: #1D4ED8; }
+        """)
+        self.btn_check_update.setToolTip("检查 GitHub 上是否有新版本，并可一键下载安装")
+        self.btn_check_update.clicked.connect(self.open_update_dialog)
+        top_layout.addWidget(self.btn_check_update)
+        QTimer.singleShot(6000, self._silent_update_check)
+
         main_layout.addLayout(top_layout)
         
         # 2. Main Area (Splitter: Sidebar and Details)
@@ -662,6 +674,29 @@ class MainWindow(QMainWindow):
         # Notify detail widget if current project matches
         if self.detail_widget.project_model and self.detail_widget.project_model.project_id == project_id:
             self.detail_widget.on_download_finished(success, msg)
+
+    def open_update_dialog(self):
+        from views.update_dialog import UpdateDialog
+        dlg = UpdateDialog(self, auto_check=True)
+        dlg.exec()
+
+    def _silent_update_check(self):
+        """启动后静默检查一次；有新版本时仅把按钮改成醒目提示，不弹窗打扰。"""
+        try:
+            from services.updater import CheckUpdateThread
+            self._silent_check_thread = CheckUpdateThread()
+
+            def _done(res):
+                if res.get("has_update"):
+                    self.btn_check_update.setText(f"🆕 有新版本 v{res['version']}")
+                    self.btn_check_update.setStyleSheet(
+                        "QPushButton { background-color: #DC2626; color: white; font-size: 12px;"
+                        " font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
+                        "QPushButton:hover { background-color: #B91C1C; }")
+            self._silent_check_thread.finished_signal.connect(_done)
+            self._silent_check_thread.start()
+        except Exception:
+            pass
 
     def delete_selected_project(self):
         """Permanently deletes the selected project folder and files."""
