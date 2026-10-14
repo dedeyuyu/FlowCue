@@ -84,8 +84,8 @@ class PluginServer(QObject):
             host = (parsed.hostname or "").lower()
             if origin.startswith("chrome-extension://") or origin.startswith("file://"):
                 return True
-            allowed_hosts = {"labs.google", "flow.google.com", "localhost", "127.0.0.1"}
-            if host in allowed_hosts or host.endswith(".labs.google") or host.endswith(".flow.google.com"):
+            allowed_hosts = {"labs.google", "flow.google.com", "docs.google.com", "localhost", "127.0.0.1"}
+            if host in allowed_hosts or host.endswith(".labs.google") or host.endswith(".flow.google.com") or host == "docs.google.com":
                 return True
         except Exception as e:
             logger.warning(f"Error parsing origin {origin}: {e}")

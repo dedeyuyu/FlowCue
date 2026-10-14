@@ -167,10 +167,21 @@ async function handleDownload(url, filename, task) {
       throw new Error("缺少媒体 ID 或任务文件名绑定，拒绝下载");
     }
     const parsed = new URL(url);
-    const isVidsHost = parsed.hostname.endsWith(".usercontent.google.com") ||
+    const isVidsHost = (
+      parsed.hostname.endsWith(".usercontent.google.com") ||
       parsed.hostname.endsWith(".googleusercontent.com") ||
-      parsed.hostname === "docs.google.com" ||
-      !!task.isVids;
+      parsed.hostname === "docs.google.com"
+    );
+    const isGoogleFlowHost = (
+      parsed.hostname === "flow-content.google" ||
+      parsed.hostname === "labs.google" ||
+      parsed.hostname.endsWith(".labs.google")
+    );
+    if (!isVidsHost && !isGoogleFlowHost) {
+      console.error(`[Background] ❌ 拒绝下载: 域名不在受信任的 Google CDN 白名单中: ${parsed.hostname}`);
+      throw new Error("下载域名不受信任，已安全拦截");
+    }
+
     const mediaId = parsed.hostname === "flow-content.google" ? parsed.pathname.match(/^\/video\/([a-zA-Z0-9_-]+)$/)?.[1] :
       parsed.hostname === "labs.google" && parsed.pathname === "/fx/api/trpc/media.getMediaUrlRedirect" ?
         ((parsed.searchParams.get("name") || "").split("/media/").pop().replace(/^media\//, "")) :
@@ -184,6 +195,10 @@ async function handleDownload(url, filename, task) {
     if (sanitizedFilename.split("/").some(part => !part || part === "." || part === ".." || /[<>:"|?*]/.test(part))) {
       console.error(`[Background] ❌ 拒绝下载: 文件名包含非法字符: ${sanitizedFilename}`);
       throw new Error("下载文件名无效");
+    }
+    if (!sanitizedFilename.toLowerCase().endsWith(".mp4")) {
+      console.error(`[Background] ❌ 拒绝下载: 仅允许下载 .mp4 视频文件: ${sanitizedFilename}`);
+      throw new Error("文件类型不安全，仅允许 .mp4 视频");
     }
     // 在 Chrome 触发文件命名事件之前保存这个 URL 的独立文件名。
     await chrome.storage.session.set({ [`filename_${url}`]: sanitizedFilename });
