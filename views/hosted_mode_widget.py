@@ -199,6 +199,10 @@ class HostedModeWidget(QWidget):
         self.btn_reupload = self._btn("🔁 重新上传失败图片", "#EA580C", "#C2410C")
         self.btn_reupload.clicked.connect(lambda: self.start_upload(retry_only=True))
         l2.addWidget(self.btn_reupload)
+        self.btn_flip_failed = self._btn("↔️ 一键翻转失败图片", "#0D9488", "#0F766E")
+        self.btn_flip_failed.setToolTip("将所有上传失败的图片进行左右翻转，用新图片替换并删除原图（保留原文件名）")
+        self.btn_flip_failed.clicked.connect(self.flip_failed_upload_images)
+        l2.addWidget(self.btn_flip_failed)
         l2.addSpacing(20)
         self.btn_run = self._btn("🚀 步骤3：发送任务并开始生成", "#16A34A", "#15803D")
         self.btn_run.clicked.connect(self.start_run)
@@ -840,10 +844,101 @@ class HostedModeWidget(QWidget):
     def _finish_upload_summary(self):
         ok = sum(1 for b in self.batches if b["upload_state"] == "成功")
         bad = [b for b in self.batches if b["upload_state"] == "失败"]
-        self._log(f"📤 上传结束：{ok} 批成功，{len(bad)} 批有失败图片" + ("（可点击「重新上传失败图片」）" if bad else ""))
+        self._log(f"📤 上传结束：{ok} 批成功，{len(bad)} 批有失败图片" + ("（可点击「↔️ 一键翻转失败图片」或「🔁 重新上传失败图片」）" if bad else ""))
         for b in bad:
             self._log(f"   ❌ {b['short']}：" + "；".join(f"{Path(p).name}({r})" for p, r in b["upload_failed"].items()))
         self.refresh_all()
+
+    def flip_failed_upload_images(self):
+        """
+        一键将所有上传失败的图片进行左右翻转：
+        生成翻转后的新图片替换原来的老图片，继承原图片名称，并删除原图片文件。
+        """
+        if self._busy():
+            QMessageBox.warning(self, "提示", "正在上传或生成中，请先停止后再翻转图片。")
+            return
+
+        failed_paths = []
+        for b in self.batches:
+            for p in (b.get("upload_failed") or {}).keys():
+                if p and p not in failed_paths:
+                    failed_paths.append(p)
+
+        if not failed_paths:
+            QMessageBox.information(self, "提示", "当前没有上传失败的图片。")
+            return
+
+        from views.project_detail_widget import flip_image_horizontally_replace, encode_image_to_data_url
+
+        # 若当前打开的项目正显示预览图，先清空引用以免占用文件句柄
+        detail = getattr(self.mw, "detail_widget", None)
+        if detail and hasattr(detail, "lbl_preview"):
+            detail.lbl_preview.clear()
+
+        flipped_ok = []
+        flipped_err = {}
+        new_data_urls = {}
+
+        for p in failed_paths:
+            try:
+                flip_image_horizontally_replace(p)
+                flipped_ok.append(p)
+                new_data_urls[p] = encode_image_to_data_url(p)
+            except Exception as e:
+                flipped_err[p] = str(e)
+
+        # 同步更新批次任务中的 Base64 数据与失败提示说明
+        ok_set = set(flipped_ok)
+        for b in self.batches:
+            for p in list((b.get("upload_failed") or {}).keys()):
+                if p in ok_set:
+                    b["upload_failed"][p] = "已左右翻转（待重新上传）"
+            for t in b.get("tasks") or []:
+                lp = t.get("local_image_path")
+                if lp in new_data_urls and new_data_urls[lp]:
+                    t["image_data_url"] = new_data_urls[lp]
+                    t["imageDataUrl"] = new_data_urls[lp]
+                elp = t.get("end_local_image_path")
+                if elp in new_data_urls and new_data_urls[elp]:
+                    t["end_image_data_url"] = new_data_urls[elp]
+                    t["endImageDataUrl"] = new_data_urls[elp]
+
+        # 同步刷新项目管理资源面板（若已打开）
+        if detail and getattr(detail, "project_path", None):
+            try:
+                detail.refresh_media_list()
+                detail.on_media_selection_changed(detail.list_media.currentItem(), None)
+            except Exception:
+                pass
+
+        self.refresh_all()
+
+        if flipped_ok:
+            names_str = "、".join(Path(p).name for p in flipped_ok)
+            self._log(f"↔️ 已左右翻转并替换 {len(flipped_ok)} 张失败图片：{names_str}")
+        if flipped_err:
+            err_str = "；".join(f"{Path(p).name}({r})" for p, r in flipped_err.items())
+            self._log(f"❌ 有 {len(flipped_err)} 张图片翻转失败：{err_str}")
+
+        if flipped_ok:
+            err_note = f"\n\n⚠️ 另有 {len(flipped_err)} 张翻转失败：\n" + "\n".join(
+                f"{Path(p).name}: {r}" for p, r in list(flipped_err.items())[:8]
+            ) if flipped_err else ""
+            reply = QMessageBox.question(
+                self, "翻转完成",
+                f"已成功将 {len(flipped_ok)} 张上传失败的图片左右翻转！\n"
+                f"（新图片已替换并删除原图，保留原文件名）{err_note}\n\n"
+                f"是否立即重新上传这些失败图片？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.start_upload(retry_only=True)
+        else:
+            QMessageBox.critical(
+                self, "翻转失败",
+                "所有失败图片翻转均未成功：\n\n" + "\n".join(f"{Path(p).name}: {r}" for p, r in list(flipped_err.items())[:10])
+            )
 
     # ──────────────────────────────── RPC 响应
     def _on_rpc_response(self, payload):

@@ -39,6 +39,30 @@ class ConfigManager:
         ("ar", "阿拉伯语 (Arabic)"),
     ]
     
+    # Video generation default rules
+    DEFAULT_TASK_INTERVAL = 5
+    DEFAULT_GENERATION_MODE = "VIDEO_FRAMES"
+    DEFAULT_ASPECT_RATIO = "9:16"
+    DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
+    
+    SUPPORTED_GENERATION_MODES = [
+        ("VIDEO_FRAMES", "帧模式 (First Frame / 影格)"),
+        ("VIDEO_REFERENCES", "素材模式 (Ingredients / 素材)"),
+    ]
+    
+    SUPPORTED_ASPECT_RATIOS = [
+        ("9:16", "9:16 (竖屏)"),
+        ("16:9", "16:9 (横屏)"),
+    ]
+    
+    SUPPORTED_VIDEO_MODELS = [
+        ("omni_1_1_flash", "Omni 1.1 Flash (默认)"),
+        ("veo_3_1_lite", "Veo 3.1 - Lite"),
+        ("veo_3_1_fast", "Veo 3.1 - Fast"),
+        ("veo_3_1_quality", "Veo 3.1 - Quality"),
+        ("veo_3_1_lite_low_priority", "Veo 3.1 - Lite [Lower Priority]"),
+    ]
+    
     def __init__(self, workspace_dir):
         self.workspace_dir = Path(workspace_dir)
         self.config_path = self.workspace_dir / self.CONFIG_FILE_NAME
@@ -64,6 +88,12 @@ class ConfigManager:
         # End frame settings
         self.DEFAULT_ENABLE_END_FRAME = False
         self.enable_end_frame = self.DEFAULT_ENABLE_END_FRAME
+        
+        # Video generation default rules
+        self.task_interval = self.DEFAULT_TASK_INTERVAL
+        self.default_generation_mode = self.DEFAULT_GENERATION_MODE
+        self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
+        self.default_video_model = self.DEFAULT_VIDEO_MODEL
         
         self._load_dotenv()
         self.load()
@@ -134,6 +164,25 @@ class ConfigManager:
                     
                     # Load end frame setting
                     self.enable_end_frame = data.get("enable_end_frame", getattr(self, "DEFAULT_ENABLE_END_FRAME", False))
+                    
+                    # Load video generation default rules
+                    try:
+                        raw_interval = data.get("task_interval", self.DEFAULT_TASK_INTERVAL)
+                        self.task_interval = max(0, int(raw_interval))
+                    except (ValueError, TypeError):
+                        self.task_interval = self.DEFAULT_TASK_INTERVAL
+                        
+                    mode_val = data.get("default_generation_mode", self.DEFAULT_GENERATION_MODE)
+                    valid_modes = {m[0] for m in self.SUPPORTED_GENERATION_MODES}
+                    self.default_generation_mode = mode_val if mode_val in valid_modes else self.DEFAULT_GENERATION_MODE
+                    
+                    aspect_val = data.get("default_aspect_ratio", self.DEFAULT_ASPECT_RATIO)
+                    valid_aspects = {a[0] for a in self.SUPPORTED_ASPECT_RATIOS}
+                    self.default_aspect_ratio = aspect_val if aspect_val in valid_aspects else self.DEFAULT_ASPECT_RATIO
+                    
+                    model_val = data.get("default_video_model", self.DEFAULT_VIDEO_MODEL)
+                    valid_models = {m[0] for m in self.SUPPORTED_VIDEO_MODELS}
+                    self.default_video_model = model_val if model_val in valid_models else self.DEFAULT_VIDEO_MODEL
             except Exception as e:
                 print(f"Error loading config: {e}")
 
@@ -163,7 +212,11 @@ class ConfigManager:
             "speech_language": self.speech_language,
             "enable_plugin_server": self.enable_plugin_server,
             "plugin_server_port": self.plugin_server_port,
-            "enable_end_frame": self.enable_end_frame
+            "enable_end_frame": self.enable_end_frame,
+            "task_interval": self.task_interval,
+            "default_generation_mode": self.default_generation_mode,
+            "default_aspect_ratio": self.default_aspect_ratio,
+            "default_video_model": self.default_video_model
         })
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
@@ -179,6 +232,10 @@ class ConfigManager:
         self.char_duration_rules = [dict(r) for r in self.DEFAULT_CHAR_DURATION_RULES]
         self.duration_points_rules = [dict(r) for r in self.DEFAULT_DURATION_POINTS_RULES]
         self.enable_end_frame = getattr(self, "DEFAULT_ENABLE_END_FRAME", False)
+        self.task_interval = self.DEFAULT_TASK_INTERVAL
+        self.default_generation_mode = self.DEFAULT_GENERATION_MODE
+        self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
+        self.default_video_model = self.DEFAULT_VIDEO_MODEL
         self.save()
 
     def get_duration_for_length(self, length):

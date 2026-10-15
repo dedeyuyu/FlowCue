@@ -310,6 +310,12 @@ class BatchGenerateTabWidget(QWidget):
         all_tasks = []
         skipped_count = 0
         
+        cm = getattr(self.main_window, "config_manager", None) if self.main_window else None
+        default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
+        default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
+        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        task_interval = getattr(cm, "task_interval", 5) if cm else 5
+        
         for idx, img in enumerate(images):
             image_path = Path(img.get("path", ""))
             image_stem = image_path.stem
@@ -337,9 +343,10 @@ class BatchGenerateTabWidget(QWidget):
                 "image_name": image_path.name,
                 "local_image_path": str(image_path.resolve()),
                 "duration": img.get("duration", 8),
-                "mode": "VIDEO_FRAMES",
-                "model": "omni_1_1_flash",
-                "aspect_ratio": self.current_project.get("aspect_ratio", "16:9"),
+                "mode": default_mode,
+                "model": default_model,
+                "interval": task_interval,
+                "aspect_ratio": self.current_project.get("aspect_ratio", default_aspect),
                 "download_path": str(download_path_obj.resolve())
             }
             all_tasks.append(task_dict)
@@ -356,13 +363,17 @@ class BatchGenerateTabWidget(QWidget):
         max_batch_points = self.sb_points.value()
         
         class MockCM:
-            def __init__(self, pts):
+            def __init__(self, pts, real_cm=None):
                 self.max_batch_points = pts
+                self.default_generation_mode = getattr(real_cm, "default_generation_mode", "VIDEO_FRAMES") if real_cm else "VIDEO_FRAMES"
+                self.default_aspect_ratio = getattr(real_cm, "default_aspect_ratio", "9:16") if real_cm else "9:16"
+                self.default_video_model = getattr(real_cm, "default_video_model", "omni_1_1_flash") if real_cm else "omni_1_1_flash"
+                self.task_interval = getattr(real_cm, "task_interval", 5) if real_cm else 5
             def get_points_for_duration(self, dur):
                 points_map = {10: 15, 8: 12, 6: 10, 4: 7}
                 return points_map.get(dur, 10)
                 
-        cm_mock = MockCM(max_batch_points)
+        cm_mock = MockCM(max_batch_points, cm)
         
         def get_task_points(task):
             return cm_mock.get_points_for_duration(task.get("duration", 4))
@@ -461,12 +472,19 @@ class BatchGenerateTabWidget(QWidget):
         ws = Path(self.main_window.workspace_dir) if hasattr(self.main_window, 'workspace_dir') else Path('.')
         project_name = self.current_project.get("name", "批量任务")
         download_path = str((ws / project_name / f"{image_path.stem}.mp4").resolve())
+        cm = getattr(self.main_window, "config_manager", None) if self.main_window else None
+        default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
+        default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
+        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        task_interval = getattr(cm, "task_interval", 5) if cm else 5
         data = [{
             "prompt": img.get("prompt", ""),
             "image": image_path.name,
             "duration": img.get("duration", 8),
-            "mode": "VIDEO_FRAMES",
-            "aspect_ratio": self.current_project.get("aspect_ratio", "16:9"),
+            "mode": default_mode,
+            "model": default_model,
+            "interval": task_interval,
+            "aspect_ratio": self.current_project.get("aspect_ratio", default_aspect),
             "download_path": download_path
         }]
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
@@ -480,6 +498,11 @@ class BatchGenerateTabWidget(QWidget):
         
         ws = Path(self.main_window.workspace_dir) if hasattr(self.main_window, 'workspace_dir') else Path('.')
         project_name = self.current_project.get("name", "批量任务")
+        cm = getattr(self.main_window, "config_manager", None) if self.main_window else None
+        default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
+        default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
+        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        task_interval = getattr(cm, "task_interval", 5) if cm else 5
         out = []
         for i in images:
             image_path = Path(i.get("path", ""))
@@ -488,8 +511,10 @@ class BatchGenerateTabWidget(QWidget):
                 "prompt": i.get("prompt", ""), 
                 "image": image_path.name, 
                 "duration": i.get("duration", 8), 
-                "mode": "VIDEO_FRAMES",
-                "aspect_ratio": self.current_project.get("aspect_ratio", "16:9"),
+                "mode": default_mode,
+                "model": default_model,
+                "interval": task_interval,
+                "aspect_ratio": self.current_project.get("aspect_ratio", default_aspect),
                 "download_path": download_path
             })
             

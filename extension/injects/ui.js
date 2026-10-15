@@ -139,8 +139,8 @@
     activeTasksQueue: [],  // FIFO 活跃任务排队队列，用于与完成的视频松散匹配
     downloadedUrls: [],    // 已下载视频 URL 记录，防止重复下载
     settings: {
-      interval: 20,        // 每次生成的间隔基数(秒)
-      intervalRandom: 10,  // 随机抖动上限(秒)
+      interval: 5,         // 每次生成的间隔基数(秒，默认 5 秒，遵循软件规则设置)
+      intervalRandom: 0,   // 随机抖动上限(秒，默认 0 秒，严格按设定间隔执行)
       maxLetterFor4s: 40,  // 4s视频最大字数
       maxLetterFor6s: 60,  // 6s视频最大字数
       defaultCount: 1,     // 默认生成数量
@@ -230,9 +230,11 @@
       }
       if (saved[`tasks_${key}`]) state.tasks = saved[`tasks_${key}`];
       if (saved.settings) state.settings = { ...state.settings, ...saved.settings };
-      // 迁移: 旧默认值 VIDEO_REFERENCES 自动升级为 omni_1_1_flash
-      if (state.settings.videoModel === "VIDEO_REFERENCES") {
+      // 迁移: 旧默认值 VIDEO_REFERENCES / veo_fast 自动升级为标准模型 ID
+      if (state.settings.videoModel === "VIDEO_REFERENCES" || !state.settings.videoModel) {
         state.settings.videoModel = "omni_1_1_flash";
+      } else if (state.settings.videoModel === "veo_fast") {
+        state.settings.videoModel = "veo_3_1_fast";
       }
       if (saved.presets) state.presets = saved.presets;
       if (saved[`taskRecord_${key}`]) state.taskRecord = saved[`taskRecord_${key}`];
@@ -382,12 +384,12 @@
             
             <div class="settings-group">
               <label>生成间隔基数 (秒)</label>
-              <input type="number" class="settings-input" id="cfg-interval" min="5" value="20">
+              <input type="number" class="settings-input" id="cfg-interval" min="0" value="5">
             </div>
             
             <div class="settings-group">
               <label>随机抖动时间 (秒)</label>
-              <input type="number" class="settings-input" id="cfg-random" min="0" value="10">
+              <input type="number" class="settings-input" id="cfg-random" min="0" value="0">
             </div>
             
             <div class="settings-group">
@@ -413,10 +415,11 @@
               <label>视频生成模型</label>
               <select class="settings-input" id="cfg-model" style="background: rgba(255,255,255,0.05); color: var(--flow-text-primary);">
                 <option value="omni_1_1_flash" selected>Omni 1.1 Flash (默认)</option>
-                <option value="VIDEO_REFERENCES">VIDEO_REFERENCES (素材参考模型)</option>
-                <option value="veo_2">Veo 2 (高画质)</option>
-                <option value="veo_3_1_lite_low_priority">Veo 3.1 Lite (低优先级 / 快速)</option>
-                <option value="veo_fast">Veo 3.1 Fast (极速模式)</option>
+                <option value="veo_3_1_lite">Veo 3.1 - Lite</option>
+                <option value="veo_3_1_fast">Veo 3.1 - Fast</option>
+                <option value="veo_3_1_quality">Veo 3.1 - Quality</option>
+                <option value="veo_3_1_lite_low_priority">Veo 3.1 - Lite [Lower Priority]</option>
+                <option value="veo_2">Veo 2</option>
               </select>
             </div>
 
@@ -645,7 +648,7 @@
     setVal("cfg-max4s", state.settings.maxLetterFor4s);
     setVal("cfg-max6s", state.settings.maxLetterFor6s);
     setVal("cfg-aspect", state.settings.aspectRatio || "ASPECT_RATIO_9_16");
-    setVal("cfg-model", state.settings.videoModel || "VIDEO_REFERENCES");
+    setVal("cfg-model", state.settings.videoModel || "omni_1_1_flash");
     setVal("cfg-resolution", state.settings.resolution || "VIDEO_RESOLUTION_720P");
     setVal("cfg-footagetype", state.settings.footageType || "VIDEO_FRAMES");
     
@@ -834,7 +837,10 @@
       const el = document.getElementById(elementId);
       if (el) {
         el.addEventListener("change", (e) => {
-          state.settings[settingKey] = parseInt(e.target.value, 10) || state.settings[settingKey];
+          const val = parseInt(e.target.value, 10);
+          if (!Number.isNaN(val) && val >= 0) {
+            state.settings[settingKey] = val;
+          }
           saveState();
         });
       }
@@ -899,13 +905,19 @@
   // ----------------------------------------------------
   // 4. 加载页面图片
   // ----------------------------------------------------
-  // 检查是否为 Google Flow 系统按钮/热键图标文字（排除取消收藏、更多选项等噪声）
+  // 检查是否为 Google Flow 系统按钮/热键图标文字（排除取消收藏、更多选项等噪声，兼容简中/繁中/英文）
   function isSystemHotbarLabel(text) {
     if (!text || typeof text !== "string") return true;
     const t = text.trim().toLowerCase();
-    return t === "取消收藏" || t === "收藏" || t === "更多选项" || t === "favorite" || 
-           t === "more_vert" || t === "image" || t === "play_circle" || t === "download" || 
-           t === "显示用户图片的图块" || t === "图块" || t === "unfavorite" || t === "more options";
+    const systemSet = new Set([
+      "取消收藏", "收藏", "加入最愛", "移除最愛", "取消最愛", "favorite", "unfavorite", "add to favorites", "remove from favorites",
+      "更多选项", "更多選項", "更多项目选项", "更多專案選項", "more_vert", "more options", "more project options",
+      "image", "play_circle", "play_arrow", "download", "redo", "delete", "search", "filter_list", "add", "home", "help", "swap_horiz",
+      "显示用户图片的图块", "顯示使用者圖像的圖塊", "顯示使用者圖片的圖塊", "tile showing user image", "user image tile",
+      "生成的视频缩略图", "生成的影片縮圖", "generated video thumbnail", "video thumbnail",
+      "图块", "圖塊", "tile", "重复使用提示词", "重複使用提示詞", "reuse prompt"
+    ]);
+    return systemSet.has(t);
   }
 
   // 精准提取媒体图块标题名称
@@ -1034,7 +1046,7 @@
     const images = [];
     const seenIds = new Set();
 
-    // 1. 优先从所有图块容器中扫描
+    // 1. 优先从所有图块容器中扫描（排除视频图块 flow-video-tile）
     const candidateContainers = document.querySelectorAll(
       "flow-grid-tile-container, " +
       "flow-image-tile, " +
@@ -1045,8 +1057,9 @@
     );
 
     candidateContainers.forEach((container, idx) => {
+      if (container.tagName === "FLOW-VIDEO-TILE" || container.querySelector?.("flow-video-tile") || container.closest?.("flow-video-tile")) return;
       const img = container.querySelector("img");
-      if (!img) return;
+      if (!img || img.classList.contains("thumbnail")) return;
       const src = img.src || img.getAttribute("src") || "";
       if (!src || src.includes("avatar") || src.includes("favicon") || src.includes("googlelogo") || src.startsWith("data:image/svg") || img.closest(".gb_X, .gbii")) return;
 
@@ -1195,9 +1208,13 @@
     return out.filter(x => { const k = x.path.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
   }
 
-  // 定位 Flow 的拖放区域（「开始创建或拖放媒体」/ 素材网格）
+  // 定位 Flow 的拖放区域（「开始创建或拖放媒体」/ 素材网格，兼容简中/繁中/英文）
   function findFlowDropPoint() {
-    const phrases = ["开始创建或拖放媒体", "拖放媒体", "drop media", "drag media", "drop files", "drag files"];
+    const phrases = [
+      "开始创建或拖放媒体", "拖放媒体", "开始创建",
+      "開始建立或拖放媒體", "拖放媒體", "新增媒體", "上傳項目",
+      "drop media", "drag media", "drop files", "drag files", "start creating"
+    ];
     let best = null;
     document.querySelectorAll("div,section,main,[role='main'],[role='button'],span,p").forEach(el => {
       if (el.closest("#flow-batch-overlay, #flow-import-dialog, #flow-alarm-dialog, #flow-batch-fab")) return;
@@ -1497,7 +1514,7 @@
       const statusList = new Array(linesCount).fill("pending");
       const messageList = new Array(linesCount).fill("等待批量调度");
 
-      // 提取 JSON 中可能指定的独立比例、分辨率和模型 (具备智能归一化)
+      // 提取 JSON 中可能指定的独立比例、分辨率、模型和间隔时间 (具备智能归一化与规则同步)
       const rawAspect = item.aspect_ratio || item.aspectRatio || "";
       let taskAspect = state.settings.aspectRatio;
       if (rawAspect.includes("9:16") || rawAspect.includes("9_16") || String(rawAspect).toUpperCase().includes("PORTRAIT")) {
@@ -1514,12 +1531,40 @@
       else if (String(rawRes).includes("1080")) taskRes = "VIDEO_RESOLUTION_1080P";
       else if (String(rawRes).includes("720")) taskRes = "VIDEO_RESOLUTION_720P";
 
-      const rawModel = item.model || item.video_model || "";
-      let taskModel = state.settings.videoModel;
-      if (String(rawModel).toLowerCase().includes("omni") || String(rawModel).toLowerCase().includes("flash")) taskModel = "omni_1_1_flash";
-      else if (String(rawModel).includes("3_1") || String(rawModel).toLowerCase().includes("lite")) taskModel = "veo_3_1_lite_low_priority";
-      else if (String(rawModel).toLowerCase().includes("fast")) taskModel = "veo_fast";
-      else if (String(rawModel).includes("veo_2") || String(rawModel).includes("veo2")) taskModel = "veo_2";
+      const rawModel = String(item.model || item.video_model || "").trim().toLowerCase();
+      let taskModel = state.settings.videoModel || "omni_1_1_flash";
+      if (rawModel) {
+        if (rawModel.includes("omni") || rawModel.includes("flash")) {
+          taskModel = "omni_1_1_flash";
+        } else if (rawModel.includes("low_priority") || rawModel.includes("lower priority") || rawModel.includes("lowpriority") || rawModel.includes("低优先级") || rawModel.includes("低優先順序")) {
+          taskModel = "veo_3_1_lite_low_priority";
+        } else if (rawModel.includes("quality")) {
+          taskModel = "veo_3_1_quality";
+        } else if (rawModel.includes("fast")) {
+          taskModel = "veo_3_1_fast";
+        } else if (rawModel.includes("lite")) {
+          taskModel = "veo_3_1_lite";
+        } else if (rawModel.includes("veo_2") || rawModel.includes("veo2") || rawModel === "veo 2") {
+          taskModel = "veo_2";
+        }
+      }
+
+      const rawInterval = item.interval ?? item.task_interval;
+      let taskInterval = null;
+      if (rawInterval !== undefined && rawInterval !== null && rawInterval !== "") {
+        const parsedInt = Number(rawInterval);
+        if (Number.isFinite(parsedInt) && parsedInt >= 0) {
+          taskInterval = parsedInt;
+          // 同步软件规则设置的间隔时间到全局设置，并将随机抖动归零以严格执行该间隔
+          state.settings.interval = taskInterval;
+          state.settings.intervalRandom = 0;
+        }
+      }
+
+      // 同步软件规则设置的默认参数到插件面板
+      if (rawAspect) state.settings.aspectRatio = taskAspect;
+      if (rawModel) state.settings.videoModel = taskModel;
+      if (item.mode || item.footageType) state.settings.footageType = mode;
 
       state.tasks.push({
         image: finalTaskImage,
@@ -1534,10 +1579,22 @@
         duration: duration,
         aspectRatio: taskAspect,
         resolution: taskRes,
-        videoModel: taskModel
+        videoModel: taskModel,
+        interval: taskInterval
       });
       importCount++;
     });
+
+    // 同步更新设置抽屉 DOM 控件显示
+    const syncDomVal = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && val !== undefined && val !== null) el.value = val;
+    };
+    syncDomVal("cfg-interval", state.settings.interval);
+    syncDomVal("cfg-random", state.settings.intervalRandom);
+    syncDomVal("cfg-aspect", state.settings.aspectRatio);
+    syncDomVal("cfg-model", state.settings.videoModel);
+    syncDomVal("cfg-footagetype", state.settings.footageType);
 
     return importCount;
   }
@@ -1958,8 +2015,10 @@
         try { bd.click(); } catch (_) {}
       });
 
-      // 若意外打开了素材/大图详情面板，自动点击返回或关闭按钮退出大图模式
-      const detailExitBtn = document.querySelector("button[aria-label='返回'], button[aria-label='Back'], button[aria-label='关闭'], button[aria-label='Close'], .asset-detail-back, flow-asset-detail button:first-child");
+      // 若意外打开了素材/大图详情面板，自动点击返回或关闭按钮退出大图模式（兼容简中/繁中/英文）
+      const detailExitBtn = document.querySelector(
+        "button[aria-label='返回'], button[aria-label='Back'], button[aria-label='关闭'], button[aria-label='關閉'], button[aria-label='Close'], .asset-detail-back, flow-asset-detail button:first-child"
+      );
       if (detailExitBtn && !detailExitBtn.disabled) {
         console.log("[FlowUI] 检测到大图/素材详情面板，自动点击退出");
         try { detailExitBtn.click(); } catch (_) {}
@@ -1996,7 +2055,7 @@
   }
 
   // ====================================================
-  // 7.5 Google Vids 专属逐个任务自动化生成与下载引擎
+  // 7.5 Google Vids 专属逐个任务自动化生成与下载引擎 (兼容简中/繁中/英文)
   // ====================================================
   async function ensureVidsSidebarAndAnimateTab() {
     // 1. 若存在初始模板欢迎弹窗，自动点击“生成 AI 视频片段”或按 Escape 关闭
@@ -2012,7 +2071,7 @@
       await delay(700);
     }
 
-    // 2. 确保右侧“AI 视频片段”侧边栏处于打开状态
+    // 2. 确保右侧“AI 视频片段”侧边栏处于打开状态（兼容简中/繁中/英文）
     const isSidebarOpen = () => {
       const sb = document.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogensidebarSidebarContent, .appsDocsAiGenerativeaiVideoUiSidebarWizVideogensidebarWideSideSheet");
       return !!(sb && sb.offsetParent !== null && sb.getBoundingClientRect().width > 100);
@@ -2020,7 +2079,11 @@
 
     if (!isSidebarOpen()) {
       const railBtn = document.getElementById("content-library-rail-video-generation-element") ||
-                      document.querySelector('[aria-label="生成 AI 视频片段"], [data-tooltip="AI 视频片段"]');
+                      document.querySelector(
+                        '[aria-label="生成 AI 视频片段"], [aria-label="產生 AI 影片片段"], [aria-label="生成 AI 影片片段"], ' +
+                        '[aria-label*="AI 视频"], [aria-label*="AI 影片"], [aria-label*="AI video" i], ' +
+                        '[data-tooltip="AI 视频片段"], [data-tooltip="AI 影片片段"], [data-tooltip*="AI video" i]'
+                      );
       if (railBtn) {
         console.log("[Vids] 正在点击右侧边栏按钮打开 [AI 视频片段] 面板...");
         simulateClick(railBtn);
@@ -2031,18 +2094,19 @@
       }
     }
 
-    // 3. 确保切换到“添加动画”标签页
+    // 3. 确保切换到“添加动画”/“加入動畫”/“Animate”标签页（或第 2 个 Tab）
     let animateTab = null;
+    const animateRe = /(添加动画|加入動畫|新增動畫|加上動畫|動畫|动画|Animate|Add animation|Image)/i;
     for (let w = 0; w < 8; w++) {
-      animateTab = document.querySelector('button.collapsiblePromptBoxTabButton[aria-label="添加动画"]') ||
-                   Array.from(document.querySelectorAll('button.collapsiblePromptBoxTabButton[role="tab"], button[role="tab"]'))
-                     .find(b => (b.textContent || "").includes("添加动画") || (b.getAttribute("aria-label") || "").includes("添加动画"));
+      const tabs = Array.from(document.querySelectorAll('button.collapsiblePromptBoxTabButton[role="tab"], button.collapsiblePromptBoxTabButton, .collapsiblePromptBoxContainerWithTabs button[role="tab"]'));
+      animateTab = tabs.find(b => animateRe.test(b.textContent || "") || animateRe.test(b.getAttribute("aria-label") || "")) ||
+                   (tabs.length >= 2 ? tabs[1] : null);
       if (animateTab) break;
       await delay(400);
     }
 
     if (animateTab && animateTab.getAttribute("aria-selected") !== "true") {
-      console.log("[Vids] 正在切换到 [添加动画] 标签页...");
+      console.log("[Vids] 正在切换到 [添加动画 / 加入動畫 / Animate] 标签页...");
       simulateClick(animateTab);
       await delay(500);
     }
@@ -2055,9 +2119,9 @@
       const genBtn = document.querySelector("button.collapsiblePromptBoxGenerateButton");
       const genBtnVisible = !!(genBtn && genBtn.offsetParent !== null && genBtn.getBoundingClientRect().height > 0);
       const isExpandedClass = container ? container.classList.contains("collapsiblePromptBoxContainerWithTabsExpanded") : true;
-      const toggleLabel = toggleBtn ? (toggleBtn.getAttribute("aria-label") || "") : "";
+      const toggleLabel = toggleBtn ? (toggleBtn.getAttribute("aria-label") || "").trim() : "";
 
-      if (isExpandedClass && genBtnVisible && toggleLabel !== "展开") {
+      if (isExpandedClass && genBtnVisible && !/^(展开|展開|Expand)$/i.test(toggleLabel)) {
         return true;
       }
       if (toggleBtn && toggleBtn.offsetParent !== null) {
@@ -2079,18 +2143,22 @@
     await ensureVidsPromptBoxExpanded();
     await delay(250);
 
-    // 2. 点击“清除”按钮（同时清除上一次的提示词与已上传图片）
+    // 2. 点击“清除”/“Clear”按钮（同时清除上一次的提示词与已上传图片）
+    const clearRe = /(清除|清空|Clear)/i;
     const clearBtn = document.querySelector("button.promptTextAreaMenuBarClearLabel") ||
                      Array.from(document.querySelectorAll(".promptTextAreaMenuBarRightActions button, .promptTextAreaMenuBarV2Container button"))
-                       .find(b => (b.textContent || "").trim() === "清除" || (b.getAttribute("data-tooltip") || "").includes("清除"));
+                       .find(b => clearRe.test((b.textContent || "").trim()) || clearRe.test(b.getAttribute("data-tooltip") || "") || clearRe.test(b.getAttribute("aria-label") || ""));
     if (clearBtn && clearBtn.offsetParent !== null && !clearBtn.disabled && clearBtn.getAttribute("aria-disabled") !== "true") {
       console.log("[Vids] 点击 [清除] 按钮清空上一任务的提示词与图片...");
       simulateClick(clearBtn);
       await delay(500);
     }
 
-    // 3. 保底检查：若仍有残留图片预览，点击“移除图片”按钮
-    const removeImgBtn = document.querySelector('button.removeInputButtonButton[aria-label="移除图片"], .removeInputButtonContainer button');
+    // 3. 保底检查：若仍有残留图片预览，点击“移除图片”/“移除圖片”/“Remove image”按钮
+    const removeImgBtn = document.querySelector(
+      'button.removeInputButtonButton, .removeInputButtonContainer button, ' +
+      'button[aria-label="移除图片"], button[aria-label="移除圖片"], button[aria-label="移除圖像"], button[aria-label*="Remove" i]'
+    );
     if (removeImgBtn && removeImgBtn.offsetParent !== null) {
       console.log("[Vids] 点击 [移除图片] 按钮清理残留图片...");
       simulateClick(removeImgBtn);
@@ -2120,7 +2188,8 @@
   async function syncVidsVideoSettings({ aspectRatio, resolution, duration }) {
     await ensureVidsPromptBoxExpanded();
     const settingsBtn = document.querySelector(
-      "button.appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonGenerationSettingsButton, button[aria-label^='生成设置']"
+      "button.appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonGenerationSettingsButton, " +
+      "button[aria-label^='生成设置'], button[aria-label^='生成設定'], button[aria-label^='產生設定'], button[aria-label^='Generation settings' i]"
     );
     if (!settingsBtn) {
       console.warn("[Vids] 未找到 Vids 生成设置按钮，跳过设置同步");
@@ -2128,15 +2197,19 @@
     }
 
     const wantPortrait = !String(aspectRatio || "").includes("16_9") && !String(aspectRatio || "").includes("16:9");
-    const targetAspectLabel = wantPortrait ? "竖屏" : "横屏";
+    const targetAspectRe = wantPortrait
+      ? /(竖屏|豎屏|直向|直式|9:16|Portrait)/i
+      : /(横屏|橫屏|横向|橫向|橫式|16:9|Landscape)/i;
+    const targetAspectLabel = wantPortrait ? "竖屏/直向(9:16)" : "横屏/橫向(16:9)";
     const targetResLabel = String(resolution || "").includes("1080") ? "1080p" : "720p";
     const targetDuration = Math.min(10, Math.max(3, Math.round(Number(duration) || 8)));
 
     const ariaSummary = settingsBtn.getAttribute("aria-label") || "";
     const textSummary = (settingsBtn.textContent || "").replace(/\s+/g, "");
-    const aspectAlreadyOk = ariaSummary.includes(targetAspectLabel);
+    const aspectAlreadyOk = targetAspectRe.test(ariaSummary) || targetAspectRe.test(textSummary);
     const resAlreadyOk = ariaSummary.includes(targetResLabel) || textSummary.includes(targetResLabel);
-    const durAlreadyOk = ariaSummary.includes(`${targetDuration} 秒`) || textSummary.includes(`${targetDuration}s`);
+    const durRe = new RegExp(`(^|\\D)${targetDuration}\\s*(秒|s|sec|seconds)(\\D|$)`, "i");
+    const durAlreadyOk = durRe.test(ariaSummary) || durRe.test(textSummary);
 
     if (aspectAlreadyOk && resAlreadyOk && durAlreadyOk) {
       console.log(`[Vids] 当前生成设置 (${ariaSummary}) 已符合目标要求，无需打开设置菜单`);
@@ -2149,11 +2222,11 @@
 
     const popover = document.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonPopoverContainer");
     if (popover) {
-      // (a) 宽高比：横屏 / 竖屏
+      // (a) 宽高比：横屏 / 竖屏（兼容简中/繁中/英文）
       const aspectBtns = Array.from(popover.querySelectorAll(
         ".appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonAspectRatioButtonGroup button[role='radio'], button[role='radio']"
       ));
-      const targetAspectBtn = aspectBtns.find(b => (b.textContent || "").includes(targetAspectLabel));
+      const targetAspectBtn = aspectBtns.find(b => targetAspectRe.test(b.textContent || "") || targetAspectRe.test(b.getAttribute("aria-label") || ""));
       if (targetAspectBtn && targetAspectBtn.getAttribute("aria-checked") !== "true") {
         console.log(`[Vids] 切换宽高比 -> ${targetAspectLabel}`);
         simulateClick(targetAspectBtn);
@@ -2371,10 +2444,36 @@
     editor.dispatchEvent(new Event("change", { bubbles: true }));
     await delay(400);
 
-    // 等待生成按钮可用并点击
-    const findGenBtn = () => document.querySelector(
-      "button.collapsiblePromptBoxGenerateButton[aria-label='生成'], button.collapsiblePromptBoxGenerateButton"
-    );
+    // 等待生成按钮可用并点击（兼容简中/繁中/英文，严格排除顶部 Tab 按钮如「建立」）
+    const findGenBtn = () => {
+      const byClass = document.querySelector(
+        "button.collapsiblePromptBoxGenerateButton, " +
+        "button[data-idom-class*='collapsiblePromptBoxGenerateButton'], " +
+        ".promptTextAreaMenuBarRightActions button.collapsiblePromptBoxGenerateButton, " +
+        ".promptTextAreaMenuBarRightActions button:not(.promptTextAreaMenuBarClearLabel)"
+      );
+      if (byClass) return byClass;
+
+      const touchDiv = document.querySelector(
+        "button.collapsiblePromptBoxGenerateButton .javascriptMaterialdesignGm3WizIconButtonFilled-icon-button__touch, " +
+        ".promptTextAreaMenuBarRightActions .javascriptMaterialdesignGm3WizIconButtonFilled-icon-button__touch, " +
+        ".promptTextAreaMenuBarV2Container .javascriptMaterialdesignGm3WizIconButtonFilled-icon-button__touch"
+      );
+      if (touchDiv) {
+        const parentBtn = touchDiv.closest("button");
+        if (parentBtn) return parentBtn;
+      }
+
+      const candidates = Array.from(document.querySelectorAll(
+        "button[aria-label='生成'], button[aria-label='產生'], button[aria-label='傳送'], button[aria-label='发送'], button[aria-label='Generate' i]"
+      ));
+      return candidates.find(b =>
+        b.getAttribute("role") !== "tab" &&
+        !b.classList.contains("collapsiblePromptBoxTabButton") &&
+        !b.closest("[role='tablist']")
+      ) || null;
+    };
+
     let genBtn = null;
     for (let i = 0; i < 20; i++) {
       if (isStopRequested) throw new Error("用户已停止任务");
@@ -2397,9 +2496,34 @@
       genBtn.setAttribute("aria-disabled", "false");
     }
 
-    console.log("[Vids] 🚀 点击 [生成] 按钮提交当前任务...");
-    simulateClick(genBtn);
-    await delay(600);
+    const touchTarget = genBtn.querySelector(".javascriptMaterialdesignGm3WizIconButtonFilled-icon-button__touch") || genBtn;
+    console.log("[Vids] 🚀 点击 [生成] 按钮提交当前任务...", { genBtn, touchTarget });
+    const rect = touchTarget.getBoundingClientRect();
+    const cx = rect.width > 0 ? Math.round(rect.left + rect.width / 2) : 0;
+    const cy = rect.height > 0 ? Math.round(rect.top + rect.height / 2) : 0;
+    try {
+      if (typeof PointerEvent !== "undefined") {
+        touchTarget.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true }));
+        touchTarget.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true }));
+      }
+      touchTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
+      touchTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
+    } catch (_) {}
+    if (typeof touchTarget.click === "function") {
+      touchTarget.click();
+    } else {
+      genBtn.click();
+    }
+    await delay(400);
+
+    // 保底：若 400ms 后按钮仍处于可用未提交状态且提示词框仍展开，直接在 button 本体上补发一次点击
+    const stillBtn = findGenBtn();
+    const stillExpanded = document.querySelector(".collapsiblePromptBoxContainerWithTabsExpanded");
+    if (stillBtn && stillExpanded && !stillBtn.disabled && !stillBtn.hasAttribute("disabled") && stillBtn.getAttribute("aria-disabled") !== "true") {
+      console.log("[Vids] 🔁 检测到 touch 层点击后按钮仍未进入提交态，在 button 本体补发 click...");
+      stillBtn.click();
+    }
+    await delay(400);
   }
 
   async function runVidsBatch(singleRowIndex = null) {
@@ -2691,16 +2815,19 @@
           return;
         }
 
-        // 任务间隔等待
-        const intervalSec = Math.max(2, Number(state.settings.interval) || 5);
-        const intervalRand = Math.max(0, Number(state.settings.intervalRandom) || 3);
+        // 任务间隔等待 (严格遵循软件规则设置或面板设置，支持 0 秒及任意秒数)
+        const rawInterval = (task.interval !== undefined && task.interval !== null) ? Number(task.interval) : Number(state.settings.interval);
+        const intervalSec = (Number.isFinite(rawInterval) && rawInterval >= 0) ? rawInterval : 5;
+        const intervalRand = (task.interval !== undefined && task.interval !== null) ? 0 : Math.max(0, Number(state.settings.intervalRandom) || 0);
         const waitTime = Math.round(intervalSec + Math.random() * intervalRand);
-        const targetEndTime = Date.now() + waitTime * 1000;
-        while (Date.now() < targetEndTime) {
-          if (isStopRequested) break;
-          const rem = Math.max(1, Math.round((targetEndTime - Date.now()) / 1000));
-          showToast(`✅ [Vids ${rIdx + 1}/${state.tasks.length}] 已完成！${rem} 秒后自动展开清空并开始下一项...`, 1500);
-          await delay(1000);
+        if (waitTime > 0) {
+          const targetEndTime = Date.now() + waitTime * 1000;
+          while (Date.now() < targetEndTime) {
+            if (isStopRequested) break;
+            const rem = Math.max(1, Math.round((targetEndTime - Date.now()) / 1000));
+            showToast(`✅ [Vids ${rIdx + 1}/${state.tasks.length}] 已完成！${rem} 秒后自动展开清空并开始下一项...`, 1500);
+            await delay(1000);
+          }
         }
       }
     }
@@ -3021,18 +3148,27 @@
           return;
         }
 
-        // 任务下载完成后的批量间隔延时 (严格按照设定执行停顿，基于绝对时间戳保证失焦/后台准确走完)
-        const intervalSec = Math.max(0, Number(state.settings.interval) || 0);
-        const intervalRand = Math.max(0, Number(state.settings.intervalRandom) || 0);
+        // 任务下载完成后的批量间隔延时 (严格按照规则设置或当前设定执行停顿，基于绝对时间戳保证失焦/后台准确走完)
+        const baseInterval = (task.interval !== undefined && task.interval !== null && !isNaN(Number(task.interval)))
+          ? Number(task.interval)
+          : (state.settings.interval !== undefined ? Number(state.settings.interval) : 5);
+        const intervalSec = Math.max(0, baseInterval);
+        const intervalRand = (task.interval !== undefined && task.interval !== null)
+          ? 0
+          : Math.max(0, Number(state.settings.intervalRandom) || 0);
         const waitTime = Math.round(intervalSec + Math.random() * intervalRand);
-        const targetEndTime = Date.now() + waitTime * 1000;
-        console.log(`[Batch] 当前任务已完成，等待间隔延迟: ${waitTime} 秒后进入下一项`);
+        if (waitTime > 0) {
+          const targetEndTime = Date.now() + waitTime * 1000;
+          console.log(`[Batch] 当前任务已完成，等待间隔延迟: ${waitTime} 秒后进入下一项`);
 
-        while (Date.now() < targetEndTime) {
-          if (isStopRequested) break;
-          const remainingSec = Math.max(1, Math.round((targetEndTime - Date.now()) / 1000));
-          showToast(`当前视频已完成！将在 ${remainingSec} 秒后开始下一个任务...`, 1500);
-          await delay(1000);
+          while (Date.now() < targetEndTime) {
+            if (isStopRequested) break;
+            const remainingSec = Math.max(1, Math.round((targetEndTime - Date.now()) / 1000));
+            showToast(`当前视频已完成！将在 ${remainingSec} 秒后开始下一个任务...`, 1500);
+            await delay(1000);
+          }
+        } else {
+          console.log(`[Batch] 当前任务已完成，间隔设置为 0 秒，立即进入下一项`);
         }
 
         // 倒计时结束，在流转进入下一项前清理可能残留的遮罩与弹窗
@@ -3089,8 +3225,12 @@
   function findDurationGroup() {
     const overlay = document.querySelector(".cdk-overlay-pane flow-prompt-box-settings, flow-prompt-box-settings, .settings-content-overlay");
     if (!overlay) return null;
-    return Array.from(overlay.querySelectorAll("flow-toggles[aria-label], [role='radiogroup'][aria-label], select[aria-label]"))
-      .find(group => /时长|秒数|duration|length/i.test(group.getAttribute("aria-label") || "")) || null;
+    const groups = Array.from(overlay.querySelectorAll("flow-toggles[aria-label], [role='radiogroup'][aria-label], select[aria-label], flow-toggles"));
+    return groups.find(group => /时长|時長|秒数|秒數|长度|長度|duration|length/i.test(group.getAttribute("aria-label") || "")) ||
+           groups.find(group => {
+             const btns = Array.from(group.querySelectorAll("mat-button-toggle, [role='radio'], option"));
+             return btns.length >= 2 && btns.some(b => /^\s*\d+\s*(秒|s|sec|seconds)\s*$/i.test(b.textContent || ""));
+           }) || null;
   }
 
   async function applyDurationSetting(value) {
@@ -3103,7 +3243,14 @@
       if (isStopRequested) throw durationError("任务已停止");
       await delay(200);
     }
-    if (!group) throw durationError(`找不到视频时长选项，无法确认 ${target} 秒；请检查当前模型的设置面板`);
+    if (!group) {
+      const panelOpen = document.querySelector(".cdk-overlay-pane flow-prompt-box-settings, flow-prompt-box-settings, .settings-content-overlay");
+      if (panelOpen) {
+        console.warn(`[FlowUI] 当前模型设置面板中无时长选项（可能为固定时长模型），跳过 ${target} 秒设置`);
+        return;
+      }
+      throw durationError(`找不到视频时长选项，无法确认 ${target} 秒；请检查当前模型的设置面板`);
+    }
     const options = () => Array.from(group.querySelectorAll("mat-button-toggle, [role='radio'], option"));
     const secondsOf = option => {
       try { return normalizeDuration(option.textContent.trim()); } catch (_) { return null; }
@@ -3111,25 +3258,37 @@
     const selected = option => option.selected === true || option.classList.contains("mat-button-toggle-checked") ||
       option.getAttribute("aria-checked") === "true" || option.querySelector("button")?.getAttribute("aria-checked") === "true" ||
       option.querySelector("button")?.getAttribute("aria-pressed") === "true";
-    const option = options().find(item => secondsOf(item) === target);
-    if (!option) throw durationError(`当前模型不支持 ${target} 秒；可选时长：${options().map(secondsOf).filter(v => v != null).join("、") || "未识别"}`);
+
+    let effectiveTarget = target;
+    let option = options().find(item => secondsOf(item) === effectiveTarget);
+    if (!option) {
+      const availableOpts = options().map(item => ({ item, sec: secondsOf(item) })).filter(x => x.sec != null);
+      if (availableOpts.length > 0) {
+        availableOpts.sort((a, b) => Math.abs(a.sec - target) - Math.abs(b.sec - target));
+        option = availableOpts[0].item;
+        effectiveTarget = availableOpts[0].sec;
+        console.warn(`[FlowUI] 当前模型不支持 ${target} 秒，已自动匹配最接近的可用时长: ${effectiveTarget} 秒`);
+      } else {
+        throw durationError(`当前模型不支持 ${target} 秒；可选时长：${options().map(secondsOf).filter(v => v != null).join("、") || "未识别"}`);
+      }
+    }
     if (!selected(option)) {
       if (group.tagName === "SELECT") {
         group.value = option.value;
         group.dispatchEvent(new Event("change", { bubbles: true }));
       } else {
         const button = option.querySelector("button") || option;
-        if (button.disabled || button.getAttribute("aria-disabled") === "true") throw durationError(`${target} 秒选项不可用`);
+        if (button.disabled || button.getAttribute("aria-disabled") === "true") throw durationError(`${effectiveTarget} 秒选项不可用`);
         button.click();
       }
     }
     for (let attempt = 0; attempt < 10; attempt++) {
       group = findDurationGroup();
-      if (group && options().some(item => secondsOf(item) === target && selected(item))) return;
+      if (group && options().some(item => secondsOf(item) === effectiveTarget && selected(item))) return;
       if (isStopRequested) throw durationError("任务已停止");
       await delay(200);
     }
-    throw durationError(`点击后未确认选中 ${target} 秒，已阻止生成`);
+    throw durationError(`点击后未确认选中 ${effectiveTarget} 秒，已阻止生成`);
   }
 
   // ----------------------------------------------------
@@ -3137,19 +3296,45 @@
   // ----------------------------------------------------
   const MODEL_DISPLAY_NAMES = {
     "omni_1_1_flash": "Omni 1.1 Flash",
-    "veo_2": "Veo 2",
-    "veo_3_1_lite_low_priority": "Veo 3.1 - Lite",
+    "veo_3_1_lite": "Veo 3.1 - Lite",
+    "veo_3_1_fast": "Veo 3.1 - Fast",
+    "veo_3_1_quality": "Veo 3.1 - Quality",
+    "veo_3_1_lite_low_priority": "Veo 3.1 - Lite [Lower Priority]",
     "veo_fast": "Veo 3.1 - Fast",
+    "veo_2": "Veo 2",
     "VIDEO_REFERENCES": "VIDEO_REFERENCES"
   };
 
-  // 在设置面板内部切换模型 (overlay = flow-prompt-box-settings 面板元素)
+  function isModelNameMatch(candidateText, targetDisplayName, targetModelId) {
+    if (!candidateText || !targetDisplayName) return false;
+    const candLower = candidateText.toLowerCase();
+    const targLower = targetDisplayName.toLowerCase();
+    // 严格区分普通版与 [Lower Priority] 低优先级版本
+    const candIsLowPrio = /lower\s*priority|low\s*priority|低优先级|低優先/i.test(candLower);
+    const targIsLowPrio = targetModelId === "veo_3_1_lite_low_priority" || /lower\s*priority|low\s*priority|低优先级|低優先/i.test(targLower);
+    if (candIsLowPrio !== targIsLowPrio) return false;
+
+    const stripTags = (s) => s
+      .replace(/\[.*?\]/g, "")
+      .replace(/测试版|測試版|beta|arrow_drop_down|check/gi, "")
+      .replace(/[\s\-_.]+/g, "")
+      .trim();
+
+    const candNorm = stripTags(candLower);
+    const targNorm = stripTags(targLower);
+    if (!candNorm || !targNorm) return false;
+    return candNorm === targNorm || candNorm.includes(targNorm) || targNorm.includes(candNorm);
+  }
+
+  // 在设置面板内部切换模型 (overlay = flow-prompt-box-settings 面板元素，兼容简中/繁中/英文)
   async function switchModelInPanel(overlay, targetModelId) {
     const targetDisplayName = MODEL_DISPLAY_NAMES[targetModelId] || targetModelId;
     console.log(`[FlowUI] 🔄 面板内模型切换: 目标="${targetDisplayName}" (ID=${targetModelId})`);
 
+    const modelBtnSelector = 'button[aria-label="选择模型系列"], button[aria-label="選取模型系列"], button[aria-label*="模型"], button[aria-label*="model" i], button.mat-mdc-menu-trigger';
+
     // 1. 在设置面板内查找模型选择器按钮
-    let triggerBtn = overlay.querySelector('button[aria-label="选择模型系列"]');
+    let triggerBtn = overlay.querySelector(modelBtnSelector);
     if (!triggerBtn) {
       // 回退: 通过 .model-select-trigger-content 子元素
       const triggerContent = overlay.querySelector('.model-select-trigger-content');
@@ -3158,7 +3343,8 @@
     }
     if (!triggerBtn) {
       // 回退: 在整个页面中查找 (可能在 overlay 外层)
-      triggerBtn = document.querySelector('button[aria-label="选择模型系列"]');
+      triggerBtn = document.querySelector('flow-prompt-box-settings ' + modelBtnSelector) ||
+                   document.querySelector('button[aria-label="选择模型系列"], button[aria-label="選取模型系列"], button[aria-label*="model family" i]');
       if (!triggerBtn) {
         const triggerContent = document.querySelector('.model-select-trigger-content');
         triggerBtn = triggerContent?.closest('button');
@@ -3178,9 +3364,7 @@
     console.log(`[FlowUI] 当前页面模型: "${currentModelText}"`);
 
     // 3. 判断是否需要切换
-    const currentNorm = currentModelText.toLowerCase().replace(/[\s\-_.]+/g, "");
-    const targetNorm = targetDisplayName.toLowerCase().replace(/[\s\-_.]+/g, "");
-    if (currentNorm === targetNorm || currentNorm.includes(targetNorm) || targetNorm.includes(currentNorm)) {
+    if (isModelNameMatch(currentModelText, targetDisplayName, targetModelId)) {
       console.log(`[FlowUI] ✅ 当前模型已经是 "${currentModelText}"，无需切换`);
       return false; // 没有切换
     }
@@ -3194,15 +3378,13 @@
 
     // 5. 在下拉菜单中查找目标模型选项
     let targetMenuItem = null;
-    const targetNormClean = targetNorm;
 
     // 策略 A: 查找 span.label 文本
-    const labelElements = document.querySelectorAll('.cdk-overlay-container span.label, .cdk-overlay-container .item-text .label');
+    const labelElements = document.querySelectorAll('.cdk-overlay-container span.label, .cdk-overlay-container .item-text .label, .cdk-overlay-container [role="menuitem"] span');
     console.log(`[FlowUI] 下拉菜单中找到 ${labelElements.length} 个 label 元素`);
     for (const label of labelElements) {
       const labelText = (label.textContent || "").trim();
-      const labelNorm = labelText.toLowerCase().replace(/[\s\-_.]+/g, "");
-      if (labelNorm.includes(targetNormClean) || targetNormClean.includes(labelNorm)) {
+      if (isModelNameMatch(labelText, targetDisplayName, targetModelId)) {
         // 向上查找可点击的按钮
         targetMenuItem = label.closest('button') || label.closest('flow-menu-item')?.querySelector('button') || label.closest('[role="menuitem"]') || label;
         console.log(`[FlowUI] ✅ 找到目标: "${labelText}" -> ${targetMenuItem.tagName}`);
@@ -3212,12 +3394,12 @@
 
     // 策略 B: 遍历菜单按钮
     if (!targetMenuItem) {
-      const allMenuBtns = document.querySelectorAll('.cdk-overlay-container button');
+      const allMenuBtns = document.querySelectorAll('.cdk-overlay-container button, .cdk-overlay-container [role="menuitem"]');
       for (const btn of allMenuBtns) {
-        const btnText = (btn.textContent || "").trim().toLowerCase().replace(/[\s\-_.]+/g, "");
-        if (btnText.includes(targetNormClean) || targetNormClean.includes(btnText)) {
+        const btnText = (btn.textContent || "").trim();
+        if (isModelNameMatch(btnText, targetDisplayName, targetModelId)) {
           targetMenuItem = btn;
-          console.log(`[FlowUI] ✅ 策略 B 找到: "${btn.textContent.trim().substring(0, 40)}"`);
+          console.log(`[FlowUI] ✅ 策略 B 找到: "${btnText.substring(0, 50)}"`);
           break;
         }
       }
@@ -3263,12 +3445,15 @@
       console.warn("[FlowUI] promptBoxStore 兜底更新提示:", storeErr);
     }
 
+    const findSettingsTriggerBtn = () =>
+      document.querySelector("button.settings-trigger-button") ||
+      document.querySelector("div.submit-controls button:not(.generate-icon-button)") ||
+      document.querySelector("button[aria-label*='设置'], button[aria-label*='設定'], button[aria-label*='Settings' i]");
+
     // 1. 定位页面底部的设置按钮 (模型切换后页面可能重新渲染，需要重试)
     let settingsBtn = null;
     for (let retry = 0; retry < 8; retry++) {
-      settingsBtn = document.querySelector("button.settings-trigger-button") || 
-                    document.querySelector("div.submit-controls button:not(.generate-icon-button)") ||
-                    document.querySelector("button[aria-label*='设置']");
+      settingsBtn = findSettingsTriggerBtn();
       if (settingsBtn) break;
       console.log(`[FlowUI] 等待设置按钮出现... (${retry + 1}/8)`);
       await delay(500);
@@ -3278,19 +3463,24 @@
       throw durationError("未找到 Flow 设置按钮，无法确认任务秒数");
     }
 
-    // 检查按钮文本摘要是否已经完全符合预期
+    // 检查按钮文本摘要是否已经完全符合预期（兼容简中/繁中/英文，如 `x 1` vs `x1`）
     const summaryText = (settingsBtn.textContent || "").toLowerCase();
+    const summaryCompact = summaryText.replace(/\s+/g, "");
     const resKey = targetRes.includes("360") ? "360p" : (targetRes.includes("1080") ? "1080p" : "720p");
     const aspectKey = targetAspect.includes("9_16") ? "crop_9_16" : (targetAspect.includes("1_1") ? "crop_1_1" : "crop_16_9");
     const aspectTextKey = targetAspect.includes("9_16") ? "9:16" : (targetAspect.includes("1_1") ? "1:1" : "16:9");
     const countKey = `x${targetCount}`;
 
-    const resMatched = summaryText.includes(resKey);
-    const aspectMatched = summaryText.includes(aspectKey) || summaryText.includes(aspectTextKey);
-    const countMatched = summaryText.includes(countKey);
+    const resMatched = summaryCompact.includes(resKey);
+    const aspectMatched = summaryCompact.includes(aspectKey) || summaryCompact.includes(aspectTextKey);
+    const countMatched = summaryCompact.includes(countKey);
+    const modelMatched = !videoModel || isModelNameMatch(summaryText, MODEL_DISPLAY_NAMES[videoModel] || videoModel, videoModel);
+    const footageMatched = targetFootage === "VIDEO_FRAMES"
+      ? /(帧|影格|frame|crop_free)/i.test(summaryText)
+      : /(素材|原料|ingredient|reference|chrome_extension)/i.test(summaryText);
 
-    // 如果摘要已经完美满足（例如已是 720p、9:16 且 x1），无需重复开启设置弹窗
-    if (duration == null && resMatched && aspectMatched && countMatched) {
+    // 如果摘要已经完美满足（分辨率、比例、数量、模型、模式全部一致且无强制秒数校验），才跳过设置弹窗
+    if (duration == null && resMatched && aspectMatched && countMatched && modelMatched && footageMatched) {
       console.log(`[FlowUI] 当前设置摘要 (${settingsBtn.textContent.trim()}) 已满足要求，无需重复开启设置弹窗`);
       return;
     }
@@ -3300,9 +3490,7 @@
     for (let retry = 0; retry < 3; retry++) {
       console.log(`[FlowUI] 正在点击设置按钮弹出设置面板... (尝试 ${retry + 1}/3)`);
       // 每次重试都重新查找按钮（防止 DOM 被替换）
-      const freshBtn = document.querySelector("button.settings-trigger-button") || 
-                       document.querySelector("div.submit-controls button:not(.generate-icon-button)") ||
-                       document.querySelector("button[aria-label*='设置']") || settingsBtn;
+      const freshBtn = findSettingsTriggerBtn() || settingsBtn;
       freshBtn.click();
       
       // 等待面板出现
@@ -3320,7 +3508,56 @@
       throw durationError("未打开 Flow 设置面板，无法设置任务秒数");
     }
 
-    // 2.5 在设置面板内部自动切换模型 (模型选择器在面板里)
+    // 3. 通用切换助手：支持简中/繁中/英文多语言 aria-label 列表，并自带图标/文字全组扫描兜底
+    function setToggle(ariaLabels, matcher) {
+      const labelList = Array.isArray(ariaLabels) ? ariaLabels : [ariaLabels];
+      let toggleGroup = null;
+      for (const lbl of labelList) {
+        toggleGroup = overlay.querySelector(`flow-toggles[aria-label="${lbl}"]`) ||
+                      overlay.querySelector(`flow-toggles[aria-label*="${lbl}" i]`);
+        if (toggleGroup) break;
+      }
+
+      // 兜底：若 aria-label 因界面语言未知未命中，扫描面板内所有 flow-toggles 寻找包含匹配项的组
+      const candidateGroups = toggleGroup
+        ? [toggleGroup]
+        : Array.from(overlay.querySelectorAll("flow-toggles, mat-button-toggle-group"));
+
+      for (const grp of candidateGroups) {
+        const toggles = grp.querySelectorAll("mat-button-toggle");
+        for (const t of toggles) {
+          const clone = t.cloneNode(true);
+          clone.querySelectorAll("mat-icon").forEach(ic => ic.remove());
+          const pureText = (clone.textContent || "").trim();
+          const fullText = (t.textContent || "").trim();
+          const icon = (t.querySelector("mat-icon")?.textContent || "").trim();
+          const isChecked = t.classList.contains("mat-button-toggle-checked") ||
+                            t.querySelector("button")?.getAttribute("aria-checked") === "true";
+
+          const isMatch = typeof matcher === "function"
+            ? (matcher(pureText, icon, t) || matcher(fullText, icon, t))
+            : (pureText.includes(matcher) || fullText.includes(matcher) || icon.includes(matcher));
+          if (isMatch) {
+            if (!isChecked) {
+              const btn = t.querySelector("button.mat-button-toggle-button") || t.querySelector("button") || t;
+              console.log(`[FlowUI] 切换设置 [${labelList[0]}] -> ${pureText || icon}`);
+              btn.click();
+            } else {
+              console.log(`[FlowUI] 设置 [${labelList[0]}] 已经是目标状态: ${pureText || icon}`);
+            }
+            return true;
+          }
+        }
+      }
+      console.warn(`[FlowUI] 设置面板内未找到切换组: [${labelList.join(" / ")}]`);
+      return false;
+    }
+
+    // 3.1 先确保顶层模式是“视频 / 影片 / Video”，这样模型选择器才会显示视频生成模型
+    setToggle(["模式", "Mode"], (text, icon) => /(视频|影片|video)/i.test(text) || icon === "videocam");
+    await delay(150);
+
+    // 3.2 在设置面板内部自动切换模型 (模型选择器在面板里)
     if (videoModel) {
       const modelSwitched = await switchModelInPanel(overlay, videoModel);
       if (modelSwitched) {
@@ -3330,9 +3567,7 @@
         if (!overlay) {
           console.log("[FlowUI] 设置面板已关闭，重新打开...");
           for (let retry = 0; retry < 3; retry++) {
-            const freshBtn = document.querySelector("button.settings-trigger-button") || 
-                             document.querySelector("div.submit-controls button:not(.generate-icon-button)") ||
-                             document.querySelector("button[aria-label*='设置']");
+            const freshBtn = findSettingsTriggerBtn();
             if (freshBtn) freshBtn.click();
             for (let wait = 0; wait < 8; wait++) {
               await delay(400);
@@ -3350,67 +3585,37 @@
       }
     }
 
-    // 3. 通用切换助手：精确定位 flow-toggles[aria-label] 内部的 mat-button-toggle
-    function setToggle(ariaLabel, matcher) {
-      const toggleGroup = overlay.querySelector(`flow-toggles[aria-label="${ariaLabel}"]`) ||
-                          overlay.querySelector(`flow-toggles[aria-label*="${ariaLabel}"]`);
-      if (!toggleGroup) {
-        console.warn(`[FlowUI] 设置面板内未找到切换组: [aria-label="${ariaLabel}"]`);
-        return false;
-      }
-      const toggles = toggleGroup.querySelectorAll("mat-button-toggle");
-      for (const t of toggles) {
-        const text = (t.textContent || "").trim();
-        const icon = (t.querySelector("mat-icon")?.textContent || "").trim();
-        const isChecked = t.classList.contains("mat-button-toggle-checked") || 
-                          t.querySelector("button")?.getAttribute("aria-checked") === "true";
-        
-        const isMatch = typeof matcher === "function" ? matcher(text, icon, t) : (text.includes(matcher) || icon.includes(matcher));
-        if (isMatch) {
-          if (!isChecked) {
-            const btn = t.querySelector("button.mat-button-toggle-button") || t.querySelector("button") || t;
-            console.log(`[FlowUI] 切换设置 [${ariaLabel}] -> ${text || icon}`);
-            btn.click();
-          } else {
-            console.log(`[FlowUI] 设置 [${ariaLabel}] 已经是目标状态: ${text || icon}`);
-          }
-          return true;
-        }
-      }
-      return false;
-    }
-
-    // (a) 模式: 切换为“视频”
-    setToggle("模式", (text, icon) => text.includes("视频") || icon === "videocam");
+    // (a) 模式: 再次确认切换为“视频 / 影片 / Video”
+    setToggle(["模式", "Mode"], (text, icon) => /(视频|影片|video)/i.test(text) || icon === "videocam");
     await delay(150);
 
-    // (b) 视频类型: 切换为“帧”或“素材”
+    // (b) 视频类型: 切换为“帧 / 影格 / Frames”或“素材 / Ingredients”
     if (targetFootage === "VIDEO_FRAMES") {
-      setToggle("视频类型", (text, icon) => text.includes("帧") || icon === "crop_free");
+      setToggle(["视频类型", "影片類型", "Video type", "Type"], (text, icon) => /(帧|影格|frame)/i.test(text) || icon === "crop_free");
     } else {
-      setToggle("视频类型", (text, icon) => text.includes("素材") || icon === "chrome_extension");
+      setToggle(["视频类型", "影片類型", "Video type", "Type"], (text, icon) => /(素材|原料|ingredient|reference)/i.test(text) || icon === "chrome_extension");
     }
     await delay(150);
 
-    // (c) 宽高比 / 尺寸: 切换为“9:16”或“16:9”
+    // (c) 宽高比 / 顯示比例 / Aspect ratio: 切换为“9:16”或“16:9”
     if (targetAspect.includes("9_16")) {
-      setToggle("宽高比", (text, icon) => text.includes("9:16") || icon === "crop_9_16");
+      setToggle(["宽高比", "顯示比例", "長寬比", "Aspect ratio"], (text, icon) => text.includes("9:16") || icon === "crop_9_16");
     } else if (targetAspect.includes("1_1")) {
-      setToggle("宽高比", (text, icon) => text.includes("1:1") || icon === "crop_1_1");
+      setToggle(["宽高比", "顯示比例", "長寬比", "Aspect ratio"], (text, icon) => text.includes("1:1") || icon === "crop_1_1");
     } else {
-      setToggle("宽高比", (text, icon) => text.includes("16:9") || icon === "crop_16_9");
+      setToggle(["宽高比", "顯示比例", "長寬比", "Aspect ratio"], (text, icon) => text.includes("16:9") || icon === "crop_16_9");
     }
     await delay(150);
 
-    // (d) 视频分辨率: 切换为 720p 或 360p
-    setToggle("视频分辨率", (text) => text.includes(resKey));
+    // (d) 视频分辨率 / 影片解析度 / Video resolution: 切换为 720p 或 360p
+    setToggle(["视频分辨率", "影片解析度", "解析度", "分辨率", "Video resolution", "Resolution"], (text) => text.toLowerCase().includes(resKey));
     await delay(150);
 
-    // (e) 输出数量: 强制切换为目标数量 (默认 x1)
-    setToggle("输出数量", (text) => text === `x${targetCount}` || text.includes(`x${targetCount}`));
+    // (e) 输出数量 / 生成數量 / Outputs: 强制切换为目标数量 (兼容 `x1` 与 `x 1`)
+    setToggle(["输出数量", "生成數量", "輸出數量", "Outputs", "Count"], (text) => text.replace(/\s+/g, "").toLowerCase() === `x${targetCount}`);
     await delay(150);
 
-    // 必须精确选择并读取选中状态；不允许 6 匹配 16，也不忽略不支持的时长。
+    // 选择时长（若当前模型不支持目标秒数则自动匹配最近可用秒数）
     try {
       await applyDurationSetting(duration);
     } catch (err) {
@@ -3595,15 +3800,15 @@
                 if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return false;
                 const t = (btn.textContent || "").trim();
                 const aria = (btn.getAttribute("aria-label") || "").trim();
-                if (/^(取消|关闭|Cancel|Close|Dismiss)$/i.test(t) || /^(取消|关闭|Cancel|Close|Dismiss)$/i.test(aria)) return false;
-                if (/(确认|确定|选择|添加|完成|使用|插入|首帧|Confirm|Select|Add|Done|OK|Apply|Insert)/i.test(t) ||
-                    /(确认|确定|选择|添加|完成|使用|插入|首帧|Confirm|Select|Add|Done|OK|Apply|Insert)/i.test(aria)) return true;
+                if (/^(取消|关闭|關閉|Cancel|Close|Dismiss)$/i.test(t) || /^(取消|关闭|關閉|Cancel|Close|Dismiss)$/i.test(aria)) return false;
+                if (/(确认|确定|確認|確定|选择|選取|選擇|添加|新增|完成|使用|插入|首帧|初始影格|Confirm|Select|Add|Done|OK|Apply|Insert)/i.test(t) ||
+                    /(确认|确定|確認|確定|选择|選取|選擇|添加|新增|完成|使用|插入|首帧|初始影格|Confirm|Select|Add|Done|OK|Apply|Insert)/i.test(aria)) return true;
                 if (btn.closest("mat-dialog-actions, .mat-mdc-dialog-actions") && (btn.classList.contains("primary") || btn.classList.contains("flow-button-primary") || btn.classList.contains("mat-mdc-unelevated-button") || btn.classList.contains("mat-primary"))) return true;
                 return false;
               });
 
               if (allButtons.length > 0) {
-                const actionBtn = allButtons.find(b => /(确认|确定|选择|添加|完成|使用|首帧|Confirm|Select|Add|Done|OK|Apply)/i.test((b.textContent || "") + (b.getAttribute("aria-label") || ""))) || allButtons[allButtons.length - 1];
+                const actionBtn = allButtons.find(b => /(确认|确定|確認|確定|选择|選取|選擇|添加|新增|完成|使用|首帧|初始影格|Confirm|Select|Add|Done|OK|Apply)/i.test((b.textContent || "") + (b.getAttribute("aria-label") || ""))) || allButtons[allButtons.length - 1];
                 console.log(`[FlowUI] 🎯 自动点击媒体选择弹窗确认按钮: "${(actionBtn.textContent || actionBtn.getAttribute('aria-label') || '').trim()}"`);
                 simulateClick(actionBtn);
                 await delay(500);
@@ -3733,7 +3938,7 @@
           const triggerText = startTrigger.textContent || "";
           const matchesName = image.displayName && (isImageNameMatch(image.displayName, triggerTitle) || isImageNameMatch(image.displayName, triggerText));
 
-          if (hasImg || hasNonEmptyButton || (!emptyBtn && triggerText.trim() !== "" && !triggerText.includes("开始") && !triggerText.includes("start")) || matchesName) {
+          if (hasImg || hasNonEmptyButton || (!emptyBtn && triggerText.trim() !== "" && !triggerText.includes("开始") && !triggerText.includes("開始") && !/start/i.test(triggerText)) || matchesName) {
             return true;
           }
           // 如果首帧明确包含 empty-chip，且没有缩略图，则说明首帧尚未挂上
@@ -3745,7 +3950,7 @@
 
       // 素材模式或通用检查：查看是否存在素材芯片、缩略图或移除按钮
       const hasChipOrImg = !!ingredientBar.querySelector(
-        "img, flow-ingredient-chip, .ingredient-chip, mat-chip, .chip-container, button[aria-label*='移除'], button[aria-label*='Remove'], button[aria-label*='Clear'], .clear-button"
+        "img, flow-ingredient-chip, .ingredient-chip, mat-chip, .chip-container, button[aria-label*='移除'], button[aria-label*='删除'], button[aria-label*='刪除'], button[aria-label*='Remove' i], button[aria-label*='Clear' i], .clear-button"
       );
       if (hasChipOrImg) return true;
 
@@ -3918,7 +4123,7 @@ ${presetAfter || ""}`.trim();
 
     // 7. 查找生成按钮并确保可点击发送
     const findButton = () => document.querySelector(
-      "flow-generate-icon-button button, button.generate-icon-button, button[aria-label*='生成'], button[aria-label*='开始'], button[aria-label*='Generate']"
+      "flow-generate-icon-button button, button.generate-icon-button, button[aria-label*='生成'], button[aria-label*='產生'], button[aria-label*='开始'], button[aria-label*='開始'], button[aria-label*='建立'], button[aria-label*='Generate' i], button[aria-label*='Create' i]"
     );
     let button;
     for (let i = 0; i < 40; i++) {
@@ -4111,9 +4316,10 @@ ${presetAfter || ""}`.trim();
     }
 
     // 备用通道: 点击当前批次专属的原生批量下载按钮
+    const dlSelector = "button[aria-label='批量下载'], button[aria-label='批次下載'], button[aria-label*='下载'], button[aria-label*='下載'], button[aria-label*='Download' i]";
     const newestDownloadBtn = targetBatchContainer ? 
-      targetBatchContainer.querySelector("button[aria-label='批量下载']") : 
-      document.querySelector(".batch-container button[aria-label='批量下载'], flow-batch-info button[aria-label='批量下载'], button[aria-label='批量下载']");
+      targetBatchContainer.querySelector(dlSelector) : 
+      document.querySelector(`.batch-container ${dlSelector}, flow-batch-info ${dlSelector}, ${dlSelector}`);
     if (newestDownloadBtn && !newestDownloadBtn.disabled) {
       console.log("[FlowUI] 备用通道: 尝试点击当前批次专属的 [批量下载] 按钮...");
       newestDownloadBtn.click();
@@ -4647,7 +4853,7 @@ ${presetAfter || ""}`.trim();
 
   function checkForUnusualActivity() {
     const text = document.body.innerText || "";
-    return text.includes("异常活动") || text.includes("Unusual activity") || text.includes("unusual activity");
+    return text.includes("异常活动") || text.includes("異常活動") || text.includes("不尋常的活動") || text.includes("Unusual activity") || text.includes("unusual activity");
   }
 
   function playAlarmSound() {
@@ -4894,7 +5100,7 @@ ${presetAfter || ""}`.trim();
           for (const el of panel.querySelectorAll("span, div, a, p")) {
             if (el.children.length > 2) continue;
             const t = (el.textContent || "").trim();
-            if (t.includes("点数") || t.includes("积分") || /credits/i.test(t)) {
+            if (t.includes("点数") || t.includes("點數") || t.includes("积分") || t.includes("積分") || /credits|points/i.test(t) || /\b\d+\s*點\b/.test(t)) {
               const m = t.match(/(\d+)/);
               if (m) {
                 const n = parseInt(m[1], 10);
@@ -4918,7 +5124,7 @@ ${presetAfter || ""}`.trim();
 
       const avatarBtn = document.querySelector('div.header-user-button[role="button"]') ||
                         document.querySelector("div.header-user-button") ||
-                        document.querySelector('[aria-label="账号详情"]') ||
+                        document.querySelector('[aria-label="账号详情"], [aria-label="帳戶詳細資料"], [aria-label*="账号"], [aria-label*="帳戶"], [aria-label*="帳號"], [aria-label*="Account" i]') ||
                         document.querySelector('flow-header-user-icon [role="button"]');
       if (!avatarBtn) { log("未找到头像按钮"); return null; }
 
@@ -4987,7 +5193,7 @@ ${presetAfter || ""}`.trim();
         "[role='dialog'] button, mat-dialog-container button, .cdk-overlay-pane button, [role='alertdialog'] button"));
       return btns.find(b => {
         const t = (b.textContent || "").trim();
-        return b.offsetParent && /^(删除|永久删除|移至回收站|移到回收站|确定|确认|Delete|Move to trash|Confirm)/i.test(t);
+        return b.offsetParent && /^(删除|刪除|永久删除|永久刪除|移至回收站|移到回收站|移至垃圾桶|移到垃圾桶|确定|確定|确认|確認|Delete|Move to trash|Confirm)/i.test(t);
       });
     }
 
