@@ -58,6 +58,137 @@ class TextProcessor:
         return text.strip()
 
     @staticmethod
+    def _extract_words_and_breaks(text):
+        """Extracts clean words and natural punctuation break indicators from text.
+        
+        Returns:
+            tuple: (words, break_types)
+                - words: list of clean, punctuation-free word strings
+                - break_types: list of int (same length as words), where:
+                    2 = sentence break (., !, ?, ;, …) right after this word
+                    1 = clause/comma break (,, :, —, -) right after this word
+                    0 = normal word boundary
+        """
+        if not text:
+            return [], []
+        raw_tokens = text.split()
+        words = []
+        break_types = []
+        for token in raw_tokens:
+            # Determine trailing punctuation type before stripping punctuation
+            stripped_quotes = token.rstrip('\'"”’»)]}')
+            b_type = 0
+            if stripped_quotes.endswith(('.', '!', '?', ';', '…')):
+                b_type = 2
+            elif stripped_quotes.endswith((',', ':', '—', '-')):
+                b_type = 1
+
+            clean_token = TextProcessor.remove_punctuation(token)
+            if not clean_token:
+                # If a standalone punctuation token appeared, attach break to previous word
+                if b_type > 0 and break_types:
+                    break_types[-1] = max(break_types[-1], b_type)
+                continue
+
+            sub_words = clean_token.split()
+            for idx, sw in enumerate(sub_words):
+                words.append(sw)
+                if idx == len(sub_words) - 1:
+                    break_types.append(b_type)
+                else:
+                    break_types.append(0)
+        return words, break_types
+
+    @staticmethod
+    def _partition_words_balanced(words, k, min_chars=0, max_limit=None, break_types=None):
+        """Partitions a list of clean words into exactly k contiguous segments
+        such that EVERY segment has length >= min_chars (and <= max_limit if specified),
+        while minimizing length variance around the balanced average (total_len / k).
+
+        Returns:
+            list[str] | None: List of k clean segment strings if a valid partition exists,
+                              otherwise None.
+        """
+        m = len(words)
+        if m == 0 or k <= 0 or k > m:
+            return None
+
+        if k == 1:
+            joined = " ".join(words)
+            length = len(joined)
+            if length < min_chars:
+                return None
+            if max_limit is not None and length > max_limit and m > 1:
+                return None
+            return [joined]
+
+        # Prefix character lengths of " ".join(words[:i])
+        prefix = [0] * (m + 1)
+        for i in range(1, m + 1):
+            prefix[i] = prefix[i - 1] + len(words[i - 1]) + (1 if i > 1 else 0)
+
+        def seg_len(a, b):
+            return prefix[b] - prefix[a] - (1 if a > 0 else 0)
+
+        total_len = prefix[m]
+        target = total_len / k
+
+        # dp[s][i] = (min_cost, prev_word_idx) for partitioning words[:i] into s segments
+        INF = float("inf")
+        dp = [[(INF, -1)] * (m + 1) for _ in range(k + 1)]
+        dp[0][0] = (0.0, 0)
+
+        for s in range(1, k + 1):
+            # Each remaining segment needs at least 1 word
+            max_end = m - (k - s)
+            for a in range(s - 1, max_end):
+                prev_cost = dp[s - 1][a][0]
+                if prev_cost == INF:
+                    continue
+
+                # If last segment, b must be m; otherwise b ranges from a + 1 to max_end
+                b_start = m if s == k else a + 1
+                b_end = m if s == k else max_end
+
+                for b in range(b_start, b_end + 1):
+                    length = seg_len(a, b)
+                    if length < min_chars:
+                        continue
+                    if max_limit is not None and length > max_limit:
+                        # Allow a single oversized word only if b == a + 1
+                        if b > a + 1:
+                            break
+
+                    # Squared deviation from ideal balanced length
+                    cost = (length - target) ** 2
+
+                    # Small preference for splitting at natural sentence/clause boundaries
+                    # when they are already close to the balanced split point
+                    if break_types is not None and b < m:
+                        bt = break_types[b - 1]
+                        if bt == 2:
+                            cost -= 225.0  # ~15 chars tolerance for sentence boundary
+                        elif bt == 1:
+                            cost -= 100.0  # ~10 chars tolerance for comma boundary
+
+                    total_cost = prev_cost + cost
+                    if total_cost < dp[s][b][0]:
+                        dp[s][b] = (total_cost, a)
+
+        if dp[k][m][0] == INF:
+            return None
+
+        # Reconstruct the k segments
+        result = []
+        curr = m
+        for s in range(k, 0, -1):
+            prev = dp[s][curr][1]
+            result.append(" ".join(words[prev:curr]))
+            curr = prev
+        result.reverse()
+        return result
+
+    @staticmethod
     def _split_long_chunk(chunk, max_len=170):
         """Splits a single chunk that is longer than max_len into sub-chunks.
         Tries to split by comma first, then by space (words).
@@ -105,8 +236,11 @@ class TextProcessor:
 
     @staticmethod
     def segment_spanish_text(text, config_manager=None):
-        """Segments cleaned Spanish text prioritizing max characters limit per chunk.
-        Supports forced split markers (e.g. '///', '|||', '$$') to enforce hard sentence breaks.
+        """Segments cleaned Spanish text.
+        Priority order:
+        1. Forced split markers (e.g. '///', '|||', '$$') — hard block boundaries, never crossed.
+        2. Minimum segment character count (min_segment_chars) — highest priority within each block.
+        3. Maximum character limit (max_limit) & natural punctuation breaks.
         """
         if not text:
             return []
@@ -127,7 +261,7 @@ class TextProcessor:
             cleaned_block = TextProcessor.clean_text(block)
             if not cleaned_block:
                 continue
-            # Process each forced block independently so no greedy merging occurs across markers
+            # Process each forced block independently so no merging occurs across forced markers
             block_results = TextProcessor._segment_single_block(cleaned_block, max_limit, config_manager)
             results.extend(block_results)
             
@@ -135,9 +269,14 @@ class TextProcessor:
 
     @staticmethod
     def _segment_single_block(cleaned_text, max_limit, config_manager=None):
-        """Segments a single forced block using sentence boundaries and greedy merging up to max_limit."""
+        """Segments a single forced block, giving min_segment_chars the highest priority."""
+        import math
+        min_chars = getattr(config_manager, "min_segment_chars", 0) if config_manager else 0
+        # If user set min_chars higher than max_limit, min_chars takes precedence
+        effective_max_limit = max(max_limit, min_chars) if min_chars > 0 else max_limit
+
         initial_chunks = []
-        # Split by sentence-ending punctuation (., ?, !, ;) but keep punctuation for initial splitting.
+        # Split by sentence-ending punctuation (., ?, !, ;)
         pattern = re.compile(r'([^.!?;]+[.!?;\s]*)')
         matches = pattern.findall(cleaned_text)
         
@@ -146,117 +285,174 @@ class TextProcessor:
             if trimmed:
                 initial_chunks.append(trimmed)
 
-        # Stage 1: Enforce hard limit on raw chunks by pre-splitting anything > max_limit characters
+        # Stage 1: Enforce hard limit on raw chunks by pre-splitting anything > effective_max_limit
         raw_chunks = []
         for chunk in initial_chunks:
-            if len(chunk) > max_limit:
-                raw_chunks.extend(TextProcessor._split_long_chunk(chunk, max_len=max_limit))
+            if len(chunk) > effective_max_limit:
+                raw_chunks.extend(TextProcessor._split_long_chunk(chunk, max_len=effective_max_limit))
             else:
                 raw_chunks.append(chunk)
 
-        # Stage 2: Greedy Merging up to max_limit characters
+        # Stage 2: Greedy Merging up to effective_max_limit characters
+        # Keep ". " between merged sentence chunks so Stage 3 knows natural sentence boundaries
         segments = []
         current_segment = ""
+        current_clean_len = 0
         
         for chunk in raw_chunks:
-            test_segment = (current_segment + " " + chunk).strip() if current_segment else chunk
-            if len(test_segment) <= max_limit:
-                current_segment = test_segment
+            chunk_clean = TextProcessor.remove_punctuation(chunk)
+            if not chunk_clean:
+                continue
+            test_clean_len = (current_clean_len + 1 + len(chunk_clean)) if current_segment else len(chunk_clean)
+            if test_clean_len <= effective_max_limit:
+                current_segment = (current_segment + ". " + chunk_clean) if current_segment else chunk_clean
+                current_clean_len = test_clean_len
             else:
                 if current_segment:
-                    segments.append(TextProcessor.remove_punctuation(current_segment))
-                current_segment = chunk
+                    segments.append(current_segment)
+                current_segment = chunk_clean
+                current_clean_len = len(chunk_clean)
 
         if current_segment:
-            segments.append(TextProcessor.remove_punctuation(current_segment))
+            segments.append(current_segment)
         
-        # Stage 3: Enforce minimum segment character count
-        # If min_segment_chars > 0, merge any segment shorter than the minimum into its neighbor.
-        # When simple 2-way merging would exceed max_limit, try combining 3+ neighboring
-        # segments and re-splitting them by word boundaries to produce balanced segments.
-        min_chars = getattr(config_manager, "min_segment_chars", 0) if config_manager else 0
+        # Stage 3: Strictly enforce minimum segment character count (Highest Priority after ///)
         if min_chars > 0 and len(segments) > 1:
-            merged = True
-            while merged:
-                merged = False
-                i = 0
-                while i < len(segments):
-                    seg_text = TextProcessor.remove_punctuation(segments[i])
-                    if len(seg_text) < min_chars and len(segments) > 1:
-                        # Strategy 1: Simple merge with next segment (if fits within max_limit)
-                        if i + 1 < len(segments):
-                            combined = (segments[i] + " " + segments[i + 1]).strip()
-                            combined = TextProcessor.remove_punctuation(combined)
-                            if len(combined) <= max_limit:
-                                segments[i] = combined
-                                segments.pop(i + 1)
-                                merged = True
+            changed = True
+            while changed and len(segments) > 1:
+                changed = False
+                for i in range(len(segments)):
+                    seg_clean = TextProcessor.remove_punctuation(segments[i])
+                    if len(seg_clean) >= min_chars:
+                        continue
+
+                    # Found a segment shorter than min_chars at index i!
+                    # Strategy 1: Direct 1-segment merge with an adjacent neighbor if <= effective_max_limit.
+                    # If both neighbors fit, merge with the shorter neighbor to keep lengths balanced.
+                    merge_candidates = []
+                    if i > 0:
+                        comb_prev_raw = segments[i - 1] + ". " + segments[i]
+                        comb_prev_clean = TextProcessor.remove_punctuation(comb_prev_raw)
+                        if len(comb_prev_clean) <= effective_max_limit:
+                            merge_candidates.append((len(comb_prev_clean), i - 1, i + 1, comb_prev_raw))
+                    if i + 1 < len(segments):
+                        comb_next_raw = segments[i] + ". " + segments[i + 1]
+                        comb_next_clean = TextProcessor.remove_punctuation(comb_next_raw)
+                        if len(comb_next_clean) <= effective_max_limit:
+                            merge_candidates.append((len(comb_next_clean), i, i + 2, comb_next_raw))
+
+                    if merge_candidates:
+                        merge_candidates.sort(key=lambda x: x[0])
+                        _, s_idx, e_idx, merged_raw = merge_candidates[0]
+                        segments[s_idx:e_idx] = [merged_raw]
+                        changed = True
+                        break
+
+                    # Strategy 2A: Segment-count-reducing redistribution (e.g., 3 segments -> 2 balanced segments)
+                    # Try window_size = 3, 4 around i where k < window_size fits within [min_chars, effective_max_limit]
+                    n = len(segments)
+                    redistributed = False
+                    for window_size in range(3, min(n, 5) + 1):
+                        win_start_min = max(0, i - window_size + 1)
+                        win_start_max = min(i, n - window_size)
+                        for s_idx in range(win_start_min, win_start_max + 1):
+                            e_idx = s_idx + window_size
+                            comb_raw = ". ".join(segments[s_idx:e_idx])
+                            comb_clean = TextProcessor.remove_punctuation(comb_raw)
+                            comb_len = len(comb_clean)
+                            k_min = max(1, math.ceil(comb_len / effective_max_limit))
+                            if k_min >= window_size:
                                 continue
-                        # Strategy 2: Simple merge with previous segment (if fits within max_limit)
-                        if i > 0:
-                            combined = (segments[i - 1] + " " + segments[i]).strip()
-                            combined = TextProcessor.remove_punctuation(combined)
-                            if len(combined) <= max_limit:
-                                segments[i - 1] = combined
-                                segments.pop(i)
-                                merged = True
-                                continue
-                        # Strategy 3: Multi-segment redistribution
-                        # When simple merge exceeds max_limit, combine multiple neighboring
-                        # segments and re-split by word boundaries to produce balanced segments
-                        # that all meet min_chars.
-                        ranges_to_try = []
-                        n = len(segments)
-                        # 2-segment combinations (re-split into balanced parts)
-                        if i > 0:
-                            ranges_to_try.append((i - 1, i + 1))
-                        if i + 1 < n:
-                            ranges_to_try.append((i, i + 2))
-                        # 3-segment combinations
-                        if i > 0 and i + 1 < n:
-                            ranges_to_try.append((i - 1, i + 2))
-                        if i > 1:
-                            ranges_to_try.append((i - 2, i + 1))
-                        if i + 2 < n:
-                            ranges_to_try.append((i, i + 3))
-                        # 4-segment combinations (fallback for extreme cases)
-                        if i > 1 and i + 1 < n:
-                            ranges_to_try.append((i - 2, i + 2))
-                        if i > 0 and i + 2 < n:
-                            ranges_to_try.append((i - 1, i + 3))
-
-                        redistributed = False
-                        for start_idx, end_idx in ranges_to_try:
-                            range_segs = segments[start_idx:end_idx]
-                            combined_text = " ".join(range_segs).strip()
-                            combined_text = TextProcessor.remove_punctuation(combined_text)
-
-                            # Re-split combined text by word boundaries using greedy algorithm
-                            words = combined_text.split()
-                            new_segs = []
-                            current = ""
-                            for word in words:
-                                test = (current + " " + word).strip() if current else word
-                                if len(test) <= max_limit:
-                                    current = test
-                                else:
-                                    if current:
-                                        new_segs.append(current)
-                                    current = word
-                            if current:
-                                new_segs.append(current)
-
-                            # Accept only if ALL new segments meet min_chars
-                            if new_segs and all(len(s) >= min_chars for s in new_segs):
-                                segments[start_idx:end_idx] = new_segs
-                                redistributed = True
-                                merged = True
+                            words, break_types = TextProcessor._extract_words_and_breaks(comb_raw)
+                            for k in range(k_min, window_size):
+                                new_segs = TextProcessor._partition_words_balanced(
+                                    words, k, min_chars=min_chars,
+                                    max_limit=effective_max_limit, break_types=break_types
+                                )
+                                if new_segs and all(len(TextProcessor.remove_punctuation(s)) >= min_chars for s in new_segs):
+                                    segments[s_idx:e_idx] = new_segs
+                                    redistributed = True
+                                    break
+                            if redistributed:
                                 break
-
                         if redistributed:
-                            continue
-                        # If no redistribution worked, leave segment as-is
-                    i += 1
+                            break
+
+                    if redistributed:
+                        changed = True
+                        break
+
+                    # Strategy 2B: Balanced Multi-Segment Redistribution within [min_chars, effective_max_limit]
+                    # Combine 2, 3, ..., up to all segments in the block and partition into k balanced segments
+                    # (e.g. [169 chars, 13 chars] -> two balanced ~91-char segments!)
+                    for window_size in range(2, n + 1):
+                        win_start_min = max(0, i - window_size + 1)
+                        win_start_max = min(i, n - window_size)
+                        candidate_windows = []
+                        for s_idx in range(win_start_min, win_start_max + 1):
+                            e_idx = s_idx + window_size
+                            comb_raw = ". ".join(segments[s_idx:e_idx])
+                            comb_clean = TextProcessor.remove_punctuation(comb_raw)
+                            candidate_windows.append((len(comb_clean), s_idx, e_idx, comb_raw))
+
+                        # Prefer combining with the longer neighbor first (e.g. 169 + 13 -> 88 + 94)
+                        candidate_windows.sort(key=lambda x: -x[0])
+
+                        for comb_len, s_idx, e_idx, comb_raw in candidate_windows:
+                            words, break_types = TextProcessor._extract_words_and_breaks(comb_raw)
+                            if not words:
+                                continue
+                            k_min = max(1, math.ceil(comb_len / effective_max_limit))
+                            k_max = max(1, (comb_len + 1) // (min_chars + 1))
+                            if k_min > k_max:
+                                continue
+
+                            for k in range(k_min, k_max + 1):
+                                new_segs = TextProcessor._partition_words_balanced(
+                                    words, k, min_chars=min_chars,
+                                    max_limit=effective_max_limit, break_types=break_types
+                                )
+                                if new_segs and all(len(TextProcessor.remove_punctuation(s)) >= min_chars for s in new_segs):
+                                    segments[s_idx:e_idx] = new_segs
+                                    redistributed = True
+                                    break
+                            if redistributed:
+                                break
+                        if redistributed:
+                            break
+
+                    if redistributed:
+                        changed = True
+                        break
+
+                    # Strategy 3: Ultimate Priority Fallback — min_segment_chars has HIGHER priority than max_limit!
+                    full_raw = ". ".join(segments)
+                    full_words, full_breaks = TextProcessor._extract_words_and_breaks(full_raw)
+                    full_len = len(" ".join(full_words))
+                    k_feasible = max(1, (full_len + 1) // (min_chars + 1))
+                    for k in range(k_feasible, 0, -1):
+                        new_segs = TextProcessor._partition_words_balanced(
+                            full_words, k, min_chars=min_chars,
+                            max_limit=None, break_types=full_breaks
+                        )
+                        if new_segs and all(len(TextProcessor.remove_punctuation(s)) >= min_chars for s in new_segs):
+                            segments[:] = new_segs
+                            redistributed = True
+                            break
+
+                    if redistributed:
+                        changed = True
+                        break
+
+                    # Final unconditional merge (when entire block has fewer than min_chars characters)
+                    if i > 0 and (i + 1 >= len(segments) or len(segments[i - 1]) <= len(segments[i + 1])):
+                        segments[i - 1] = segments[i - 1] + ". " + segments[i]
+                        segments.pop(i)
+                    elif i + 1 < len(segments):
+                        segments[i] = segments[i] + ". " + segments[i + 1]
+                        segments.pop(i + 1)
+                    changed = True
+                    break
 
         # Assign durations
         block_results = []

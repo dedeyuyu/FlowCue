@@ -281,6 +281,8 @@ class ImportDialog(QDialog):
                 proj.spanish_text = col5
                 # Auto clean and segment Spanish text on import using config_manager rules if available
                 config_mgr = getattr(self.parent(), "config_manager", None)
+                if config_mgr:
+                    config_mgr.load()
                 proj.spanish_segments = TextProcessor.segment_spanish_text(col5, config_mgr)
                 proj.save()
                 

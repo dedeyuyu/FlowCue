@@ -133,10 +133,10 @@ class SettingsDialog(QDialog):
         self.spin_min_segment_chars = QSpinBox()
         self.spin_min_segment_chars.setRange(0, 500)
         self.spin_min_segment_chars.setSuffix(" 字符")
-        self.spin_min_segment_chars.setToolTip("设为 0 则不限制。分段时任何片段的字符数都不会低于此值，过短的片段会自动合并到相邻片段。")
+        self.spin_min_segment_chars.setToolTip("最高优先级规则（仅次于 /// 强制分段）。分段时任何片段的字符数都不会低于此值，过短片段会自动与上下相邻段合并或均分重组。")
         min_chars_layout.addWidget(self.spin_min_segment_chars)
         
-        lbl_min_hint = QLabel("(* 设为 0 = 不限制；智能分段时过短片段会自动合并到相邻句)")
+        lbl_min_hint = QLabel("(* 除 /// 强制断句外最高权重；过短片段自动与相邻段合并或均分为中等段落)")
         lbl_min_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
         min_chars_layout.addWidget(lbl_min_hint, stretch=1)
         

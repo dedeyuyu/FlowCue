@@ -42,6 +42,8 @@ class HostedModeWidget(QWidget):
         self.small_threshold = 40
         self.group_size = 5
         self.upload_timeout = 60
+        self.run_group_size = 5
+        self.run_wait_seconds = 60
         self._load_settings()
 
         # 精准关闭管理
@@ -59,12 +61,21 @@ class HostedModeWidget(QWidget):
         self.upload_group_active = False
         self.upload_retry_only = False
         self.running = False         # 步骤 3 是否在运行
+        self.run_browser_queue = []  # 步骤 3 待启动的浏览器分组队列
+        self.run_released_cids = set()  # 步骤 3 已启动组的浏览器 cid 集合
+        self.run_total_groups = 0
+        self.run_current_group_idx = 0
+        self.run_next_group_deadline = 0
 
         self._init_ui()
 
         self.upload_timer = QTimer(self)
         self.upload_timer.setInterval(500)
         self.upload_timer.timeout.connect(self._upload_tick)
+
+        self.run_group_timer = QTimer(self)
+        self.run_group_timer.setInterval(500)
+        self.run_group_timer.timeout.connect(self._run_group_tick)
 
         if self.plugin_server:
             self.plugin_server.client_connected_signal.connect(self._schedule_refresh)
@@ -94,6 +105,8 @@ class HostedModeWidget(QWidget):
                 self.small_threshold = int(d.get("small_threshold", 40))
                 self.group_size = int(d.get("group_size", 5))
                 self.upload_timeout = int(d.get("upload_timeout", 60))
+                self.run_group_size = int(d.get("run_group_size", 5))
+                self.run_wait_seconds = int(d.get("run_wait_seconds", 60))
         except Exception as e:
             logger.warning(f"读取托管设置失败: {e}")
 
@@ -102,10 +115,14 @@ class HostedModeWidget(QWidget):
         self.small_threshold = self.spin_small.value()
         self.group_size = self.spin_group.value()
         self.upload_timeout = self.spin_timeout.value()
+        self.run_group_size = self.spin_run_group.value()
+        self.run_wait_seconds = self.spin_run_wait.value()
         try:
             self.settings_file.write_text(json.dumps({
                 "threshold": self.threshold, "small_threshold": self.small_threshold,
-                "group_size": self.group_size, "upload_timeout": self.upload_timeout}, ensure_ascii=False, indent=2),
+                "group_size": self.group_size, "upload_timeout": self.upload_timeout,
+                "run_group_size": self.run_group_size, "run_wait_seconds": self.run_wait_seconds},
+                ensure_ascii=False, indent=2),
                 encoding="utf-8")
         except Exception as e:
             logger.warning(f"保存托管设置失败: {e}")
@@ -185,8 +202,15 @@ class HostedModeWidget(QWidget):
         root.addWidget(g1)
 
         # 步骤 2 / 3
-        g2 = QGroupBox("步骤 2：分组上传图片    ·    步骤 3：发送任务并开始生成")
-        l2 = QHBoxLayout(g2)
+        g2 = QGroupBox("步骤 2：分组上传图片    ·    步骤 3：按批次发送任务并开始生成")
+        l2_root = QVBoxLayout(g2)
+        l2_root.setSpacing(6)
+
+        # 第一行：步骤 2（上传图片）
+        l2 = QHBoxLayout()
+        lbl_s2 = QLabel("📤 步骤2（上传图片）：")
+        lbl_s2.setStyleSheet("font-weight: bold; color: #0E7490;")
+        l2.addWidget(lbl_s2)
         l2.addWidget(QLabel("每组浏览器数："))
         self.spin_group = self._spin(1, 50, self.group_size, " 个")
         l2.addWidget(self.spin_group)
@@ -203,14 +227,34 @@ class HostedModeWidget(QWidget):
         self.btn_flip_failed.setToolTip("将所有上传失败的图片进行左右翻转，用新图片替换并删除原图（保留原文件名）")
         self.btn_flip_failed.clicked.connect(self.flip_failed_upload_images)
         l2.addWidget(self.btn_flip_failed)
-        l2.addSpacing(20)
+        l2.addStretch()
+        l2_root.addLayout(l2)
+
+        # 第二行：步骤 3（分批发送任务并生成）
+        l3 = QHBoxLayout()
+        lbl_s3 = QLabel("🚀 步骤3（发送任务）：")
+        lbl_s3.setStyleSheet("font-weight: bold; color: #15803D;")
+        l3.addWidget(lbl_s3)
+        l3.addWidget(QLabel("每批浏览器数："))
+        self.spin_run_group = self._spin(1, 50, self.run_group_size, " 个")
+        self.spin_run_group.setToolTip("每次同时启动多少个浏览器运行生成任务（默认 5 个）")
+        l3.addWidget(self.spin_run_group)
+        l3.addWidget(QLabel("批次等待时间："))
+        self.spin_run_wait = self._spin(1, 3600, self.run_wait_seconds, " 秒")
+        self.spin_run_wait.setToolTip("无论上一批是否完成，等待该秒数后自动启动下一批浏览器（默认 60 秒）")
+        l3.addWidget(self.spin_run_wait)
         self.btn_run = self._btn("🚀 步骤3：发送任务并开始生成", "#16A34A", "#15803D")
         self.btn_run.clicked.connect(self.start_run)
-        l2.addWidget(self.btn_run)
+        l3.addWidget(self.btn_run)
         self.btn_stop = self._btn("⏹ 停止", "#DC2626", "#B91C1C")
         self.btn_stop.clicked.connect(self.stop_run)
-        l2.addWidget(self.btn_stop)
-        l2.addStretch()
+        l3.addWidget(self.btn_stop)
+        self.lbl_run_group_status = QLabel("")
+        self.lbl_run_group_status.setStyleSheet("color: #0369A1; font-weight: bold; font-size: 12px; margin-left: 8px;")
+        l3.addWidget(self.lbl_run_group_status)
+        l3.addStretch()
+        l2_root.addLayout(l3)
+
         root.addWidget(g2)
 
         # 表格
@@ -287,6 +331,9 @@ class HostedModeWidget(QWidget):
                 entry["cid"] = m[0]["client_id"]
                 if old in self.plan and old != entry["cid"]:
                     self.plan[entry["cid"]] = self.plan.pop(old)
+                    if hasattr(self, "run_released_cids") and old in self.run_released_cids:
+                        self.run_released_cids.discard(old)
+                        self.run_released_cids.add(entry["cid"])
                     for b in self.batches:
                         if b.get("cid") == old:
                             b["cid"] = entry["cid"]
@@ -406,7 +453,10 @@ class HostedModeWidget(QWidget):
             col = {"完成": GREEN if b["fail"] == 0 else YELLOW, "生成中": BLUE, "已发送": BLUE,
                    "发送失败": RED, "连接断开": RED}.get(rs)
             txt = rs
-            if rs in ("生成中", "完成", "连接断开", "已发送"):
+            if rs == "未开始" and self.running and b.get("cid") and b["upload_state"] == "成功" and b["cid"] not in self.run_released_cids:
+                txt = "⏳ 排队等待下一批"
+                col = YELLOW
+            elif rs in ("生成中", "完成", "连接断开", "已发送"):
                 txt = f"{rs} | ✅{b['ok']} ❌{b['fail']} / {n}"
             fail_tip = "\n".join(f"{Path(k).name}: {v}" for k, v in b["fail_msgs"].items())
             self._put(self.tbl_batches, i, 6, txt, col, tip=fail_tip or None)
@@ -643,6 +693,7 @@ class HostedModeWidget(QWidget):
                     for t in batch:
                         segs.append(t.get("_original_index", 0))
                         clean = {k: v for k, v in t.items() if not k.startswith("_")}
+                        clean["_mode_overridden"] = bool(t.get("_mode_overridden"))
                         tasks.append(clean)
                         for key in ("local_image_path", "end_local_image_path"):
                             p = clean.get(key)
@@ -998,7 +1049,162 @@ class HostedModeWidget(QWidget):
         return next((b for b in self.batches if b["id"] == bid), None)
 
     # ──────────────────────────────── 步骤 3：发送任务并监控
+    def _confirm_step3_dialog(self, ready, active_entries, g_size, wait_sec):
+        """弹出步骤 3 启动前确认框：展示尺寸（16:9 爆红提醒）、模型、模式、账号数、总消耗积分及分批策略。"""
+        from PyQt6.QtWidgets import QDialog, QFrame
+        from models.config_manager import ConfigManager
+
+        cm = getattr(self.mw, "config_manager", None)
+        if cm:
+            cm.load()
+
+        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
+        default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
+        task_interval = getattr(cm, "task_interval", 5) if cm else 5
+
+        # 同步最新规则到即将发送的批次任务中
+        modes_used = set()
+        for b in ready:
+            for t in b.get("tasks") or []:
+                t["aspect_ratio"] = default_aspect
+                t["model"] = default_model
+                t["interval"] = task_interval
+                if not t.get("_mode_overridden"):
+                    t["mode"] = default_mode
+                modes_used.add(t.get("mode", default_mode))
+
+        aspect_map = dict(getattr(ConfigManager, "SUPPORTED_ASPECT_RATIOS", [("9:16", "9:16 (竖屏)"), ("16:9", "16:9 (横屏)")]))
+        model_map = dict(getattr(ConfigManager, "SUPPORTED_VIDEO_MODELS", []))
+        mode_map = dict(getattr(ConfigManager, "SUPPORTED_GENERATION_MODES", []))
+
+        aspect_label = aspect_map.get(default_aspect, default_aspect)
+        model_label = model_map.get(default_model, default_model)
+        if len(modes_used) > 1:
+            mode_label = " + ".join(mode_map.get(m, m) for m in sorted(modes_used))
+        else:
+            single_mode = next(iter(modes_used), default_mode)
+            mode_label = mode_map.get(single_mode, single_mode)
+
+        is_16_9 = (default_aspect == "16:9")
+        account_count = len(active_entries)
+        batch_count = len(ready)
+        task_count = sum(len(b.get("tasks") or []) for b in ready)
+        total_points = sum(b.get("points", 0) for b in ready)
+        num_groups = (account_count + g_size - 1) // g_size if account_count > 0 else 1
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🚀 确认执行 步骤3：发送任务并开始生成")
+        dlg.setMinimumWidth(520)
+        dlg.setStyleSheet("""
+            QDialog {
+                background-color: #FAF6F0;
+                color: #3E2723;
+                font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+            }
+            QLabel {
+                font-size: 13px;
+                color: #3E2723;
+            }
+        """)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("请核对本次全局托管生成的参数配置与消耗信息：")
+        title_lbl.setStyleSheet("font-size: 14px; font-weight: bold; color: #5D4037;")
+        layout.addWidget(title_lbl)
+
+        # 如果尺寸是 16:9，顶部显示爆红警告横幅（仅提醒，不阻止运行）
+        if is_16_9:
+            warn_box = QLabel(
+                "🚨 【爆红提醒】当前画幅尺寸为 16:9（横屏）！\n"
+                "请仔细确认本次任务是否确实需要生成 16:9 横屏视频！\n"
+                "（若确认需要 16:9 可直接点击下方「确认开始」；如需改为 9:16 请点击「取消」前往系统规则设置修改）"
+            )
+            warn_box.setWordWrap(True)
+            warn_box.setStyleSheet("""
+                QLabel {
+                    background-color: #FEE2E2;
+                    color: #DC2626;
+                    border: 2px solid #DC2626;
+                    border-radius: 6px;
+                    padding: 10px 12px;
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+            """)
+            layout.addWidget(warn_box)
+
+        # 参数详情卡片
+        card = QFrame(dlg)
+        card.setStyleSheet("""
+            QFrame {
+                background-color: #FFFFFF;
+                border: 1px solid #D7CCC8;
+                border-radius: 6px;
+            }
+        """)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(8)
+
+        def add_info_row(label_text, value_text, highlight_red=False, highlight_color=None):
+            row = QHBoxLayout()
+            k_lbl = QLabel(label_text)
+            k_lbl.setFixedWidth(135)
+            k_lbl.setStyleSheet("font-weight: bold; color: #5D4037; border: none;")
+            v_lbl = QLabel(value_text)
+            v_lbl.setWordWrap(True)
+            if highlight_red:
+                v_lbl.setStyleSheet(
+                    "background-color: #FEE2E2; color: #DC2626; font-weight: 900; "
+                    "font-size: 15px; padding: 4px 8px; border: 1.5px solid #DC2626; border-radius: 4px;"
+                )
+            elif highlight_color:
+                v_lbl.setStyleSheet(f"color: {highlight_color}; font-weight: bold; font-size: 14px; border: none;")
+            else:
+                v_lbl.setStyleSheet("color: #1E293B; font-weight: bold; font-size: 13px; border: none;")
+            row.addWidget(k_lbl)
+            row.addWidget(v_lbl, stretch=1)
+            card_layout.addLayout(row)
+
+        add_info_row(
+            "📐 当前画幅尺寸：",
+            f"🚨 {aspect_label} 【当前为16:9横屏，请重点核对！】" if is_16_9 else f"✅ {aspect_label}",
+            highlight_red=is_16_9,
+            highlight_color="#15803D" if not is_16_9 else None
+        )
+        add_info_row("🤖 当前生成模型：", model_label, highlight_color="#1D4ED8")
+        add_info_row("🎬 当前生成模式：", mode_label, highlight_color="#7C3AED")
+        add_info_row("👤 执行浏览器账号：", f"{account_count} 个账号（共 {batch_count} 批 / {task_count} 条视频任务）", highlight_color="#0F766E")
+        add_info_row("⚡ 预计总消耗积分：", f"共 {total_points} 积分", highlight_color="#D97706")
+
+        if num_groups > 1:
+            batch_policy_str = f"每批运行 {g_size} 个浏览器（共 {num_groups} 批），间隔等待 {wait_sec} 秒后自动启动下一批"
+        else:
+            batch_policy_str = f"每批运行 {g_size} 个浏览器（共 1 批，立即全部启动）"
+        add_info_row("⏱️ 分批执行策略：", batch_policy_str)
+
+        layout.addWidget(card)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = self._btn("❌ 取消", "#6B7280", "#4B5563")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_ok = self._btn("✅ 确认开始", "#16A34A", "#15803D")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        layout.addLayout(btn_row)
+
+        return dlg.exec() == QDialog.DialogCode.Accepted
+
     def start_run(self):
+        if self.running:
+            QMessageBox.information(self, "提示", "步骤 3 正在运行中，如需重新开始请先点击「⏹ 停止」。")
+            return
         if self.upload_group_active or self.upload_queue:
             QMessageBox.warning(self, "提示", "图片还在上传中，请等待上传结束。")
             return
@@ -1017,18 +1223,96 @@ class HostedModeWidget(QWidget):
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                     QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
                 return
+
+        ready_cids = {b["cid"] for b in ready}
+        active_entries = [entry for entry in self.plan.values() if entry["cid"] in ready_cids]
+        g_size = self.spin_run_group.value()
+        wait_sec = self.spin_run_wait.value()
+
+        # 弹窗确认尺寸（16:9 爆红提醒）、模型、模式、账号数与总消耗积分
+        if not self._confirm_step3_dialog(ready, active_entries, g_size, wait_sec):
+            self._log("⏹ 用户取消了步骤 3 启动")
+            return
+
         for b in ready:
             if b["run_state"] != "未开始":
                 b["run_state"] = "未开始"
+
         self.running = True
-        self._log(f"🚀 步骤3 开始：{len(ready)} 批任务将发送到 {len({b['cid'] for b in ready})} 个浏览器")
-        for entry in list(self.plan.values()):
-            self._dispatch_next(entry)
+        self.run_browser_queue = [active_entries[i:i + g_size] for i in range(0, len(active_entries), g_size)]
+        self.run_total_groups = len(self.run_browser_queue)
+        self.run_current_group_idx = 0
+        self.run_released_cids = set()
+        self.run_next_group_deadline = 0
+
+        total_pts = sum(b.get("points", 0) for b in ready)
+        self._log(
+            f"🚀 步骤3 开始：{len(ready)} 批任务（共 {total_pts} 积分）将发送到 {len(active_entries)} 个浏览器，"
+            f"分 {self.run_total_groups} 批启动（每批 {g_size} 个，间隔等待 {wait_sec} 秒）"
+        )
+        self._start_next_run_group()
         self.refresh_all()
+
+    def _start_next_run_group(self):
+        if not self.running or not self.run_browser_queue:
+            self.run_group_timer.stop()
+            if self.running and self.run_total_groups > 1:
+                self.lbl_run_group_status.setText(f"✅ 全部 {self.run_total_groups} 批浏览器已启动")
+            else:
+                self.lbl_run_group_status.setText("")
+            return
+
+        group = self.run_browser_queue.pop(0)
+        self.run_current_group_idx += 1
+        for entry in group:
+            self.run_released_cids.add(entry["cid"])
+
+        self._log(
+            f"🚀 步骤3 第 {self.run_current_group_idx}/{self.run_total_groups} 批启动："
+            f"正在向本批 {len(group)} 个浏览器发送任务..."
+        )
+        for entry in group:
+            self._dispatch_next(entry)
+
+        if self.run_browser_queue:
+            wait_sec = self.spin_run_wait.value()
+            self.run_next_group_deadline = time.time() + wait_sec
+            next_count = len(self.run_browser_queue[0])
+            self._log(
+                f"⏳ 将等待 {wait_sec} 秒后（无论本批是否完成）自动启动第 "
+                f"{self.run_current_group_idx + 1}/{self.run_total_groups} 批（{next_count} 个浏览器）..."
+            )
+            self.lbl_run_group_status.setText(
+                f"⏳ 已启动第 {self.run_current_group_idx}/{self.run_total_groups} 批 · 距下一批启动还有 {wait_sec} 秒"
+            )
+            if not self.run_group_timer.isActive():
+                self.run_group_timer.start()
+        else:
+            self.run_group_timer.stop()
+            if self.run_total_groups > 1:
+                self.lbl_run_group_status.setText(f"✅ 全部 {self.run_total_groups} 批浏览器已启动")
+            else:
+                self.lbl_run_group_status.setText("")
+        self.refresh_all()
+
+    def _run_group_tick(self):
+        if not self.running or not self.run_browser_queue:
+            self.run_group_timer.stop()
+            return
+        rem = int(round(self.run_next_group_deadline - time.time()))
+        if rem <= 0:
+            self._log(f"⏰ 等待时间已到，开始启动下一批浏览器（无论上一批是否完成）...")
+            self._start_next_run_group()
+        else:
+            self.lbl_run_group_status.setText(
+                f"⏳ 已启动第 {self.run_current_group_idx}/{self.run_total_groups} 批 · 距下一批启动还有 {rem} 秒"
+            )
 
     def _dispatch_next(self, entry):
         if not self.running:
             return
+        if self.run_released_cids and entry["cid"] not in self.run_released_cids:
+            return   # 该浏览器所属批次尚未到达启动时间
         mine = [b for b in self.batches if b["id"] in entry["batch_ids"]]
         if any(b["run_state"] in ("已发送", "生成中") for b in mine):
             return   # 该浏览器还在跑上一批
@@ -1043,12 +1327,13 @@ class HostedModeWidget(QWidget):
             self.refresh_all()
             return
         nxt["run_state"] = "已发送"
+        clean_tasks = [{k: v for k, v in t.items() if not k.startswith("_")} for t in nxt["tasks"]]
         req = self.plugin_server.send_rpc_action(c["client_id"], "run_tasks",
-                                                 {"batch_id": nxt["id"], "tasks": nxt["tasks"], "clear_existing": True})
+                                                 {"batch_id": nxt["id"], "tasks": clean_tasks, "clear_existing": True})
         if not req:
             nxt["run_state"] = "发送失败"
         else:
-            self._log(f"📨 已发送 {nxt['short']}（{len(nxt['tasks'])} 个任务）→ {self._label(entry['email'])}")
+            self._log(f"📨 已发送 {nxt['short']}（{len(clean_tasks)} 个任务）→ {self._label(entry['email'])}")
         self.refresh_all()
 
     def _on_hosted_event(self, payload):
@@ -1103,11 +1388,15 @@ class HostedModeWidget(QWidget):
     def _check_all_done(self):
         if not self.running:
             return
+        if self.run_browser_queue:
+            return
         active = [b for b in self.batches if b["run_state"] in ("已发送", "生成中")]
         waiting = [b for b in self.batches if b["cid"] and b["run_state"] == "未开始" and b["upload_state"] == "成功"]
         if active or waiting:
             return
         self.running = False
+        self.run_group_timer.stop()
+        self.lbl_run_group_status.setText("")
         ok = sum(b["ok"] for b in self.batches)
         fail = sum(b["fail"] for b in self.batches)
         self._log(f"🎉 全部批次执行结束：✅ 成功 {ok} 个视频，❌ 失败 {fail} 个。"
@@ -1124,8 +1413,11 @@ class HostedModeWidget(QWidget):
             self.upload_group_active = False
             self.upload_timer.stop()
             self._log("⏹ 已停止上传")
-        if self.running:
+        if self.running or self.run_browser_queue:
             self.running = False
+            self.run_browser_queue = []
+            self.run_group_timer.stop()
+            self.lbl_run_group_status.setText("")
             for b in self.batches:
                 if b["run_state"] in ("已发送", "生成中"):
                     c = self._resolve_client(self.plan.get(b["cid"], {"cid": b["cid"], "email": b["email"]}))

@@ -1146,10 +1146,27 @@ class ProjectDetailWidget(QWidget):
             QMessageBox.warning(self, "提示", "西班牙语文案为空，请先输入。")
             return
             
-        # Perform segmentation
+        # Ensure latest config rules (especially min_segment_chars) are loaded
+        if not self.config_manager:
+            main_win = self.window()
+            if hasattr(main_win, "config_manager"):
+                self.config_manager = main_win.config_manager
+        if self.config_manager:
+            self.config_manager.load()
+
+        # Perform segmentation while preserving existing image/mode/template bindings by row index
+        old_segments = self.project_model.spanish_segments or []
         segments = TextProcessor.segment_spanish_text(text, self.config_manager)
+        preserve_keys = ("image_name", "end_image_name", "mode", "mode_overridden", "template_id", "motion_id")
+        for idx, new_seg in enumerate(segments):
+            if idx < len(old_segments):
+                old_seg = old_segments[idx]
+                for k in preserve_keys:
+                    if k in old_seg:
+                        new_seg[k] = old_seg[k]
         self.project_model.spanish_segments = segments
         self.populate_segments_table()
+        self.project_model.save()
         QMessageBox.information(self, "成功", "已完成西文的表情清理与智能切分！")
 
     def save_project_data(self):
@@ -2602,7 +2619,8 @@ class ProjectDetailWidget(QWidget):
                 "download_path": download_path,
                 "_raw_duration": duration,
                 "_original_index": idx,
-                "_text_len": len(text)
+                "_text_len": len(text),
+                "_mode_overridden": bool(seg.get("mode_overridden"))
             }
             if getattr(self, "enable_end_frame", False) and end_image_name:
                 task_dict["end_image_name"] = end_image_name

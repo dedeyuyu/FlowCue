@@ -8,7 +8,7 @@ class ConfigManager:
     CONFIG_FILE_NAME = ".app_config.json"
     
     DEFAULT_MAX_BATCH_POINTS = 50
-    DEFAULT_MIN_SEGMENT_CHARS = 0  # 0 means disabled (no minimum)
+    DEFAULT_MIN_SEGMENT_CHARS = 45  # Default 45 chars (0 means disabled)
     DEFAULT_CHAR_DURATION_RULES = [
         {"max_chars": 40, "duration": 4},
         {"max_chars": 90, "duration": 6},

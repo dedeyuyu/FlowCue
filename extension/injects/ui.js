@@ -2503,27 +2503,38 @@
     const cy = rect.height > 0 ? Math.round(rect.top + rect.height / 2) : 0;
     try {
       if (typeof PointerEvent !== "undefined") {
-        touchTarget.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true }));
-        touchTarget.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true }));
+        touchTarget.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true, button: 0, buttons: 1 }));
+        touchTarget.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true, button: 0, buttons: 0 }));
       }
-      touchTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
-      touchTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
+      touchTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 1 }));
+      touchTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 0 }));
     } catch (_) {}
     if (typeof touchTarget.click === "function") {
       touchTarget.click();
     } else {
       genBtn.click();
     }
-    await delay(400);
+    await delay(450);
 
-    // 保底：若 400ms 后按钮仍处于可用未提交状态且提示词框仍展开，直接在 button 本体上补发一次点击
-    const stillBtn = findGenBtn();
-    const stillExpanded = document.querySelector(".collapsiblePromptBoxContainerWithTabsExpanded");
+    // 保底 1：若 450ms 后按钮仍处于可用未提交状态且提示词框仍展开，直接在 button 本体上补发一次点击
+    let stillBtn = findGenBtn();
+    let stillExpanded = document.querySelector(".collapsiblePromptBoxContainerWithTabsExpanded");
     if (stillBtn && stillExpanded && !stillBtn.disabled && !stillBtn.hasAttribute("disabled") && stillBtn.getAttribute("aria-disabled") !== "true") {
       console.log("[Vids] 🔁 检测到 touch 层点击后按钮仍未进入提交态，在 button 本体补发 click...");
       stillBtn.click();
+      await delay(450);
     }
-    await delay(400);
+
+    // 保底 2：若仍未提交，调用后台 chrome.debugger 发出真实硬件鼠标点击 (isTrusted=true)
+    stillBtn = findGenBtn();
+    stillExpanded = document.querySelector(".collapsiblePromptBoxContainerWithTabsExpanded");
+    if (stillBtn && stillExpanded && !stillBtn.disabled && !stillBtn.hasAttribute("disabled") && stillBtn.getAttribute("aria-disabled") !== "true" && cx > 0 && cy > 0) {
+      console.log(`[Vids] 🖱️ 启用内核级硬件点击 (nativeClick) 提交 @(${cx}, ${cy})...`);
+      try {
+        await sendToExtension("nativeClick", { x: cx, y: cy });
+      } catch (_) {}
+      await delay(400);
+    }
   }
 
   async function runVidsBatch(singleRowIndex = null) {
@@ -2855,14 +2866,14 @@
 
     // 校验页面生成组件是否就绪 (ProseMirror 富文本框与生成按钮)
     let editor = document.querySelector("flow-rich-text-editor div.ProseMirror") || document.querySelector("div.ProseMirror[contenteditable='true']");
-    let genBtn = document.querySelector("flow-generate-icon-button button") || document.querySelector("button.generate-icon-button");
+    let genBtn = findFlowGenerateButton();
 
     if (!editor || !genBtn) {
       console.log("[FlowUI] 正在等待页面 ProseMirror 提示词框及生成按钮就绪...");
       for (let w = 0; w < 6; w++) {
         await delay(500);
         editor = document.querySelector("flow-rich-text-editor div.ProseMirror") || document.querySelector("div.ProseMirror[contenteditable='true']");
-        genBtn = document.querySelector("flow-generate-icon-button button") || document.querySelector("button.generate-icon-button");
+        genBtn = findFlowGenerateButton();
         if (editor && genBtn) break;
       }
     }
@@ -3704,7 +3715,9 @@
     // 1. 核心通道：通过 flow-ingredient-bar 的“开始”帧槽位注入 (帧模式)
     const ingredientBar = document.querySelector("flow-ingredient-bar.prompt-ingredient-bar, .prompt-ingredient-bar, flow-ingredient-bar");
     if (ingredientBar) {
-      const startTrigger = ingredientBar.querySelector(".frame-trigger:first-of-type, .frame-trigger");
+      const allTriggers = Array.from(ingredientBar.querySelectorAll(".frame-trigger"));
+      const isEndSlot = (el) => /(结束|結束|\bend\b)/i.test(((el?.textContent || "") + " " + (el?.getAttribute?.("aria-label") || "")).trim());
+      const startTrigger = allTriggers.find(t => !isEndSlot(t)) || null;
       if (startTrigger) {
         // 如果首帧已有内容且匹配当前图片，无需重复添加
         const triggerImg = startTrigger.querySelector("img");
@@ -3715,9 +3728,9 @@
           return;
         }
 
-        // 点击“开始”按钮（button.empty-chip 或 button）打开媒体选择面板
+        // 点击“开始”按钮（button.empty-chip 或 button）打开媒体选择面板（严禁误点“结束”帧按钮）
         const startBtn = startTrigger.querySelector("button.empty-chip") || startTrigger.querySelector("button");
-        if (startBtn) {
+        if (startBtn && !isEndSlot(startBtn)) {
           console.log("[FlowUI] 点击首帧触发器按钮 [开始] 弹出媒体选择面板...");
           simulateClick(startBtn);
 
@@ -3926,12 +3939,19 @@
     // 2. 检查 DOM: flow-ingredient-bar / .prompt-ingredient-bar
     const ingredientBar = document.querySelector("flow-ingredient-bar.prompt-ingredient-bar, .prompt-ingredient-bar, flow-ingredient-bar");
     if (ingredientBar) {
-      // 帧模式下检查首帧槽位 (.frame-trigger)
+      // 优先检查 ingredientBar 内是否已存在任何已挂载的图片缩略图或素材胶囊（注意排除空的“结束”槽位干扰）
+      const hasChipOrImg = !!ingredientBar.querySelector(
+        "img, flow-tile, flow-media-tile, flow-ingredient-chip, .ingredient-chip, mat-chip, .chip-container, button[aria-label*='移除'], button[aria-label*='删除'], button[aria-label*='刪除'], button[aria-label*='Remove' i], button[aria-label*='Clear' i], .clear-button"
+      );
+      if (hasChipOrImg) return true;
+
+      // 帧模式下检查首帧槽位 (.frame-trigger，严格排除“结束/End”帧槽位)
       if (isFrameMode) {
-        const startTrigger = ingredientBar.querySelector(".frame-trigger:first-of-type, .frame-trigger");
+        const allTriggers = Array.from(ingredientBar.querySelectorAll(".frame-trigger"));
+        const isEndSlot = (el) => /(结束|結束|\bend\b)/i.test(((el?.textContent || "") + " " + (el?.getAttribute?.("aria-label") || "")).trim());
+        const startTrigger = allTriggers.find(t => !isEndSlot(t)) || null;
         if (startTrigger) {
           const emptyBtn = startTrigger.querySelector("button.empty-chip");
-          // 如果首帧中存在 img 标签或已不是 empty-chip，或者内容包含图片名称，则认为已挂载
           const hasImg = !!startTrigger.querySelector("img, flow-tile, flow-media-tile, [role='img']");
           const hasNonEmptyButton = !!startTrigger.querySelector("button:not(.empty-chip)");
           const triggerTitle = extractTileDisplayName(startTrigger, startTrigger.querySelector("img"));
@@ -3941,18 +3961,11 @@
           if (hasImg || hasNonEmptyButton || (!emptyBtn && triggerText.trim() !== "" && !triggerText.includes("开始") && !triggerText.includes("開始") && !/start/i.test(triggerText)) || matchesName) {
             return true;
           }
-          // 如果首帧明确包含 empty-chip，且没有缩略图，则说明首帧尚未挂上
           if (emptyBtn) {
             return false;
           }
         }
       }
-
-      // 素材模式或通用检查：查看是否存在素材芯片、缩略图或移除按钮
-      const hasChipOrImg = !!ingredientBar.querySelector(
-        "img, flow-ingredient-chip, .ingredient-chip, mat-chip, .chip-container, button[aria-label*='移除'], button[aria-label*='删除'], button[aria-label*='刪除'], button[aria-label*='Remove' i], button[aria-label*='Clear' i], .clear-button"
-      );
-      if (hasChipOrImg) return true;
 
       const barTitle = extractTileDisplayName(ingredientBar, ingredientBar.querySelector("img"));
       const barText = ingredientBar.textContent || "";
@@ -3968,6 +3981,68 @@
     }
 
     return false;
+  }
+
+  // 精准定位 Google Flow 底部提示词框的发送/生成按钮 (包含 <mat-icon>arrow_forward</mat-icon> 或 generate-icon-button)
+  // 严格按优先级查找，绝不使用包含宽泛 [aria-label*='开始'] 的单次 querySelector，防止误匹配首帧按钮或顶部导航栏按钮
+  function findFlowGenerateButton() {
+    const isVisible = (el) => {
+      if (!el || !el.isConnected) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden" && getComputedStyle(el).display !== "none";
+    };
+
+    const editor = document.querySelector("flow-rich-text-editor div.ProseMirror") ||
+                   document.querySelector("div.ProseMirror[contenteditable='true']");
+    const promptRoot = editor?.closest("flow-prompt-box, .prompt-box-container, .prompt-box, form") ||
+                       document.querySelector("flow-prompt-box, .prompt-box-container, .prompt-box") ||
+                       document;
+
+    // 优先级 1: 明确带有 generate-icon-button 类名或位于 flow-generate-icon-button 内的 button
+    const directCandidates = [
+      ...Array.from(promptRoot.querySelectorAll("button.generate-icon-button, flow-generate-icon-button button")),
+      ...Array.from(document.querySelectorAll("button.generate-icon-button, flow-generate-icon-button button"))
+    ];
+    const visDirect = directCandidates.find(b => isVisible(b) && Array.from(b.querySelectorAll("mat-icon, .google-symbols")).some(ic => (ic.textContent || "").trim() === "arrow_forward")) ||
+                      directCandidates.find(isVisible) ||
+                      directCandidates[0];
+    if (visDirect) return visDirect;
+
+    // 优先级 2: 通过内部 <mat-icon class="... google-symbols ...">arrow_forward</mat-icon> 精准反查父级 button（跨简/繁/英完全通用）
+    const arrowIcons = Array.from(promptRoot.querySelectorAll("mat-icon, .google-symbols")).filter(ic => (ic.textContent || "").trim() === "arrow_forward");
+    for (const ic of arrowIcons) {
+      const btn = ic.closest("button");
+      if (btn && isVisible(btn)) return btn;
+    }
+
+    const globalArrowBtns = Array.from(document.querySelectorAll("mat-icon, .google-symbols"))
+      .filter(ic => (ic.textContent || "").trim() === "arrow_forward")
+      .map(ic => ic.closest("button"))
+      .filter(btn => btn && isVisible(btn));
+    if (globalArrowBtns.length > 0) {
+      // 选择页面最底部（提示词框所在位置）的 arrow_forward 按钮
+      globalArrowBtns.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+      return globalArrowBtns[0];
+    }
+
+    // 优先级 3: 精确匹配生成按钮的 aria-label 或 type="submit"（绝不模糊匹配“开始”，防止误点首帧槽位）
+    const exactSelectors = [
+      "button[type='submit'][aria-label='开始生成']",
+      "button[type='submit'][aria-label='開始產生']",
+      "button[type='submit'][aria-label='開始生成']",
+      "button[aria-label='开始生成']",
+      "button[aria-label='開始產生']",
+      "button[aria-label='開始生成']",
+      "button[aria-label='Start generating' i]",
+      "button[aria-label='Generate' i]",
+      "button[type='submit']"
+    ];
+    for (const sel of exactSelectors) {
+      const found = Array.from(promptRoot.querySelectorAll(sel)).filter(isVisible);
+      if (found.length > 0) return found[found.length - 1];
+    }
+
+    return null;
   }
 
   // 注入提示词至 ProseMirror 并触发 Angular 提交
@@ -4071,8 +4146,10 @@ ${presetAfter || ""}`.trim();
       }
     }
 
-    // 策略 C: 结构化段落替换
-    if (!textInjected || editor.textContent.trim() !== finalPrompt) {
+    // 策略 C: 结构化段落替换（比较去空白后的文本，避免多行段落因不含 \n 而误覆盖 ProseMirror 原生节点）
+    const normEditorText = (editor.textContent || "").replace(/\s+/g, "");
+    const normFinalPrompt = finalPrompt.replace(/\s+/g, "");
+    if (!textInjected || normEditorText !== normFinalPrompt) {
       if (typeof editor.replaceChildren === "function") {
         const paragraphs = finalPrompt.split("\n").map(l => {
           const p = document.createElement("p");
@@ -4099,6 +4176,7 @@ ${presetAfter || ""}`.trim();
     editor.dispatchEvent(new Event("change", { bubbles: true }));
     window.promptBoxStore?.getState?.().actions?.setText?.(finalPrompt);
     window.promptBoxStore?.getState?.().actions?.setPrompt?.(finalPrompt);
+    await delay(300);
 
     // 6. 提交前图片挂载状态二次复核与补救
     if (image && (image.displayName || image.src || image.primaryMediaKey)) {
@@ -4121,17 +4199,16 @@ ${presetAfter || ""}`.trim();
       }
     }
 
-    // 7. 查找生成按钮并确保可点击发送
-    const findButton = () => document.querySelector(
-      "flow-generate-icon-button button, button.generate-icon-button, button[aria-label*='生成'], button[aria-label*='產生'], button[aria-label*='开始'], button[aria-label*='開始'], button[aria-label*='建立'], button[aria-label*='Generate' i], button[aria-label*='Create' i]"
-    );
+    // 7. 查找生成按钮 (button.generate-icon-button / <mat-icon>arrow_forward</mat-icon>) 并确保可点击发送
+    const isBtnReady = (b) => b && !b.disabled && !b.hasAttribute("disabled") && b.getAttribute("aria-disabled") !== "true" && !b.classList.contains("mat-mdc-button-disabled") && !b.classList.contains("flow-icon-button-disabled");
     let button;
     for (let i = 0; i < 40; i++) {
       if (isStopRequested) throw new Error("用户已停止任务");
-      button = findButton();
-      if (!state.isSuspended && button && !button.disabled && !button.hasAttribute("disabled") && button.getAttribute("aria-disabled") !== "true") break;
+      button = findFlowGenerateButton();
+      if (!state.isSuspended && isBtnReady(button)) break;
       // 若按钮仍 disabled，尝试重新派发输入事件激活
-      if (button && (button.disabled || button.getAttribute("aria-disabled") === "true")) {
+      if (button && !isBtnReady(button)) {
+        editor.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: finalPrompt }));
         editor.dispatchEvent(new Event("input", { bubbles: true }));
         editor.dispatchEvent(new Event("change", { bubbles: true }));
       }
@@ -4139,12 +4216,13 @@ ${presetAfter || ""}`.trim();
       await delay(500);
     }
     if (!button) {
-      button = findButton();
+      button = findFlowGenerateButton();
       if (button) {
         console.warn("[FlowUI] ⚠️ 生成按钮超时未就绪，强制解除 disabled 限制触发点击");
         button.removeAttribute("disabled");
         button.disabled = false;
         button.setAttribute("aria-disabled", "false");
+        button.classList.remove("mat-mdc-button-disabled", "flow-icon-button-disabled");
       } else {
         throw new Error("Flow 生成按钮尚未就绪，请检查页面提示");
       }
@@ -4173,9 +4251,61 @@ ${presetAfter || ""}`.trim();
     window.currentProcess = params;
     state.activeTasksQueue = [params];
 
-    console.log("[FlowUI] 🚀 正在触发生成按钮点击发送 (严格单次原生单击):", button);
-    simulateClick(button);
-    await delay(500);
+    // 重新获取最新 DOM 引用，防止异步等待期间按钮被 Angular 重绘替换
+    button = findFlowGenerateButton() || button;
+    const arrowIcon = Array.from(button.querySelectorAll("mat-icon, .google-symbols")).find(ic => (ic.textContent || "").trim() === "arrow_forward") || button.querySelector("mat-icon");
+    const touchTarget = button.querySelector(".mat-mdc-button-touch-target");
+    const clickEl = arrowIcon || button;
+    const rect = clickEl.getBoundingClientRect();
+    const cx = rect.width > 0 ? Math.round(rect.left + rect.width / 2) : 0;
+    const cy = rect.height > 0 ? Math.round(rect.top + rect.height / 2) : 0;
+
+    console.log("[FlowUI] 🚀 正在触发生成按钮点击发送 (目标 button & mat-icon arrow_forward):", { button, arrowIcon, cx, cy });
+    try {
+      if (typeof PointerEvent !== "undefined") {
+        clickEl.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true, button: 0, buttons: 1 }));
+        clickEl.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true, button: 0, buttons: 0 }));
+      }
+      clickEl.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 1 }));
+      clickEl.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 0 }));
+    } catch (_) {}
+    button.click();
+    await delay(750);
+
+    // 校验是否已成功进入提交/生成态；若提示词仍残留在输入框且按钮仍可用未旋转，执行多级保底触发
+    const isStillUnsubmitted = () => {
+      const boundIds = task.mediaBindings?.[lineIndex]?.mediaIds || [];
+      if (boundIds.length > 0 || isFlowCurrentlyGenerating()) return false;
+      const curEditor = document.querySelector("flow-rich-text-editor div.ProseMirror") || document.querySelector("div.ProseMirror[contenteditable='true']");
+      const editorHasText = curEditor && (curEditor.textContent || "").trim().length > 0;
+      const curBtn = findFlowGenerateButton();
+      return !!(editorHasText && curBtn && isBtnReady(curBtn));
+    };
+
+    if (isStillUnsubmitted()) {
+      console.log("[FlowUI] 🔁 检测到首次点击后仍未触发提交，针对 <mat-icon>arrow_forward</mat-icon> 与 touch-target 执行二次精准点击...");
+      const curBtn = findFlowGenerateButton() || button;
+      const curIcon = Array.from(curBtn.querySelectorAll("mat-icon, .google-symbols")).find(ic => (ic.textContent || "").trim() === "arrow_forward") || curBtn.querySelector("mat-icon");
+      const curTouch = curBtn.querySelector(".mat-mdc-button-touch-target");
+      if (curIcon) {
+        curIcon.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy }));
+      }
+      if (curTouch && typeof curTouch.click === "function") {
+        curTouch.click();
+      }
+      if (curBtn.form && typeof curBtn.form.requestSubmit === "function") {
+        try { curBtn.form.requestSubmit(curBtn); } catch (_) {}
+      }
+      await delay(650);
+    }
+
+    if (isStillUnsubmitted() && cx > 0 && cy > 0) {
+      console.log(`[FlowUI] 🖱️ 启用内核级硬件点击 (nativeClick) 触发发送按钮 @(${cx}, ${cy})...`);
+      try {
+        await sendToExtension("nativeClick", { x: cx, y: cy });
+      } catch (_) {}
+      await delay(500);
+    }
   }
 
   function getProjectTiles() {
