@@ -74,6 +74,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // 原生硬件级鼠标悬停：用于唤醒 Google Flow 视频缩略图 (img.thumbnail) 的懒加载 <video> 标签
+  if (message.action === "nativeHover") {
+    const tabId = sender.tab?.id;
+    if (tabId == null) { sendResponse({ ok: false, error: "无法识别当前标签页" }); return; }
+    dispatchNativeHover(tabId, message.x, message.y)
+      .then(r => sendResponse(r))
+      .catch(err => sendResponse({ ok: false, error: String(err?.message || err) }));
+    return true;
+  }
+
   // 桌面软件「账号积分管理」：关闭本浏览器（关闭该浏览器配置下的所有窗口）
   if (message.action === "closeBrowser") {
     sendResponse({ success: true });
@@ -205,6 +215,44 @@ async function dispatchNativeClick(tabId, x, y) {
   });
 }
 
+async function dispatchNativeHover(tabId, x, y) {
+  const px = Number.isFinite(Number(x)) ? Math.round(Number(x)) : 0;
+  const py = Number.isFinite(Number(y)) ? Math.round(Number(y)) : 0;
+  if (px <= 0 || py <= 0) return { ok: false, error: "无效的悬停坐标" };
+
+  return serialByTab(tabId, async () => {
+    const target = { tabId };
+    let attachedHere = false;
+    try {
+      try {
+        await chrome.debugger.attach(target, "1.3");
+        attachedHere = true;
+      } catch (e) {
+        if (!/already attached/i.test(String(e?.message || e))) throw e;
+      }
+      try { await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true }); } catch (_) {}
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: Math.max(1, px - 12), y: Math.max(1, py - 12), button: "none", buttons: 0
+      });
+      await new Promise(r => setTimeout(r, 40));
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: px, y: py, button: "none", buttons: 0
+      });
+      await new Promise(r => setTimeout(r, 40));
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: px + 3, y: py + 2, button: "none", buttons: 0
+      });
+      console.log(`[Background] ✅ 原生硬件悬停已发送 @(${px},${py})`);
+      return { ok: true, method: "chrome_debugger_native_hover" };
+    } finally {
+      if (attachedHere) {
+        try { await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: false }); } catch (_) {}
+        try { await chrome.debugger.detach(target); } catch (_) {}
+      }
+    }
+  });
+}
+
 // 2. 处理直接下载逻辑
 async function handleDownload(url, filename, task) {
   try {
@@ -228,6 +276,11 @@ async function handleDownload(url, filename, task) {
     if (!isVidsHost && !isGoogleFlowHost) {
       console.error(`[Background] ❌ 拒绝下载: 域名不在受信任的 Google CDN 白名单中: ${parsed.hostname}`);
       throw new Error("下载域名不受信任，已安全拦截");
+    }
+
+    if (parsed.hostname === "flow-content.google" && (!parsed.searchParams.get("Signature") || !parsed.searchParams.get("Expires"))) {
+      console.error(`[Background] ❌ 拒绝下载: flow-content.google 视频直链缺少完整 CDN 签名参数 (Expires/Signature): ${url}`);
+      throw new Error("视频直链缺少完整签名参数，等待有效签名直链");
     }
 
     const mediaId = parsed.hostname === "flow-content.google" ? parsed.pathname.match(/^\/video\/([a-zA-Z0-9_-]+)$/)?.[1] :

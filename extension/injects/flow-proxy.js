@@ -64,20 +64,41 @@
   // ----------------------------------------------------
   window.currentProcess = null; // 由 ui.js 设置，表示当前正在处理的行元数据
 
-  // 辅助函数：深度反转义 BoQ 响应文本 (消除 \/、\u002F、\u0026、\" 等)
+  // 辅助函数：深度反转义 BoQ 响应文本 (支持单层/多层嵌套 JSON 的 \\u003d、\\u0026、\\/、\" 等，防止残留反斜杠截断签名 URL)
   function unescapeBoQ(text) {
     if (typeof text !== "string" || !text) return "";
     try {
-      return text
-        .replace(/\\u002f/gi, "/")
-        .replace(/\\u0026/gi, "&")
-        .replace(/\\u003d/gi, "=")
-        .replace(/\\u0022/gi, '"')
-        .replace(/\\\//g, "/")
-        .replace(/\\"/g, '"')
-        .replace(/\\\\/g, "\\");
+      let res = text;
+      for (let i = 0; i < 3; i++) {
+        res = res
+          .replace(/\\+u002f/gi, "/")
+          .replace(/\\+u0026/gi, "&")
+          .replace(/\\+u003d/gi, "=")
+          .replace(/\\+u0022/gi, '"')
+          .replace(/\\+u003c/gi, "<")
+          .replace(/\\+u003e/gi, ">")
+          .replace(/\\+\//g, "/")
+          .replace(/\\+"/g, '"')
+          .replace(/\\\\/g, "\\");
+      }
+      return res;
     } catch {
       return text;
+    }
+  }
+
+  // 校验 flow-content.google 视频直链是否包含完整的 CDN 签名参数 (防止截断的 ?Expires 导致下载成 .xml 错误文件)
+  function isCompleteSignedFlowVideoUrl(url) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.hostname === "flow-content.google") {
+        return parsed.pathname.startsWith("/video/") &&
+               Boolean(parsed.searchParams.get("Expires")) &&
+               Boolean(parsed.searchParams.get("Signature"));
+      }
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -102,9 +123,12 @@
     const cleanText = unescapeBoQ(text);
     const urls = new Set();
     const mediaNames = new Set();
-    // 生成后页面的真实视频 CDN：无 .mp4 后缀，图片使用独立的 /image/ 路径。
+    // 生成后页面的真实视频 CDN：无 .mp4 后缀，图片使用独立的 /image/ 路径。必须包含完整签名参数。
     for (const value of cleanText.match(/https:\/\/flow-content\.google\/video\/[^\s"'<>\\`]+/gi) || []) {
-      urls.add(value.replace(/&amp;/g, "&"));
+      const candidate = value.replace(/&amp;/g, "&");
+      if (isCompleteSignedFlowVideoUrl(candidate)) {
+        urls.add(candidate);
+      }
     }
 
     // 保存页确认 uurnC 是 GetMediaUrl；此接口可返回不带 .mp4 后缀的签名视频地址。
@@ -112,8 +136,11 @@
       const matches = cleanText.match(/https?:\/\/[^\s"'<>\\]+/g) || [];
       for (const value of matches) {
         try {
-          const parsed = new URL(value);
-          if (/(^|\.)(googleusercontent\.com|googlevideo\.com|storage\.googleapis\.com)$/.test(parsed.hostname) && !isStaticShowcaseAsset(value)) urls.add(value.replace(/&amp;/g, "&"));
+          const cleanVal = value.replace(/&amp;/g, "&");
+          const parsed = new URL(cleanVal);
+          if (/(^|\.)(googleusercontent\.com|googlevideo\.com|storage\.googleapis\.com)$/.test(parsed.hostname) && !isStaticShowcaseAsset(cleanVal)) {
+            urls.add(cleanVal);
+          }
         } catch (_) {}
       }
     }
@@ -139,9 +166,6 @@
     while ((match = mediaNameRegex.exec(cleanText)) !== null) {
       const mName = match[1];
       mediaNames.add(mName);
-      // 自动组装官方直链构造接口
-      const constructedUrl = `https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${encodeURIComponent(mName)}&mediaUrlType=MEDIA_URL_TYPE_FULL_MEDIA`;
-      // 等待响应包含真实媒体 URL 后再下载。
     }
 
     // 4. 提取相对格式 mediaName (形如 "media/xyz")
@@ -149,8 +173,6 @@
     while ((match = shortMediaRegex.exec(cleanText)) !== null) {
       const mName = match[1];
       mediaNames.add(mName);
-      const constructedUrl = `https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${encodeURIComponent(mName)}&mediaUrlType=MEDIA_URL_TYPE_FULL_MEDIA`;
-      // 等待响应包含真实媒体 URL 后再下载。
     }
 
     return {
@@ -248,10 +270,16 @@
       }
     };
     if (typeof data === "string") {
-      // 兼容按行分割与按 BoQ 字节长度块分割
-      const chunks = data.split(/(?:^|\r?\n)\d+\r?\n|\r?\n/).map(s => s.trim()).filter(Boolean);
-      for (const chunk of chunks) {
-        try { visit(JSON.parse(chunk)); } catch (_) {}
+      // 优先按 BoQ 字节长度标记分割块（避免含多行文本的 JSON 块被按行切碎），失败时回退逐行解析
+      const lengthBlocks = data.split(/(?:^|\r?\n)\d+\r?\n/).map(s => s.trim()).filter(Boolean);
+      for (const block of lengthBlocks) {
+        try {
+          visit(JSON.parse(block));
+        } catch (_) {
+          for (const line of block.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
+            try { visit(JSON.parse(line)); } catch (__) {}
+          }
+        }
       }
     } else {
       visit(data);
@@ -270,11 +298,11 @@
     const frames = readRpcFrames(data);
     let boundInThisResponse = false;
 
-    const submission = frames.find(frame => frame.rpc === "eb1hJf");
+    const submission = frames.find(frame => frame.rpc === "eb1hJf" || (Array.isArray(frame.payload?.[2]) && Array.isArray(frame.payload?.[3])));
     if (submission && activeProcess?.submissionId && window.currentProcess === activeProcess) {
       const groups = submission.payload?.[2];
       const media = submission.payload?.[3];
-      console.log("[FlowProxy] 🎯 捕获到 eb1hJf 提交帧:", {
+      console.log(`[FlowProxy] 🎯 捕获到提交帧 [${submission.rpc}]:`, {
         submissionId: activeProcess.submissionId,
         groupsCount: Array.isArray(groups) ? groups.length : 0,
         mediaCount: Array.isArray(media) ? media.length : 0,
@@ -305,20 +333,20 @@
         }).map(item => item[0]);
       }
 
-      console.log("[FlowProxy] eb1hJf 提取到的 mediaIds:", ids);
+      console.log(`[FlowProxy] [${submission.rpc}] 提取到的 mediaIds:`, ids);
       if (ids.length) {
         boundInThisResponse = true;
-        console.log(`[FlowProxy] 🚀 [eb1hJf] 成功匹配媒体 ID! 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaIds=`, ids);
+        console.log(`[FlowProxy] 🚀 [${submission.rpc}] 成功匹配媒体 ID! 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaIds=`, ids);
         window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: activeProcess.submissionId, mediaIds: [...new Set(ids)] } }));
       } else {
-        console.warn("[FlowProxy] ⚠️ eb1hJf 帧存在，暂未直接提取到 mediaIds，将继续通过轮询帧/DOM 认领");
+        console.warn(`[FlowProxy] ⚠️ [${submission.rpc}] 帧存在，暂未直接提取到 mediaIds，将继续通过轮询帧/DOM 认领`);
       }
     }
 
-    // 检查状态轮询帧 (如 jwpduf 等): 如果当前活跃任务处于生成中，从中提取匹配当前 prompt 或包含新视频的媒体 ID
+    // 检查所有 BoQ 轮询帧 (兼容 jwpduf / Iyc41d / bOKtO / as29s / nzlxg 等所有新老 RPC ID)
     if (!boundInThisResponse && activeProcess?.submissionId && window.currentProcess === activeProcess) {
       for (const frame of frames) {
-        if ((frame.rpc === "jwpduf" || frame.rpc === "Iyc41d" || frame.rpc === "bOKtO" || frame.rpc === "as29s") && frame.payload) {
+        if (frame.payload) {
           const candidateItems = [];
           const scanItems = obj => {
             if (!obj || typeof obj !== "object") return;
@@ -360,21 +388,25 @@
               break;
             }
           }
+          if (boundInThisResponse) break;
         }
       }
     }
 
-    // 从所有 BoQ RPC 帧与响应文本中直接提取已就绪的 flow-content.google/video/<mediaId> 视频直链并通知 ui.js
-    const rawTextForScan = typeof data === "string" ? data : JSON.stringify(data || "");
+    // 从已解析的 RPC 帧 (JSON.parse 后天然消除转义) 与原始响应文本中提取带完整 CDN 签名的 flow-content.google/video/<mediaId> 视频直链
+    const parsedFramesText = frames.length > 0 ? frames.map(f => JSON.stringify(f.payload || "")).join("\n") : "";
+    const rawTextForScan = [parsedFramesText, typeof data === "string" ? data : JSON.stringify(data || "")].filter(Boolean).join("\n");
     if (rawTextForScan) {
       const extracted = extractMediaAssets(rawTextForScan, true);
+      const dispatchedIds = new Set();
       for (const url of extracted.urls) {
         try {
           const parsed = new URL(url);
-          if (parsed.hostname === "flow-content.google" && parsed.pathname.startsWith("/video/")) {
+          if (parsed.hostname === "flow-content.google" && parsed.pathname.startsWith("/video/") && isCompleteSignedFlowVideoUrl(url)) {
             const mId = parsed.pathname.match(/^\/video\/([a-zA-Z0-9_-]+)/)?.[1];
-            if (mId) {
-              console.log(`[FlowProxy] 🎉 从网络响应捕获到就绪视频直链! mediaId=${mId}, URL=${url.substring(0, 100)}`);
+            if (mId && !dispatchedIds.has(mId)) {
+              dispatchedIds.add(mId);
+              console.log(`[FlowProxy] 🎉 从网络响应捕获到完整签名视频直链! mediaId=${mId}, URL=${url.substring(0, 120)}`);
               window.dispatchEvent(new CustomEvent("flow-task-media-ready", { detail: { mediaId: mId, url } }));
             }
           }
@@ -406,7 +438,7 @@
       const url = candidates.find(value => {
         try {
           const parsed = new URL(value);
-          return parsed.hostname === "flow-content.google" && parsed.pathname === `/video/${mediaId}`;
+          return parsed.hostname === "flow-content.google" && parsed.pathname === `/video/${mediaId}` && isCompleteSignedFlowVideoUrl(value);
         } catch (_) { return false; }
       }) || `https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${encodeURIComponent(media.name)}&mediaUrlType=MEDIA_URL_TYPE_FULL_MEDIA`;
       console.log(`[FlowProxy] 🎉 发现已就绪视频! mediaId=${mediaId}, 最终选定 URL=${url}`);
@@ -419,7 +451,7 @@
     try { decoded = decodeURIComponent(decoded); } catch (_) {}
     return {
       generate: /video:batchAsyncGenerateVideo|StreamGenerateContent|L2jnw|eb1hJf/.test(url + decoded),
-      status: /batchCheckAsyncVideoGenerationStatus|BatchGetMedia|Iyc41d|ListMedia|bOKtO|jwpduf|as29s|batchexecute/.test(url + decoded)
+      status: /batchCheckAsyncVideoGenerationStatus|BatchGetMedia|Iyc41d|ListMedia|bOKtO|jwpduf|as29s|nzlxg|batchexecute/.test(url + decoded)
     };
   }
 
