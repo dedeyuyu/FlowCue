@@ -169,28 +169,20 @@
   }
 
   async function parseFetchResponse(response) {
-    const contentType = response.headers.get("Content-Type") || "";
+    const contentType = (response.headers.get("Content-Type") || "").toLowerCase();
     try {
-      if (contentType.includes("application/json")) {
-        return await response.json();
-      } else if (contentType.includes("text/") || contentType.includes("application/x-javascript") || contentType.includes("application/javascript")) {
-        let text = await response.text();
-        const cleaned = cleanBoQResponseText(text);
-        try {
-          return JSON.parse(cleaned);
-        } catch {
-          return cleaned;
-        }
-      } else if (contentType.includes("application/octet-stream") || contentType.includes("blob")) {
+      if (contentType.includes("application/octet-stream") || contentType.includes("blob") || contentType.includes("video/") || contentType.includes("image/") || contentType.includes("audio/")) {
         return await response.blob();
       } else if (contentType.includes("form-data")) {
         return await response.formData();
       } else {
-        let text = await response.text();
+        const text = await response.text();
         const cleaned = cleanBoQResponseText(text);
+        if (!cleaned) return "";
         try {
           return JSON.parse(cleaned);
         } catch {
+          // Google BoQ batchexecute 响应包含长度前缀与多行帧 (如 5014\n[["wrb.fr",...]])，直接返回清洗后的文本供 readRpcFrames 逐帧解析
           return cleaned;
         }
       }
@@ -239,17 +231,31 @@
   // BoQ 响应由长度行与独立 JSON 帧组成，不能整体 JSON.parse。
   function readRpcFrames(data) {
     const frames = [];
+    const seenFrameKeys = new Set();
     const visit = value => {
       if (!Array.isArray(value)) return;
-      if (value[0] === "wrb.fr") {
-        try { frames.push({ rpc: value[1], payload: JSON.parse(value[2]) }); } catch (_) {}
-      } else value.forEach(visit);
+      if (value[0] === "wrb.fr" && typeof value[1] === "string") {
+        try {
+          const payload = typeof value[2] === "string" ? JSON.parse(value[2]) : value[2];
+          const key = `${value[1]}:${typeof value[2] === "string" ? value[2].length : ""}`;
+          if (!seenFrameKeys.has(key)) {
+            seenFrameKeys.add(key);
+            frames.push({ rpc: value[1], payload, rawPayload: value[2] });
+          }
+        } catch (_) {}
+      } else {
+        value.forEach(visit);
+      }
     };
     if (typeof data === "string") {
-      for (const line of data.split(/\r?\n/)) {
-        try { visit(JSON.parse(line)); } catch (_) {}
+      // 兼容按行分割与按 BoQ 字节长度块分割
+      const chunks = data.split(/(?:^|\r?\n)\d+\r?\n|\r?\n/).map(s => s.trim()).filter(Boolean);
+      for (const chunk of chunks) {
+        try { visit(JSON.parse(chunk)); } catch (_) {}
       }
-    } else visit(data);
+    } else {
+      visit(data);
+    }
     if (frames.length > 0) {
       console.log("[FlowProxy] 🔍 readRpcFrames 提取到的 RPC 帧列表:", frames.map(f => f.rpc));
     }
@@ -257,38 +263,62 @@
   }
 
   function receiveGenerationData(data, process, isGenerateRequest) {
-    console.log(`[FlowProxy] ⚙️ receiveGenerationData 开始处理: isGenerateRequest=${isGenerateRequest}, process=${process ? `Row=${process.rowIndex}, Line=${process.lineIndex}, SubId=${process.submissionId}` : 'null'}`);
+    const activeProcess = process || window.currentProcess;
+    console.log(`[FlowProxy] ⚙️ receiveGenerationData 开始处理: isGenerateRequest=${isGenerateRequest}, process=${activeProcess ? `Row=${activeProcess.rowIndex}, Line=${activeProcess.lineIndex}, SubId=${activeProcess.submissionId}` : 'null'}`);
+    if (data == null) return;
+
     const frames = readRpcFrames(data);
+    let boundInThisResponse = false;
+
     const submission = frames.find(frame => frame.rpc === "eb1hJf");
-    if (submission && process?.submissionId && window.currentProcess === process) {
+    if (submission && activeProcess?.submissionId && window.currentProcess === activeProcess) {
       const groups = submission.payload?.[2];
       const media = submission.payload?.[3];
       console.log("[FlowProxy] 🎯 捕获到 eb1hJf 提交帧:", {
-        submissionId: process.submissionId,
+        submissionId: activeProcess.submissionId,
         groupsCount: Array.isArray(groups) ? groups.length : 0,
         mediaCount: Array.isArray(media) ? media.length : 0,
         groupsSample: groups?.[0],
         mediaSample: media?.[0]
       });
-      // 使用返回的输出列表，并交叉核对生成分组中的媒体 ID；不扫描素材 UUID。
-      const ids = Array.isArray(media) && Array.isArray(groups) ? media.filter(item =>
+      // 1. 优先使用严格交叉核对
+      let ids = Array.isArray(media) && Array.isArray(groups) ? media.filter(item =>
         Array.isArray(item) && typeof item[0] === "string" &&
         groups.some(group => group?.[0] === item[2] && group?.[4] === item[1] && group?.[3]?.[4] === item[0])
       ).map(item => item[0]) : [];
-      console.log("[FlowProxy] eb1hJf 交叉核对提取到的 mediaIds:", ids);
+
+      // 2. 宽松交叉核对兜底：若 groups 结构微调，只要 item[0] (UUID) 出现在 groups 序列化文本中即认领
+      if (!ids.length && Array.isArray(media) && Array.isArray(groups)) {
+        const groupsJson = JSON.stringify(groups) || "";
+        ids = media.filter(item =>
+          Array.isArray(item) && typeof item[0] === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item[0]) &&
+          groupsJson.includes(item[0])
+        ).map(item => item[0]);
+      }
+
+      // 3. 终极兜底：从 groups 或 media 的首项提取新生成的媒体 UUID（排除纯图片素材）
+      if (!ids.length && Array.isArray(media) && media.length > 0) {
+        ids = media.filter(item => {
+          if (!Array.isArray(item) || typeof item[0] !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item[0])) return false;
+          const s = JSON.stringify(item) || "";
+          return !s.includes("flow-content.google/image/") || s.includes("flow-content.google/video/");
+        }).map(item => item[0]);
+      }
+
+      console.log("[FlowProxy] eb1hJf 提取到的 mediaIds:", ids);
       if (ids.length) {
-        console.log(`[FlowProxy] 🚀 [eb1hJf] 成功匹配媒体 ID! 派发 flow-task-media-bound: submissionId=${process.submissionId}, mediaIds=`, ids);
-        window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: process.submissionId, mediaIds: ids } }));
-        return;
+        boundInThisResponse = true;
+        console.log(`[FlowProxy] 🚀 [eb1hJf] 成功匹配媒体 ID! 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaIds=`, ids);
+        window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: activeProcess.submissionId, mediaIds: [...new Set(ids)] } }));
       } else {
-        console.warn("[FlowProxy] ⚠️ eb1hJf 帧存在，但未能与 groups 交叉核对出匹配的 mediaIds");
+        console.warn("[FlowProxy] ⚠️ eb1hJf 帧存在，暂未直接提取到 mediaIds，将继续通过轮询帧/DOM 认领");
       }
     }
 
-    // 检查状态轮询帧 (如 jwpduf): 如果当前活跃任务处于生成中，从中提取匹配当前 prompt 的媒体 ID
-    if (process?.submissionId && window.currentProcess === process) {
+    // 检查状态轮询帧 (如 jwpduf 等): 如果当前活跃任务处于生成中，从中提取匹配当前 prompt 或包含新视频的媒体 ID
+    if (!boundInThisResponse && activeProcess?.submissionId && window.currentProcess === activeProcess) {
       for (const frame of frames) {
-        if (frame.rpc === "jwpduf" && frame.payload) {
+        if ((frame.rpc === "jwpduf" || frame.rpc === "Iyc41d" || frame.rpc === "bOKtO" || frame.rpc === "as29s") && frame.payload) {
           const candidateItems = [];
           const scanItems = obj => {
             if (!obj || typeof obj !== "object") return;
@@ -305,55 +335,66 @@
           };
           scanItems(frame.payload);
 
+          const targetPrompt = (activeProcess.finalPrompt || activeProcess.lineText || "").trim();
+          const targetLine = (activeProcess.lineText || "").trim();
+
           for (const item of candidateItems) {
             const mId = item[0];
-            let rpcPrompt = "";
-            const scanPrompt = v => {
-              if (rpcPrompt || !v) return;
-              if (typeof v === "string" && v.length > 5) rpcPrompt = v.trim();
-              else if (Array.isArray(v)) v.forEach(scanPrompt);
+            const itemStrings = [];
+            const collectStrings = v => {
+              if (!v) return;
+              if (typeof v === "string" && v.trim().length > 3) itemStrings.push(v.trim());
+              else if (Array.isArray(v)) v.forEach(collectStrings);
+              else if (typeof v === "object") Object.values(v).forEach(collectStrings);
             };
-            if (item[5]) scanPrompt(item[5]);
-            else scanPrompt(item);
+            collectStrings(item);
 
-            const targetPrompt = (process.finalPrompt || process.lineText || "").trim();
-            const targetLine = (process.lineText || "").trim();
-            console.log("[FlowProxy] 🔎 [jwpduf] 检查媒体项:", { mediaId: mId, rpcPrompt: rpcPrompt.substring(0, 40), targetPrompt: targetPrompt.substring(0, 40) });
-            const promptMatches = (targetPrompt && rpcPrompt && (
-              targetPrompt.includes(rpcPrompt) || rpcPrompt.includes(targetPrompt) ||
-              (targetLine && (rpcPrompt.includes(targetLine) || targetLine.includes(rpcPrompt))) ||
-              rpcPrompt.substring(0, 15) === targetPrompt.substring(0, 15)
-            ));
+            const promptMatches = itemStrings.some(rpcStr =>
+              (targetPrompt && (targetPrompt.includes(rpcStr) || rpcStr.includes(targetPrompt) || rpcStr.substring(0, 15) === targetPrompt.substring(0, 15))) ||
+              (targetLine && (rpcStr.includes(targetLine) || targetLine.includes(rpcStr)))
+            );
             if (promptMatches || candidateItems.length === 1) {
-              console.log(`[FlowProxy] 🚀 [jwpduf] 识别到当前任务媒体 ID! 派发 flow-task-media-bound: submissionId=${process.submissionId}, mediaId=${mId}`);
-              window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: process.submissionId, mediaIds: [mId] } }));
-              return;
+              boundInThisResponse = true;
+              console.log(`[FlowProxy] 🚀 [${frame.rpc}] 识别到当前任务媒体 ID! 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaId=${mId}`);
+              window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: activeProcess.submissionId, mediaIds: [mId] } }));
+              break;
             }
           }
         }
       }
     }
 
-    const otherRpcs = frames.filter(f => f.rpc !== "eb1hJf");
-    if (otherRpcs.length > 0) {
-      console.log("[FlowProxy] 🔍 观察到其他 RPC 帧: " + JSON.stringify(otherRpcs.map(f => ({ rpc: f.rpc, payloadSnippet: JSON.stringify(f.payload)?.substring(0, 200) }))));
+    // 从所有 BoQ RPC 帧与响应文本中直接提取已就绪的 flow-content.google/video/<mediaId> 视频直链并通知 ui.js
+    const rawTextForScan = typeof data === "string" ? data : JSON.stringify(data || "");
+    if (rawTextForScan) {
+      const extracted = extractMediaAssets(rawTextForScan, true);
+      for (const url of extracted.urls) {
+        try {
+          const parsed = new URL(url);
+          if (parsed.hostname === "flow-content.google" && parsed.pathname.startsWith("/video/")) {
+            const mId = parsed.pathname.match(/^\/video\/([a-zA-Z0-9_-]+)/)?.[1];
+            if (mId) {
+              console.log(`[FlowProxy] 🎉 从网络响应捕获到就绪视频直链! mediaId=${mId}, URL=${url.substring(0, 100)}`);
+              window.dispatchEvent(new CustomEvent("flow-task-media-ready", { detail: { mediaId: mId, url } }));
+            }
+          }
+        } catch (_) {}
+      }
     }
 
     const lists = responseMediaLists(data);
-    console.log(`[FlowProxy] responseMediaLists 解析到 ${lists.length} 组数据，展开后共 ${lists.flat().length} 个媒体条目`);
-    if (isGenerateRequest && process?.submissionId && window.currentProcess === process) {
+    if (lists.length > 0) {
+      console.log(`[FlowProxy] responseMediaLists 解析到 ${lists.length} 组数据，展开后共 ${lists.flat().length} 个媒体条目`);
+    }
+    if (!boundInThisResponse && isGenerateRequest && activeProcess?.submissionId && window.currentProcess === activeProcess) {
       const ids = lists.flat().map(media => mediaIdOf(media?.name)).filter(Boolean);
-      console.log("[FlowProxy] [mediaLists] 提取出的 ids:", ids);
       if (ids.length) {
-        console.log(`[FlowProxy] 🚀 [mediaLists] 派发 flow-task-media-bound: submissionId=${process.submissionId}, mediaIds=`, ids);
+        console.log(`[FlowProxy] 🚀 [mediaLists] 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaIds=`, ids);
         window.dispatchEvent(new CustomEvent("flow-task-media-bound", {
-          detail: { submissionId: process.submissionId, mediaIds: [...new Set(ids)] }
+          detail: { submissionId: activeProcess.submissionId, mediaIds: [...new Set(ids)] }
         }));
       } else {
-        console.warn(`[FlowProxy] ❌ 未能从生成响应中解析出任何媒体 ID! 派发 flow-task-binding-missing (submissionId=${process.submissionId})`);
-        window.dispatchEvent(new CustomEvent("flow-task-binding-missing", {
-          detail: { submissionId: process.submissionId }
-        }));
+        console.log(`[FlowProxy] ℹ️ 生成请求响应未直接返回 mediaLists ID (submissionId=${activeProcess.submissionId})，继续等待后续轮询帧或 DOM 视频渲染认领`);
       }
     }
     for (const media of lists.flat()) {

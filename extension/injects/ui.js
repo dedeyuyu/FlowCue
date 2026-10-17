@@ -1925,12 +1925,13 @@
         badgeHtml = `<span class="status-badge failed" title="${message}">✗ 失败</span>`;
       }
 
+      const hasBoundVideo = !!(task.mediaBindings?.[lineIdx]?.schema === 2 && Array.isArray(task.mediaBindings?.[lineIdx]?.mediaIds) && task.mediaBindings[lineIdx].mediaIds.length > 0);
       setSafeHTML(lineRow, `
         <span class="status-line-text" title="${line}">#${lineIdx+1}: ${line}</span>
         <div class="status-line-actions">
           ${badgeHtml}
           ${status !== "pending" && status !== "generating" ? `
-            <button class="flow-btn secondary btn-line-reset" data-line="${lineIdx}">${task.mediaBindings?.[lineIdx]?.schema === 2 && status === "failed" ? "重试下载" : "重置"}</button>
+            <button class="flow-btn secondary btn-line-reset" data-line="${lineIdx}">${hasBoundVideo && status === "failed" ? "重试下载" : "重置"}</button>
           ` : ""}
         </div>
       `);
@@ -1942,7 +1943,7 @@
           const lIdx = parseInt(e.currentTarget.dataset.line, 10);
           const previousStatus = task.status[lIdx];
           task.status[lIdx] = "pending";
-          const retryDownload = previousStatus !== "success" && task.mediaBindings?.[lIdx]?.schema === 2;
+          const retryDownload = previousStatus !== "success" && !!(task.mediaBindings?.[lIdx]?.schema === 2 && Array.isArray(task.mediaBindings?.[lIdx]?.mediaIds) && task.mediaBindings[lIdx].mediaIds.length > 0);
           task.message[lIdx] = retryDownload ? "等待重新下载已生成的视频" : "已重置等待生成";
           task.downloaded[lIdx] = false;
           if (!retryDownload && task.videoUrls) task.videoUrls[lIdx] = null;
@@ -2949,8 +2950,15 @@
         state.activeTasksQueue = [];
         state.taskRecord = {};
         window.currentProcess = null;
+        try {
+          document.querySelectorAll("flow-video-tile").forEach(tile => {
+            triggerTileHover(tile);
+            const tId = tile.getAttribute("data-tile-id") || tile.getAttribute("data-media-id") || tile.closest("[data-tile-id]")?.getAttribute("data-tile-id");
+            if (tId) downloadedUrlsSet.add(`https://flow-content.google/video/${tId}`);
+          });
+        } catch (_) {}
         document.querySelectorAll("video").forEach(v => {
-          const src = v.getAttribute("src") || v.currentSrc || v.src;
+          const src = (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&");
           if (src) downloadedUrlsSet.add(src);
         });
         const lineText = lines[lIdx];
@@ -2962,10 +2970,12 @@
         updateLineStatus(rIdx, lIdx, "pending", "排队准备提交...");
         
         let submitOk = false;
-        if (task.mediaBindings?.[lIdx]?.schema === 2) {
+        if (task.mediaBindings?.[lIdx]?.schema === 2 && Array.isArray(task.mediaBindings?.[lIdx]?.mediaIds) && task.mediaBindings[lIdx].mediaIds.length > 0) {
           submitOk = await retrySavedVideo(task, rIdx, lIdx);
+        } else if (task.mediaBindings?.[lIdx]) {
+          task.mediaBindings[lIdx] = null;
         }
-        for (let subTry = 0; task.mediaBindings?.[lIdx]?.schema !== 2 && subTry < 2; subTry++) {
+        for (let subTry = 0; !(task.mediaBindings?.[lIdx]?.schema === 2 && task.mediaBindings?.[lIdx]?.mediaIds?.length > 0) && subTry < 2; subTry++) {
           try {
             if (isStopRequested) return;
             console.log(`[Batch] 自动提交: Row=${rIdx}, Line=${lIdx}, Text=${lineText}, Duration=${duration}`);
@@ -3069,8 +3079,8 @@
           // 3. 定位属于当前任务行的批次容器并悬停唤醒懒加载视频
           const targetBatchContainer = findCurrentBatchContainer(task, lIdx);
           const currentBatchTiles = targetBatchContainer ? 
-            Array.from(targetBatchContainer.querySelectorAll("flow-video-tile")) : 
-            Array.from(document.querySelectorAll("flow-video-tile"));
+            Array.from(targetBatchContainer.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile))")) : 
+            Array.from(document.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile))"));
 
           if (currentBatchTiles.length > 0) {
             for (const tile of currentBatchTiles) {
@@ -3078,24 +3088,34 @@
             }
           }
 
-          // 4. 严格校验：只有视频 mediaId 明确匹配当前任务的 boundMediaIds 时，才认领为本任务视频！
-          // 绝对不盲目认领未绑定 ID 的旧视频，防止误判导致连续提前提交后续任务！
-          if (!isVideoGenerated && boundMediaIds.length > 0) {
+          // 4. 校验 DOM 视频：优先匹配 boundMediaIds；若服务端未返回 boundMediaIds，认领提交后页面新生成的 flow-content.google/video 直链
+          if (!isVideoGenerated) {
             const candidateVideos = targetBatchContainer ? 
               Array.from(targetBatchContainer.querySelectorAll("video")) : 
-              Array.from(document.querySelectorAll("flow-video-tile video, video"));
+              Array.from(document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video"));
 
             for (const v of candidateVideos) {
-              const src = (typeof v.getAttribute === "function" ? v.getAttribute("src") : null) || v.currentSrc || v.src;
+              const rawSrc = (typeof v.getAttribute === "function" ? v.getAttribute("src") : null) || v.currentSrc || v.src;
+              const src = (rawSrc || "").trim().replace(/&amp;/g, "&");
               if (src && !isStaticShowcaseAsset(src)) {
                 const vidId = mediaIdFromVideoUrl(src);
-                if (vidId && boundMediaIds.includes(vidId)) {
+                if (vidId && boundMediaIds.length > 0 && boundMediaIds.includes(vidId)) {
                   console.log(`[Batch] 🎯 DOM 视频匹配到当前任务 boundMediaId=${vidId}: ${src.substring(0, 80)}`);
                   isVideoGenerated = true;
                   targetVideoUrl = src;
                   if (!binding.readyIds.includes(vidId)) binding.readyIds.push(vidId);
                   binding.urls = binding.urls || {};
                   binding.urls[vidId] = src;
+                  break;
+                } else if (vidId && boundMediaIds.length === 0 && !wasVideoSeen(src) && /^https:\/\/flow-content\.google\/video\//i.test(src)) {
+                  console.log(`[Batch] 🎯 DOM 发现提交后新生成的 Flow 视频 (mediaId=${vidId})，自动认领绑定到当前任务: ${src.substring(0, 80)}`);
+                  binding.mediaIds = [vidId];
+                  if (!binding.readyIds.includes(vidId)) binding.readyIds.push(vidId);
+                  binding.urls = binding.urls || {};
+                  binding.urls[vidId] = src;
+                  await saveState();
+                  isVideoGenerated = true;
+                  targetVideoUrl = src;
                   break;
                 }
               }
@@ -4248,6 +4268,10 @@ ${presetAfter || ""}`.trim();
 
     await saveState();
     if (isStopRequested) throw new Error("用户已停止任务");
+    document.querySelectorAll("video").forEach(v => {
+      const src = (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&");
+      if (src) downloadedUrlsSet.add(src);
+    });
     window.currentProcess = params;
     state.activeTasksQueue = [params];
 
@@ -4359,7 +4383,15 @@ ${presetAfter || ""}`.trim();
 
   function wasVideoSeen(url) {
     const identity = videoIdentity(url);
-    return Array.from(downloadedUrlsSet).some(seen => videoIdentity(seen) === identity);
+    if (Array.from(downloadedUrlsSet).some(seen => videoIdentity(seen) === identity)) return true;
+    const mId = mediaIdFromVideoUrl(url);
+    if (mId) {
+      const bound = findMediaBinding(mId);
+      if (bound && (bound.rowIndex !== state.currentIndex || bound.lineIndex !== state.currentLineIndex || bound.task?.downloaded?.[bound.lineIndex])) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function findMediaBinding(mediaId) {
@@ -4461,10 +4493,9 @@ ${presetAfter || ""}`.trim();
   async function retrySavedVideo(task, rowIndex, lineIndex) {
     const binding = task.mediaBindings?.[lineIndex];
     console.log(`[FlowUI] [retrySavedVideo] 开始重试任务行: Row=${rowIndex}, Line=${lineIndex}, binding=`, binding);
-    if (binding?.schema !== 2 || !binding.mediaIds.length) {
-      console.warn(`[FlowUI] [retrySavedVideo] 无法重试: binding.schema=${binding?.schema}, mediaIds.length=${binding?.mediaIds?.length || 0}`);
-      updateLineStatus(rowIndex, lineIndex, "failed", "未取得服务端媒体 ID，已禁止自动下载和重新生成。需要检查生成接口响应。");
-      isStopRequested = true;
+    if (binding?.schema !== 2 || !binding.mediaIds?.length) {
+      console.warn(`[FlowUI] [retrySavedVideo] 尚无已绑定的 mediaIds (mediaIds.length=${binding?.mediaIds?.length || 0})，清除空绑定以重新提交或认领...`);
+      if (task.mediaBindings) task.mediaBindings[lineIndex] = null;
       return false;
     }
     binding.downloading = false;
@@ -4482,20 +4513,23 @@ ${presetAfter || ""}`.trim();
       }
       task.downloadIds[lineIndex] = null;
     }
-    const mediaId = binding.readyIds[0];
+    const mediaId = binding.readyIds?.[0] || binding.mediaIds?.[0];
     let url = binding.urls?.[mediaId];
+    for (const video of document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video")) {
+      const candidate = (video.getAttribute("src") || video.currentSrc || video.src || "").trim().replace(/&amp;/g, "&");
+      if (candidate && mediaIdFromVideoUrl(candidate) === mediaId) {
+        console.log(`[FlowUI] [retrySavedVideo] 从 DOM 视频图块找到最新 URL 签名: ${candidate.substring(0, 80)}`);
+        url = candidate;
+        if (!binding.readyIds.includes(mediaId)) binding.readyIds.push(mediaId);
+        binding.urls = binding.urls || {};
+        binding.urls[mediaId] = candidate;
+      }
+    }
     console.log(`[FlowUI] [retrySavedVideo] readyMediaId=${mediaId}, boundUrl=${url}`);
     if (!mediaId || !url) {
       console.warn(`[FlowUI] [retrySavedVideo] 缺少就绪 mediaId 或 url (mediaId=${mediaId}, url=${url})，等待成功状态`);
       updateLineStatus(rowIndex, lineIndex, "generating", "已取得媒体 ID，等待该 ID 的成功状态...");
       return true;
-    }
-    for (const video of document.querySelectorAll("flow-video-tile video")) {
-      const candidate = video.getAttribute("src") || video.currentSrc || video.src;
-      if (mediaIdFromVideoUrl(candidate) === mediaId) {
-        console.log(`[FlowUI] [retrySavedVideo] 从 DOM flow-video-tile 找到更新的 URL 签名: ${candidate.substring(0, 80)}`);
-        url = candidate;
-      }
     }
     updateLineStatus(rowIndex, lineIndex, "generating", "重试下载已确认完成的媒体 ID...");
     return triggerAutoDownload(url, mediaId);
@@ -4527,15 +4561,15 @@ ${presetAfter || ""}`.trim();
       const activeBinding = activeTask?.mediaBindings?.[state.currentLineIndex];
       const isGenerating = activeTask?.status?.[state.currentLineIndex] === "generating" && !activeTask?.downloaded?.[state.currentLineIndex];
       if (isGenerating && activeBinding && (!activeBinding.mediaIds || activeBinding.mediaIds.length === 0) && !wasVideoSeen(cleanUrl) && !isStaticShowcaseAsset(cleanUrl)) {
-        // 确保该 video 在 DOM 的视频图块中
+        const isFlowProjectVideoUrl = /^https:\/\/flow-content\.google\/video\/[a-zA-Z0-9_-]+/i.test(cleanUrl);
         const matchingVideoEl = Array.from(document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video")).find(v => {
           if (!v) return false;
           const vSrc = (typeof v.getAttribute === "function" ? v.getAttribute("src") : null) || v.currentSrc || v.src;
-          const hasTileParent = typeof v.closest === "function" ? !!(v.closest("flow-video-tile") || (v.closest("flow-grid-tile-container") && !v.closest("flow-image-tile"))) : true;
+          const hasTileParent = isFlowProjectVideoUrl || (typeof v.closest === "function" ? !!(v.closest("flow-video-tile") || (v.closest("flow-grid-tile-container") && !v.closest("flow-image-tile"))) : true);
           return mediaIdFromVideoUrl(vSrc) === mediaId && hasTileParent;
         });
-        if (matchingVideoEl) {
-          console.log(`[FlowUI] 🎯 [AutoDownload] 从 DOM 视频图块中验证属于当前生成任务! 自动建立绑定: mediaId=${mediaId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
+        if (matchingVideoEl || isFlowProjectVideoUrl) {
+          console.log(`[FlowUI] 🎯 [AutoDownload] 验证新生成的 Flow 视频属于当前任务! 自动建立绑定: mediaId=${mediaId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
           activeBinding.mediaIds = [mediaId];
           if (!activeBinding.readyIds.includes(mediaId)) activeBinding.readyIds.push(mediaId);
           activeBinding.urls = activeBinding.urls || {};
@@ -4594,6 +4628,7 @@ ${presetAfter || ""}`.trim();
       }
       task.downloadIds = task.downloadIds || [];
       task.downloadIds[lineIndex] = result.downloadId;
+      downloadedUrlsSet.add(cleanUrl);
       console.log(`[FlowUI] [AutoDownload] ✅ 下载成功启动! downloadId=${result.downloadId}`);
       if (!task.downloaded?.[lineIndex] && task.status?.[lineIndex] !== "failed") updateLineStatus(rowIndex, lineIndex, "generating", `正在下载 ${binding.downloadPath}`);
       await saveState();
@@ -4694,10 +4729,11 @@ ${presetAfter || ""}`.trim();
       // 如果该任务视频已经下载完成，直接忽略，避免生命周期事件造成重复日志
       if (bound && bound.task?.downloaded?.[bound.lineIndex]) return;
 
-      const inTile = !!(videoEl.closest("flow-video-tile") || videoEl.closest("flow-grid-tile-container"));
+      const isFlowProjectVideoUrl = /^https:\/\/flow-content\.google\/video\/[a-zA-Z0-9_-]+/i.test((renderedUrl || "").trim());
+      const inTile = isFlowProjectVideoUrl || !!(videoEl.closest("flow-video-tile") || videoEl.closest("flow-grid-tile-container") || videoEl.closest("[data-tile-id]"));
 
       // 核心救砖兜底：若网络 RPC 未能提取绑定 mediaIds (binding.mediaIds 为空)，
-      // 但 DOM 中新渲染出了未见过的 flow-video-tile 视频卡片：
+      // 但 DOM 中新渲染出了提交前未见过的项目视频卡片 (flow-content.google/video/...)：
       if (!bound && state.isRunning && renderedId && inTile && renderedUrl) {
         const cleanUrl = renderedUrl.trim().replace(/&amp;/g, "&");
         if (!isStaticShowcaseAsset(cleanUrl) && !wasVideoSeen(cleanUrl)) {
@@ -4706,33 +4742,19 @@ ${presetAfter || ""}`.trim();
           const isGenerating = activeTask?.status?.[state.currentLineIndex] === "generating" && !activeTask?.downloaded?.[state.currentLineIndex];
 
           if (isGenerating && activeBinding && (!activeBinding.mediaIds || activeBinding.mediaIds.length === 0)) {
-            // 校验 DOM 提示词容器
-            const batchContainer = videoEl.closest(".batch-container, .virtual-item-container") || videoEl.closest("flow-batch-info")?.parentElement;
-            const promptTextEl = batchContainer ? batchContainer.querySelector(".prompt-text, flow-expandable-prompt") : null;
-            const domPrompt = promptTextEl ? (promptTextEl.innerText || promptTextEl.textContent || "").trim() : "";
-            const activeProcess = window.currentProcess;
-            const targetPrompt = (activeProcess?.finalPrompt || activeProcess?.lineText || activeTask.lines?.[state.currentLineIndex] || "").trim();
-
-            const isPromptMatch = !domPrompt || !targetPrompt ||
-              domPrompt.includes(targetPrompt.substring(0, 20)) ||
-              targetPrompt.includes(domPrompt.substring(0, 20)) ||
-              domPrompt.slice(-20) === targetPrompt.slice(-20);
-
-            if (isPromptMatch) {
-              console.log(`[FlowUI] 🎯 [DOMWatcher] 识别到当前生成任务对应的新视频图块! 自动建立绑定: mediaId=${renderedId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
-              activeBinding.mediaIds = [renderedId];
-              if (!activeBinding.readyIds.includes(renderedId)) activeBinding.readyIds.push(renderedId);
-              activeBinding.urls = activeBinding.urls || {};
-              activeBinding.urls[renderedId] = cleanUrl;
-              saveState();
-              bound = { task: activeTask, binding: activeBinding, rowIndex: state.currentIndex, lineIndex: state.currentLineIndex };
-            }
+            console.log(`[FlowUI] 🎯 [DOMWatcher] 识别到当前生成任务对应的新视频图块! 自动建立绑定: mediaId=${renderedId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
+            activeBinding.mediaIds = [renderedId];
+            if (!activeBinding.readyIds.includes(renderedId)) activeBinding.readyIds.push(renderedId);
+            activeBinding.urls = activeBinding.urls || {};
+            activeBinding.urls[renderedId] = cleanUrl;
+            saveState();
+            bound = { task: activeTask, binding: activeBinding, rowIndex: state.currentIndex, lineIndex: state.currentLineIndex };
           }
         }
       }
 
       console.log(`[FlowUI] [DOMWatcher] 检查 video 元素: src=${(renderedUrl || '').substring(0, 80)}, renderedId=${renderedId}, readyState=${videoEl.readyState}, inTile=${inTile}, isBound=${!!bound}`);
-      if (bound && (videoEl.readyState >= 1 || videoEl.currentTime > 0) && !videoEl.error && inTile) {
+      if (bound && (videoEl.readyState >= 1 || videoEl.currentTime > 0 || isFlowProjectVideoUrl) && !videoEl.error && inTile) {
         console.log(`[FlowUI] [DOMWatcher] 视频元素已就绪 (readyState=${videoEl.readyState})，更新 readyId 并启动下载: renderedId=${renderedId}`);
         if (!bound.binding.readyIds.includes(renderedId)) bound.binding.readyIds.push(renderedId);
         bound.binding.urls = bound.binding.urls || {};
@@ -4777,8 +4799,8 @@ ${presetAfter || ""}`.trim();
                   triggerTileHover(node);
                 }
                 if (node.querySelectorAll) {
-                  node.querySelectorAll("flow-video-tile").forEach(triggerTileHover);
-                  node.querySelectorAll("flow-video-tile video, video").forEach(checkVideoElement);
+                  node.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile))").forEach(triggerTileHover);
+                  node.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video").forEach(checkVideoElement);
                 }
               }
             }
@@ -4806,11 +4828,11 @@ ${presetAfter || ""}`.trim();
         const activeTask = state.tasks[state.currentIndex];
         const targetBatchContainer = findCurrentBatchContainer(activeTask, state.currentLineIndex);
         if (targetBatchContainer) {
-          targetBatchContainer.querySelectorAll("flow-video-tile").forEach(triggerTileHover);
+          targetBatchContainer.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile))").forEach(triggerTileHover);
           targetBatchContainer.querySelectorAll("video").forEach(checkVideoElement);
         } else {
-          document.querySelectorAll("flow-video-tile").forEach(triggerTileHover);
-          document.querySelectorAll("flow-video-tile video").forEach(checkVideoElement);
+          document.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile))").forEach(triggerTileHover);
+          document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video").forEach(checkVideoElement);
         }
       }
     }, 2000);
@@ -4844,31 +4866,32 @@ ${presetAfter || ""}`.trim();
     });
     window.addEventListener("flow-task-binding-missing", event => {
       const process = window.currentProcess;
-      console.warn("[FlowUI] ⚠️ 收到 flow-task-binding-missing 事件:", event.detail);
+      console.log("[FlowUI] ℹ️ 收到 flow-task-binding-missing 提示 (保持 generating 状态继续通过轮询帧/DOM 认领):", event.detail);
       if (!state.isRunning || !process || process.submissionId !== event.detail?.submissionId) {
-        console.log("[FlowUI] [binding-missing] 忽略: 不属于当前活跃任务");
         return;
       }
-      const binding = state.tasks[process.rowIndex]?.mediaBindings?.[process.lineIndex];
-      if (binding?.mediaIds.length) {
-        console.log("[FlowUI] [binding-missing] 忽略: 当前任务已有已绑定的 mediaIds:", binding.mediaIds);
-        return;
-      }
-      console.error(`[FlowUI] ❌ [binding-missing] 生成响应未解析到可验证的媒体 ID，停止批量任务！Row=${process.rowIndex}, Line=${process.lineIndex}`);
-      updateLineStatus(process.rowIndex, process.lineIndex, "failed", "生成响应未解析到可验证的媒体 ID，队列已停止，未下载其他视频。需要检查生成接口响应。");
-      stopBatch();
     });
     window.addEventListener("flow-task-media-ready", async event => {
       const { mediaId, url } = event.detail || {};
       console.log(`[FlowUI] 📥 收到 flow-task-media-ready 事件: mediaId=${mediaId}, url=${url?.substring(0, 100)}`);
-      const match = findMediaBinding(mediaId);
-      if (!match) {
-        console.warn(`[FlowUI] [media-ready] 未找到匹配的任务绑定! mediaId=${mediaId}. 当前各行绑定快照:`, state.tasks.map((t, i) => ({ rowIndex: i, bindings: t.mediaBindings })));
+      const parsedId = mediaIdFromVideoUrl(url);
+      if (parsedId && parsedId !== mediaId) {
+        console.warn(`[FlowUI] [media-ready] URL 解析出的 ID (${parsedId}) 与 mediaId (${mediaId}) 不一致! 忽略此事件`);
         return;
       }
-      const parsedId = mediaIdFromVideoUrl(url);
-      if (parsedId !== mediaId) {
-        console.warn(`[FlowUI] [media-ready] URL 解析出的 ID (${parsedId}) 与 mediaId (${mediaId}) 不一致! 忽略此事件`);
+      let match = findMediaBinding(mediaId);
+      if (!match && state.isRunning && url && !wasVideoSeen(url) && !isStaticShowcaseAsset(url)) {
+        const activeTask = state.tasks[state.currentIndex];
+        const activeBinding = activeTask?.mediaBindings?.[state.currentLineIndex];
+        const isGenerating = activeTask?.status?.[state.currentLineIndex] === "generating" && !activeTask?.downloaded?.[state.currentLineIndex];
+        if (isGenerating && activeBinding && (!activeBinding.mediaIds || activeBinding.mediaIds.length === 0)) {
+          console.log(`[FlowUI] 🎯 [media-ready] 自动将新就绪视频 (mediaId=${mediaId}) 绑定到当前生成任务 Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
+          activeBinding.mediaIds = [mediaId];
+          match = { task: activeTask, binding: activeBinding, rowIndex: state.currentIndex, lineIndex: state.currentLineIndex };
+        }
+      }
+      if (!match) {
+        console.log(`[FlowUI] [media-ready] 跳过非当前任务视频 (mediaId=${mediaId})`);
         return;
       }
       console.log(`[FlowUI] 🎯 [media-ready] 匹配到行 Row=${match.rowIndex}, Line=${match.lineIndex}, 添加至 readyIds 并触发下载...`);
