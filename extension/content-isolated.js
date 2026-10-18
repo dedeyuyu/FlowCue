@@ -32,9 +32,9 @@ function sendMessageToBackground(payload, maxRetries = 5, initialDelay = 500) {
               return;
             }
 
-            // 对于原生拖放等非幂等操作，若后台已收到消息但连接通道关闭（message port closed），绝不重试，避免重复拖放上传
-            if (payload?.action === "nativeFileDrag" && errorMsg.includes("message port closed")) {
-              resolve({ ok: true, warning: errorMsg });
+            // 对于原生拖放、自动下载等非幂等操作，若后台已收到消息但连接通道关闭（message port closed），绝不重试，避免重复上传或重复下载
+            if ((payload?.action === "nativeFileDrag" || payload?.action === "download") && errorMsg.includes("message port closed")) {
+              resolve({ ok: true, success: true, warning: errorMsg });
               return;
             }
 

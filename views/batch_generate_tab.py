@@ -6,9 +6,9 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QComboBox, QSpinBox, QFileDialog, QMessageBox,
-                             QSplitter, QListWidget, QFrame, QInputDialog)
-from PyQt6.QtCore import Qt, pyqtSlot
-from PyQt6.QtGui import QGuiApplication
+                             QSplitter, QListWidget, QFrame, QInputDialog, QDialog)
+from PyQt6.QtCore import Qt, pyqtSlot, QUrl
+from PyQt6.QtGui import QGuiApplication, QPixmap, QDesktopServices
 
 logger = logging.getLogger(__name__)
 from models.batch_model import BatchProjectModel
@@ -19,6 +19,7 @@ class BatchGenerateTabWidget(QWidget):
         super().__init__(parent)
         self.plugin_server = plugin_server
         self.main_window = parent
+        self._thumb_cache = {}
         
         workspace = "."
         if self.main_window and hasattr(self.main_window, "workspace_dir"):
@@ -119,14 +120,18 @@ class BatchGenerateTabWidget(QWidget):
         h_action.addWidget(self.btn_export_all)
         right_layout.addLayout(h_action)
         
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["序号", "图片名称", "时长", "提示词", "操作"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["序号", "图片预览", "图片名称", "时长", "提示词", "操作"])
+        self.table.verticalHeader().setDefaultSectionSize(78)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(1, 118)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.cellDoubleClicked.connect(self.on_table_cell_double_clicked)
         right_layout.addWidget(self.table)
         
         splitter.addWidget(left_panel)
@@ -140,6 +145,9 @@ class BatchGenerateTabWidget(QWidget):
             self.list_projects.addItem(f"{p['name']} ({len(p['images'])}图)")
             
     def refresh_template_list(self):
+        prev_tpl_id = self.cb_template.currentData()
+        if not prev_tpl_id and self.current_project:
+            prev_tpl_id = self.current_project.get("template_id", "")
         self.cb_template.blockSignals(True)
         self.cb_template.clear()
         self.cb_template.addItem("未选择", "")
@@ -148,6 +156,10 @@ class BatchGenerateTabWidget(QWidget):
             if hasattr(tm, "batch_templates"):
                 for t in tm.batch_templates:
                     self.cb_template.addItem(t.get("name", "未命名"), t.get("id"))
+        if prev_tpl_id:
+            idx = self.cb_template.findData(prev_tpl_id)
+            if idx >= 0:
+                self.cb_template.setCurrentIndex(idx)
         self.cb_template.blockSignals(False)
 
     def _get_next_task_name(self):
@@ -418,6 +430,107 @@ class BatchGenerateTabWidget(QWidget):
                     item.setData(Qt.ItemDataRole.BackgroundRole, None)
                     item.setData(Qt.ItemDataRole.ForegroundRole, None)
 
+    def _get_thumbnail_pixmap(self, path_str: str, max_w: int = 104, max_h: int = 66):
+        """Load and cache a smooth thumbnail QPixmap for the given image path."""
+        if not path_str or not os.path.exists(path_str):
+            return None
+        try:
+            mtime = os.path.getmtime(path_str)
+            cache_key = (path_str, mtime, max_w, max_h)
+            if cache_key in self._thumb_cache:
+                return self._thumb_cache[cache_key]
+
+            pix = QPixmap(path_str)
+            if pix.isNull():
+                # Fallback via Pillow for special WebP/EXIF formats
+                from PIL import Image, ImageOps
+                from PyQt6.QtGui import QImage
+                with Image.open(path_str) as pil_img:
+                    pil_img = ImageOps.exif_transpose(pil_img)
+                    pil_img = pil_img.convert("RGBA")
+                    data = pil_img.tobytes("raw", "RGBA")
+                    qimg = QImage(data, pil_img.width, pil_img.height, QImage.Format.Format_RGBA8888).copy()
+                    pix = QPixmap.fromImage(qimg)
+
+            if not pix.isNull():
+                thumb = pix.scaled(
+                    max_w, max_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                if len(self._thumb_cache) > 500:
+                    self._thumb_cache.clear()
+                self._thumb_cache[cache_key] = thumb
+                return thumb
+        except Exception as e:
+            logger.debug(f"Failed to load thumbnail for {path_str}: {e}")
+        return None
+
+    def on_table_cell_double_clicked(self, row: int, col: int):
+        """Double-clicking image preview or image name opens large image preview."""
+        if not self.current_project:
+            return
+        images = self.current_project.get("images", [])
+        if 0 <= row < len(images) and col in (1, 2):
+            self._show_large_image_preview(images[row].get("path", ""), row + 1)
+
+    def _show_large_image_preview(self, path_str: str, index_num: int = 1):
+        """Pop up a high-resolution preview dialog for the selected image."""
+        if not path_str or not os.path.exists(path_str):
+            QMessageBox.warning(self, "文件不存在", f"找不到图片文件：\n{path_str}")
+            return
+
+        dlg = QDialog(self)
+        img_name = os.path.basename(path_str)
+        dlg.setWindowTitle(f"🖼️ 图片预览 - #{index_num} {img_name}")
+        dlg.resize(760, 620)
+        dlg.setStyleSheet("""
+            QDialog { background-color: #FAF6F0; }
+            QLabel { color: #5D4037; font-size: 13px; font-weight: bold; }
+            QPushButton { background-color: #E0A96D; color: white; border: none; border-radius: 4px; padding: 6px 14px; font-weight: bold; }
+            QPushButton:hover { background-color: #D2904C; }
+        """)
+        v_layout = QVBoxLayout(dlg)
+
+        pix = QPixmap(path_str)
+        info_text = f"📄 文件名: {img_name}"
+        if not pix.isNull():
+            info_text += f"    📐 分辨率: {pix.width()} × {pix.height()}"
+        info_lbl = QLabel(info_text)
+        v_layout.addWidget(info_lbl)
+
+        img_lbl = QLabel()
+        img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_lbl.setStyleSheet("background-color: #263238; border: 1px solid #D7CCC8; border-radius: 6px; padding: 8px;")
+        if not pix.isNull():
+            scaled_pix = pix.scaled(
+                720, 490,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            img_lbl.setPixmap(scaled_pix)
+        else:
+            img_lbl.setText("⚠️ 无法预览该图片格式")
+            img_lbl.setStyleSheet("color: white; background-color: #263238; border-radius: 6px; padding: 20px;")
+        v_layout.addWidget(img_lbl, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_open_sys = QPushButton("🖼️ 用系统看图打开")
+        btn_open_sys.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(path_str)))
+        btn_open_dir = QPushButton("📂 打开所在文件夹")
+        btn_open_dir.setStyleSheet("background-color: #8D6E63; color: white;")
+        btn_open_dir.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path_str).parent))))
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(dlg.accept)
+
+        btn_row.addWidget(btn_open_sys)
+        btn_row.addWidget(btn_open_dir)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        v_layout.addLayout(btn_row)
+
+        dlg.exec()
+
     def render_table(self):
         if not self.current_project: return
         images = self.current_project["images"]
@@ -427,16 +540,65 @@ class BatchGenerateTabWidget(QWidget):
         project_name = self.current_project.get("name", "批量任务")
         
         for i, img in enumerate(images):
-            image_path = Path(img.get("path", ""))
+            raw_path = img.get("path", "")
+            image_path = Path(raw_path)
             name = image_path.name
             dur = f"{img.get('duration', 8)}秒"
             prompt = img.get("prompt", "")
             
-            self.table.setItem(i, 0, QTableWidgetItem(str(i+1)))
-            self.table.setItem(i, 1, QTableWidgetItem(name))
-            self.table.setItem(i, 2, QTableWidgetItem(dur))
-            self.table.setItem(i, 3, QTableWidgetItem(prompt))
+            # Col 0: 序号
+            idx_item = QTableWidgetItem(str(i + 1))
+            idx_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 0, idx_item)
+
+            # Col 1: 图片预览 (Thumbnail + Click to enlarge)
+            self.table.setItem(i, 1, QTableWidgetItem(""))
+            w_thumb = QWidget()
+            w_thumb.setStyleSheet("background: transparent;")
+            l_thumb = QHBoxLayout(w_thumb)
+            l_thumb.setContentsMargins(4, 4, 4, 4)
+            l_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            lbl_thumb = QLabel()
+            lbl_thumb.setFixedSize(106, 68)
+            lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+            lbl_thumb.setToolTip(f"🔍 点击查看大图预览\n文件: {name}\n路径: {raw_path}")
+
+            thumb_pix = self._get_thumbnail_pixmap(raw_path, 102, 64)
+            if thumb_pix:
+                lbl_thumb.setPixmap(thumb_pix)
+                lbl_thumb.setStyleSheet(
+                    "QLabel { background-color: #FFFDF9; border: 1px solid #D7CCC8; border-radius: 4px; }"
+                    "QLabel:hover { border: 2px solid #E0A96D; }"
+                )
+            else:
+                lbl_thumb.setText("无预览" if os.path.exists(raw_path) else "文件缺失")
+                lbl_thumb.setStyleSheet(
+                    "QLabel { background-color: #EFEBE9; color: #8D6E63; font-size: 11px; border: 1px dashed #BCAAA4; border-radius: 4px; }"
+                )
+
+            lbl_thumb.mousePressEvent = lambda event, p=raw_path, idx_num=i+1: (
+                self._show_large_image_preview(p, idx_num)
+                if event.button() == Qt.MouseButton.LeftButton else None
+            )
+            l_thumb.addWidget(lbl_thumb)
+            self.table.setCellWidget(i, 1, w_thumb)
+
+            # Col 2: 图片名称
+            name_item = QTableWidgetItem(name)
+            name_item.setToolTip(f"双击查看大图\n完整路径: {raw_path}")
+            self.table.setItem(i, 2, name_item)
+
+            # Col 3: 时长
+            dur_item = QTableWidgetItem(dur)
+            dur_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 3, dur_item)
+
+            # Col 4: 提示词
+            self.table.setItem(i, 4, QTableWidgetItem(prompt))
             
+            # Col 5: 操作
             w_action = QWidget()
             l_action = QHBoxLayout(w_action)
             l_action.setContentsMargins(2, 2, 2, 2)
@@ -445,7 +607,7 @@ class BatchGenerateTabWidget(QWidget):
             btn_copy_prompt.clicked.connect(lambda _, p=prompt: QGuiApplication.clipboard().setText(p))
             
             btn_copy_path = QPushButton("复制路径")
-            btn_copy_path.clicked.connect(lambda _, p=img.get("path", ""): QGuiApplication.clipboard().setText(p))
+            btn_copy_path.clicked.connect(lambda _, p=raw_path: QGuiApplication.clipboard().setText(p))
             
             btn_export = QPushButton("导出JSON")
             btn_export.clicked.connect(lambda _, idx=i: self.export_single_json(idx))
@@ -453,7 +615,7 @@ class BatchGenerateTabWidget(QWidget):
             l_action.addWidget(btn_copy_prompt)
             l_action.addWidget(btn_copy_path)
             l_action.addWidget(btn_export)
-            self.table.setCellWidget(i, 4, w_action)
+            self.table.setCellWidget(i, 5, w_action)
             # Get the actual base storage path where Chrome downloads
             base_path = self.main_window.storage_manager.get_base_path() if hasattr(self.main_window, 'storage_manager') else None
             if not base_path:

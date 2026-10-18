@@ -2,7 +2,7 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QLabel, QLineEdit, 
                              QTextEdit, QTabWidget, QWidget, QMessageBox, QSplitter,
-                             QFileDialog)
+                             QFileDialog, QAbstractItemView)
 from PyQt6.QtCore import Qt
 import uuid
 
@@ -14,6 +14,23 @@ class TemplateConfigDialog(QDialog):
         self.tm = template_manager
         self.init_ui()
         self.load_data()
+
+    def _create_draggable_item(self, text: str, item_id: str) -> QListWidgetItem:
+        """Create a QListWidgetItem configured for smooth top-level drag-and-drop reordering."""
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, item_id)
+        item.setFlags((item.flags() | Qt.ItemFlag.ItemIsDragEnabled) & ~Qt.ItemFlag.ItemIsDropEnabled)
+        return item
+
+    def _setup_draggable_list(self, list_widget: QListWidget, on_reordered):
+        """Enable internal drag-and-drop reordering on a QListWidget."""
+        list_widget.setDragEnabled(True)
+        list_widget.setAcceptDrops(True)
+        list_widget.setDropIndicatorShown(True)
+        list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
+        list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        list_widget.setToolTip("💡 提示：按住鼠标左键可直接上下拖动调整顺序，常用的可拖到最上方")
+        list_widget.model().rowsMoved.connect(lambda *args: on_reordered())
 
     def init_ui(self):
         self.setWindowTitle("模板与运镜配置 (Templates & Motions Config)")
@@ -66,6 +83,17 @@ class TemplateConfigDialog(QDialog):
             }
             QPushButton#btn_reset:hover {
                 background-color: #90A4AE;
+            }
+            QPushButton#btn_move {
+                background-color: #EFEBE9;
+                color: #5D4037;
+                border: 1px solid #D7CCC8;
+                padding: 3px 8px;
+                font-size: 12px;
+            }
+            QPushButton#btn_move:hover {
+                background-color: #FFE0B2;
+                border-color: #E0A96D;
             }
             QListWidget {
                 background-color: white;
@@ -149,8 +177,23 @@ class TemplateConfigDialog(QDialog):
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         
-        left_layout.addWidget(QLabel("已保存的提示词模板:"))
+        hdr_tpl_layout = QHBoxLayout()
+        hdr_tpl_layout.addWidget(QLabel("已保存模板 (支持拖动排序):"))
+        hdr_tpl_layout.addStretch()
+        self.btn_up_tpl = QPushButton("⬆️ 上移")
+        self.btn_up_tpl.setObjectName("btn_move")
+        self.btn_up_tpl.setToolTip("将选中模板向上移动一位")
+        self.btn_up_tpl.clicked.connect(lambda: self._move_list_item(self.list_templates, -1, self._sync_templates_order))
+        self.btn_down_tpl = QPushButton("⬇️ 下移")
+        self.btn_down_tpl.setObjectName("btn_move")
+        self.btn_down_tpl.setToolTip("将选中模板向下移动一位")
+        self.btn_down_tpl.clicked.connect(lambda: self._move_list_item(self.list_templates, 1, self._sync_templates_order))
+        hdr_tpl_layout.addWidget(self.btn_up_tpl)
+        hdr_tpl_layout.addWidget(self.btn_down_tpl)
+        left_layout.addLayout(hdr_tpl_layout)
+
         self.list_templates = QListWidget()
+        self._setup_draggable_list(self.list_templates, self._sync_templates_order)
         self.list_templates.currentRowChanged.connect(self.on_template_selected)
         left_layout.addWidget(self.list_templates)
         
@@ -197,7 +240,7 @@ class TemplateConfigDialog(QDialog):
         right_widget.setLayout(right_layout)
         splitter.addWidget(right_widget)
         
-        splitter.setSizes([300, 550])
+        splitter.setSizes([320, 530])
         layout.addWidget(splitter)
         self.tabs.addTab(tab, "📝 提示词模板")
 
@@ -212,8 +255,23 @@ class TemplateConfigDialog(QDialog):
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         
-        left_layout.addWidget(QLabel("已保存的运镜预设:"))
+        hdr_motion_layout = QHBoxLayout()
+        hdr_motion_layout.addWidget(QLabel("已保存运镜 (支持拖动排序):"))
+        hdr_motion_layout.addStretch()
+        self.btn_up_motion = QPushButton("⬆️ 上移")
+        self.btn_up_motion.setObjectName("btn_move")
+        self.btn_up_motion.setToolTip("将选中运镜预设向上移动一位")
+        self.btn_up_motion.clicked.connect(lambda: self._move_list_item(self.list_motions, -1, self._sync_motions_order))
+        self.btn_down_motion = QPushButton("⬇️ 下移")
+        self.btn_down_motion.setObjectName("btn_move")
+        self.btn_down_motion.setToolTip("将选中运镜预设向下移动一位")
+        self.btn_down_motion.clicked.connect(lambda: self._move_list_item(self.list_motions, 1, self._sync_motions_order))
+        hdr_motion_layout.addWidget(self.btn_up_motion)
+        hdr_motion_layout.addWidget(self.btn_down_motion)
+        left_layout.addLayout(hdr_motion_layout)
+
         self.list_motions = QListWidget()
+        self._setup_draggable_list(self.list_motions, self._sync_motions_order)
         self.list_motions.currentRowChanged.connect(self.on_motion_selected)
         left_layout.addWidget(self.list_motions)
         
@@ -260,28 +318,86 @@ class TemplateConfigDialog(QDialog):
         right_widget.setLayout(right_layout)
         splitter.addWidget(right_widget)
         
-        splitter.setSizes([300, 550])
+        splitter.setSizes([320, 530])
         layout.addWidget(splitter)
         self.tabs.addTab(tab, "🎥 运镜预设")
 
+    def _move_list_item(self, list_widget: QListWidget, direction: int, sync_callback):
+        """Move the currently selected item up (-1) or down (+1) in list_widget and persist order."""
+        row = list_widget.currentRow()
+        if row < 0:
+            return
+        target_row = row + direction
+        if target_row < 0 or target_row >= list_widget.count():
+            return
+        list_widget.blockSignals(True)
+        item = list_widget.takeItem(row)
+        list_widget.insertItem(target_row, item)
+        list_widget.setCurrentRow(target_row)
+        list_widget.blockSignals(False)
+        sync_callback()
+
+    def _sync_templates_order(self):
+        """Sync self.tm.templates order with self.list_templates and save to disk."""
+        id_map = {t["id"]: t for t in self.tm.templates}
+        new_order = []
+        for i in range(self.list_templates.count()):
+            tpl_id = self.list_templates.item(i).data(Qt.ItemDataRole.UserRole)
+            if tpl_id in id_map:
+                new_order.append(id_map[tpl_id])
+        if len(new_order) == len(self.tm.templates):
+            self.tm.templates = new_order
+            self.tm.save_templates()
+        self.on_template_selected(self.list_templates.currentRow())
+
+    def _sync_motions_order(self):
+        """Sync self.tm.motions order with self.list_motions and save to disk."""
+        id_map = {m["id"]: m for m in self.tm.motions}
+        new_order = []
+        for i in range(self.list_motions.count()):
+            motion_id = self.list_motions.item(i).data(Qt.ItemDataRole.UserRole)
+            if motion_id in id_map:
+                new_order.append(id_map[motion_id])
+        if len(new_order) == len(self.tm.motions):
+            self.tm.motions = new_order
+            self.tm.save_motions()
+        self.on_motion_selected(self.list_motions.currentRow())
+
+    def _sync_batch_order(self):
+        """Sync self.tm.batch_templates order with self.list_batch and save to disk."""
+        id_map = {t["id"]: t for t in self.tm.batch_templates if "id" in t}
+        new_order = []
+        for i in range(self.list_batch.count()):
+            bt_id = self.list_batch.item(i).data(Qt.ItemDataRole.UserRole)
+            if bt_id in id_map:
+                new_order.append(id_map[bt_id])
+        if len(new_order) == len(self.tm.batch_templates):
+            self.tm.batch_templates = new_order
+            self.tm.save_batch_templates()
+        self.on_batch_selected(self.list_batch.currentRow())
+
     def load_data(self):
+        """Loads items from template manager into widgets."""
         if hasattr(self, "list_batch"):
             self.list_batch.clear()
             for t in self.tm.batch_templates:
-                self.list_batch.addItem(t.get("name", "未命名批量模板"))
-        """Loads items from template manager into widgets."""
+                if "id" not in t:
+                    t["id"] = "bt-" + uuid.uuid4().hex[:8]
+                item = self._create_draggable_item(t.get("name", "未命名批量模板"), t["id"])
+                self.list_batch.addItem(item)
+            if self.list_batch.count() > 0:
+                self.list_batch.setCurrentRow(0)
+
         # Load templates
         self.list_templates.clear()
         for t in self.tm.templates:
-            item = QListWidgetItem(t["name"])
-            item.setData(Qt.ItemDataRole.UserRole, t["id"])
+            item = self._create_draggable_item(t["name"], t["id"])
             self.list_templates.addItem(item)
             
         # Load motions
         self.list_motions.clear()
         for m in self.tm.motions:
-            item = QListWidgetItem(m["name"])
-            item.setData(Qt.ItemDataRole.UserRole, m["id"])
+            item = self._create_draggable_item(m["name"], m["id"])
             self.list_motions.addItem(item)
 
         # Select first items by default
@@ -312,10 +428,10 @@ class TemplateConfigDialog(QDialog):
             "content": "这里是您的提示词模板，包含占位符 {spanish_text} 和 {camera_motion}。"
         }
         self.tm.templates.append(new_tpl)
+        self.tm.save_templates()
         
         # Add to list
-        item = QListWidgetItem(new_tpl["name"])
-        item.setData(Qt.ItemDataRole.UserRole, new_id)
+        item = self._create_draggable_item(new_tpl["name"], new_id)
         self.list_templates.addItem(item)
         self.list_templates.setCurrentItem(item)
         self.txt_tpl_name.setFocus()
@@ -391,9 +507,9 @@ class TemplateConfigDialog(QDialog):
             "content": "运镜细节描述文本"
         }
         self.tm.motions.append(new_mot)
+        self.tm.save_motions()
         
-        item = QListWidgetItem(new_mot["name"])
-        item.setData(Qt.ItemDataRole.UserRole, new_id)
+        item = self._create_draggable_item(new_mot["name"], new_id)
         self.list_motions.addItem(item)
         self.list_motions.setCurrentItem(item)
         self.txt_motion_name.setFocus()
@@ -506,8 +622,24 @@ class TemplateConfigDialog(QDialog):
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel("已保存的批量模板:"))
+
+        hdr_batch_layout = QHBoxLayout()
+        hdr_batch_layout.addWidget(QLabel("已保存批量模板 (支持拖动排序):"))
+        hdr_batch_layout.addStretch()
+        self.btn_up_batch = QPushButton("⬆️ 上移")
+        self.btn_up_batch.setObjectName("btn_move")
+        self.btn_up_batch.setToolTip("将选中批量模板向上移动一位")
+        self.btn_up_batch.clicked.connect(lambda: self._move_list_item(self.list_batch, -1, self._sync_batch_order))
+        self.btn_down_batch = QPushButton("⬇️ 下移")
+        self.btn_down_batch.setObjectName("btn_move")
+        self.btn_down_batch.setToolTip("将选中批量模板向下移动一位")
+        self.btn_down_batch.clicked.connect(lambda: self._move_list_item(self.list_batch, 1, self._sync_batch_order))
+        hdr_batch_layout.addWidget(self.btn_up_batch)
+        hdr_batch_layout.addWidget(self.btn_down_batch)
+        left_layout.addLayout(hdr_batch_layout)
+
         self.list_batch = QListWidget()
+        self._setup_draggable_list(self.list_batch, self._sync_batch_order)
         self.list_batch.currentRowChanged.connect(self.on_batch_selected)
         left_layout.addWidget(self.list_batch)
         
@@ -541,44 +673,53 @@ class TemplateConfigDialog(QDialog):
         right_layout.addLayout(save_layout)
         
         splitter.addWidget(right_widget)
-        splitter.setSizes([300, 550])
+        splitter.setSizes([320, 530])
         layout.addWidget(splitter)
         self.tabs.addTab(tab, "🚀 批量模板")
 
     def on_batch_selected(self, row):
-        if row < 0 or row >= len(self.tm.batch_templates):
+        if row < 0 or row >= self.list_batch.count():
             self.txt_batch_name.clear()
             self.txt_batch_content.clear()
             return
-        tpl = self.tm.batch_templates[row]
-        self.txt_batch_name.setText(tpl.get("name", ""))
-        self.txt_batch_content.setPlainText(tpl.get("content", ""))
+        item = self.list_batch.item(row)
+        bt_id = item.data(Qt.ItemDataRole.UserRole)
+        tpl = next((t for t in self.tm.batch_templates if t.get("id") == bt_id), None)
+        if not tpl and row < len(self.tm.batch_templates):
+            tpl = self.tm.batch_templates[row]
+        if tpl:
+            self.txt_batch_name.setText(tpl.get("name", ""))
+            self.txt_batch_content.setPlainText(tpl.get("content", ""))
 
     def new_batch_template(self):
-        import uuid
+        new_id = "bt-" + uuid.uuid4().hex[:8]
         new_tpl = {
-            "id": "bt-" + uuid.uuid4().hex[:8],
+            "id": new_id,
             "name": "新建批量模板",
             "content": "在此输入批量生成提示词..."
         }
         self.tm.batch_templates.append(new_tpl)
         self.tm.save_batch_templates()
-        self.load_data()
-        self.list_batch.setCurrentRow(len(self.tm.batch_templates) - 1)
+        item = self._create_draggable_item(new_tpl["name"], new_id)
+        self.list_batch.addItem(item)
+        self.list_batch.setCurrentItem(item)
+        self.txt_batch_name.setFocus()
 
     def delete_batch_template(self):
         row = self.list_batch.currentRow()
-        if row < 0 or row >= len(self.tm.batch_templates):
+        if row < 0 or row >= self.list_batch.count():
             return
+        item = self.list_batch.item(row)
+        bt_id = item.data(Qt.ItemDataRole.UserRole)
         reply = QMessageBox.question(self, "确认删除", "是否确定删除该批量模板？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
-            self.tm.batch_templates.pop(row)
+            self.tm.batch_templates = [t for t in self.tm.batch_templates if t.get("id") != bt_id]
             self.tm.save_batch_templates()
-            self.load_data()
+            self.list_batch.takeItem(row)
 
     def save_batch_template(self):
         row = self.list_batch.currentRow()
-        if row < 0 or row >= len(self.tm.batch_templates):
+        if row < 0 or row >= self.list_batch.count():
             QMessageBox.warning(self, "未选择", "请先在左侧选择要保存的批量模板。")
             return
         
@@ -587,10 +728,15 @@ class TemplateConfigDialog(QDialog):
             QMessageBox.warning(self, "名称为空", "批量模板名称不能为空。")
             return
             
-        self.tm.batch_templates[row]["name"] = name
-        self.tm.batch_templates[row]["content"] = self.txt_batch_content.toPlainText()
-        self.tm.save_batch_templates()
-        
-        self.load_data()
-        self.list_batch.setCurrentRow(row)
-        QMessageBox.information(self, "成功", "批量模板已保存！")
+        item = self.list_batch.item(row)
+        bt_id = item.data(Qt.ItemDataRole.UserRole)
+        for t in self.tm.batch_templates:
+            if t.get("id") == bt_id:
+                t["name"] = name
+                t["content"] = self.txt_batch_content.toPlainText()
+                break
+        if self.tm.save_batch_templates():
+            item.setText(name)
+            QMessageBox.information(self, "成功", "批量模板已保存！")
+        else:
+            QMessageBox.critical(self, "错误", "批量模板保存失败。")

@@ -443,7 +443,6 @@ class HostedModeWidget(QWidget):
         self.refresh_all()
 
     def refresh_all(self):
-        self._load_aliases()
         self._refresh_browsers()
         self._refresh_batches()
 
@@ -465,63 +464,67 @@ class HostedModeWidget(QWidget):
         online_ids = {c.get("client_id") for c in clients}
         offline = [e for cid, e in self.plan.items() if cid not in online_ids and not self._client_for(e)]
         self._browser_row_cids = [c.get("client_id") for c in rows] + [e["cid"] for e in offline]
-        self.tbl_browsers.setRowCount(len(rows) + len(offline))
-        for i, c in enumerate(rows):
-            cid = c.get("client_id")
-            email = self._email(c)
-            known = bool(c.get("points_known"))
-            pts = int(c.get("remaining_points", 0)) if known else None
-            entry = self.plan.get(cid)
-            if not known:
-                mark, color = "⚪ 未读取积分", GRAY
-            elif self._is_low(c):
-                mark, color = "🔴 低积分（已标记）", RED
-            else:
-                mark, color = "🟢 正常", None
-            if c.get("bg_ok") is False:
-                mark, color = mark + " | ⚠️插件后台未更新", YELLOW
-            elif "bg_ok" not in c:
-                mark = mark + " | ❔后台版本未知"
-            if c.get("secondary_tab"):
-                mark, color = "🟡 同一浏览器的第2个Flow标签页（不分配任务）", YELLOW
-            if not c.get("instance_id"):
-                mark = mark + " | ⚠️旧版插件"
-            iid = self._iid(c)
-            alias = self._alias(c)
-            saved = self.aliases.get(iid) if iid else ""
-            if saved and (c.get("instance_name") or "") != saved and not c.get("_name_pushed"):
-                c["_name_pushed"] = True
-                self.plugin_server.set_instance_name(cid, saved)
-            id_txt = (iid or "(旧版插件无ID)") + (f"（{alias}）" if alias else "")
-            email_txt = email or "(未识别账号)"
-            if email and email_count.get(email, 0) > 1:
-                email_txt += "  ⚠️同邮箱多个浏览器"
-            tip = f"client_id: {cid}\n浏览器进程 PID: {c.get('browser_pid') or '-'}\n用户数据目录: {c.get('user_data_dir') or '-'}"
-            self._put(self.tbl_browsers, i, 0, mark, color)
-            self._put(self.tbl_browsers, i, 1, id_txt, color, tip=tip)
-            self._put(self.tbl_browsers, i, 2, c.get("profile") or "识别中...", color, tip=c.get("user_data_dir") or None)
-            self._put(self.tbl_browsers, i, 3, email_txt, color)
-            self._put(self.tbl_browsers, i, 4, "-" if pts is None else str(pts), color, center=True)
-            if entry:
-                bl = [b for b in self.batches if b["id"] in entry["batch_ids"]]
-                self._put(self.tbl_browsers, i, 5, "、".join(b["short"] for b in bl), color)
-                planned = sum(b["points"] for b in bl)
-                self._put(self.tbl_browsers, i, 6, f"{planned} / {(pts or 0) - planned}", color, center=True)
-                self._put(self.tbl_browsers, i, 7, self._browser_progress(bl), color)
-            else:
-                for col in (5, 6, 7):
-                    self._put(self.tbl_browsers, i, col, "", color)
-        for j, e in enumerate(offline):
-            i = len(rows) + j
-            self._put(self.tbl_browsers, i, 0, "⚫ 已断开", GRAY)
-            self._put(self.tbl_browsers, i, 1, e.get("who") or e.get("iid") or e["email"], GRAY)
-            self._put(self.tbl_browsers, i, 2, "", GRAY)
-            self._put(self.tbl_browsers, i, 3, e.get("email", ""), GRAY)
-            self._put(self.tbl_browsers, i, 4, str(e.get("points", "-")), GRAY, center=True)
-            bl = [b for b in self.batches if b["id"] in e["batch_ids"]]
-            self._put(self.tbl_browsers, i, 5, "、".join(b["short"] for b in bl), GRAY)
-            self._put(self.tbl_browsers, i, 6, "", GRAY)
-            self._put(self.tbl_browsers, i, 7, self._browser_progress(bl), GRAY)
+        self.tbl_browsers.setUpdatesEnabled(False)
+        try:
+            self.tbl_browsers.setRowCount(len(rows) + len(offline))
+            for i, c in enumerate(rows):
+                cid = c.get("client_id")
+                email = self._email(c)
+                known = bool(c.get("points_known"))
+                pts = int(c.get("remaining_points", 0)) if known else None
+                entry = self.plan.get(cid)
+                if not known:
+                    mark, color = "⚪ 未读取积分", GRAY
+                elif self._is_low(c):
+                    mark, color = "🔴 低积分（已标记）", RED
+                else:
+                    mark, color = "🟢 正常", None
+                if c.get("bg_ok") is False:
+                    mark, color = mark + " | ⚠️插件后台未更新", YELLOW
+                elif "bg_ok" not in c:
+                    mark = mark + " | ❔后台版本未知"
+                if c.get("secondary_tab"):
+                    mark, color = "🟡 同一浏览器的第2个Flow标签页（不分配任务）", YELLOW
+                if not c.get("instance_id"):
+                    mark = mark + " | ⚠️旧版插件"
+                iid = self._iid(c)
+                alias = self._alias(c)
+                saved = self.aliases.get(iid) if iid else ""
+                if saved and (c.get("instance_name") or "") != saved and not c.get("_name_pushed"):
+                    c["_name_pushed"] = True
+                    self.plugin_server.set_instance_name(cid, saved)
+                id_txt = (iid or "(旧版插件无ID)") + (f"（{alias}）" if alias else "")
+                email_txt = email or "(未识别账号)"
+                if email and email_count.get(email, 0) > 1:
+                    email_txt += "  ⚠️同邮箱多个浏览器"
+                tip = f"client_id: {cid}\n浏览器进程 PID: {c.get('browser_pid') or '-'}\n用户数据目录: {c.get('user_data_dir') or '-'}"
+                self._put(self.tbl_browsers, i, 0, mark, color)
+                self._put(self.tbl_browsers, i, 1, id_txt, color, tip=tip)
+                self._put(self.tbl_browsers, i, 2, c.get("profile") or "识别中...", color, tip=c.get("user_data_dir") or None)
+                self._put(self.tbl_browsers, i, 3, email_txt, color)
+                self._put(self.tbl_browsers, i, 4, "-" if pts is None else str(pts), color, center=True)
+                if entry:
+                    bl = [b for b in self.batches if b["id"] in entry["batch_ids"]]
+                    self._put(self.tbl_browsers, i, 5, "、".join(b["short"] for b in bl), color)
+                    planned = sum(b["points"] for b in bl)
+                    self._put(self.tbl_browsers, i, 6, f"{planned} / {(pts or 0) - planned}", color, center=True)
+                    self._put(self.tbl_browsers, i, 7, self._browser_progress(bl), color)
+                else:
+                    for col in (5, 6, 7):
+                        self._put(self.tbl_browsers, i, col, "", color)
+            for j, e in enumerate(offline):
+                i = len(rows) + j
+                self._put(self.tbl_browsers, i, 0, "⚫ 已断开", GRAY)
+                self._put(self.tbl_browsers, i, 1, e.get("who") or e.get("iid") or e["email"], GRAY)
+                self._put(self.tbl_browsers, i, 2, "", GRAY)
+                self._put(self.tbl_browsers, i, 3, e.get("email", ""), GRAY)
+                self._put(self.tbl_browsers, i, 4, str(e.get("points", "-")), GRAY, center=True)
+                bl = [b for b in self.batches if b["id"] in e["batch_ids"]]
+                self._put(self.tbl_browsers, i, 5, "、".join(b["short"] for b in bl), GRAY)
+                self._put(self.tbl_browsers, i, 6, "", GRAY)
+                self._put(self.tbl_browsers, i, 7, self._browser_progress(bl), GRAY)
+        finally:
+            self.tbl_browsers.setUpdatesEnabled(True)
 
     @staticmethod
     def _browser_progress(bl):
@@ -534,50 +537,54 @@ class HostedModeWidget(QWidget):
         return f"上传 {up_ok}/{len(bl)} 批 | 生成完成 {done}/{len(bl)} 批 | ✅{ok} ❌{fail}"
 
     def _refresh_batches(self):
-        self.tbl_batches.setRowCount(len(self.batches))
         total_pts = sum(b["points"] for b in self.batches)
         unassigned = [b for b in self.batches if not b.get("cid")]
         self.lbl_summary.setText(
             f"共 {len(self.batches)} 批 · {total_pts} 积分" + (f" · ⚠️ 未分配 {len(unassigned)} 批" if unassigned else ""))
-        for i, b in enumerate(self.batches):
-            self._put(self.tbl_batches, i, 0, b["project_label"], tip=b["project_path"])
-            self._put(self.tbl_batches, i, 1, f"第 {b['batch_no']} 批", center=True)
-            self._put(self.tbl_batches, i, 2, ", ".join(str(x + 1) for x in b["seg_indices"]))
-            small = b["points"] < self.small_threshold
-            self._put(self.tbl_batches, i, 3, f"{b['points']}" + (" (小)" if small else ""), center=True)
-            if b.get("cid"):
-                self._put(self.tbl_batches, i, 4, self._label(b) + ("  [低积分号]" if b.get("to_low") else ""))
-            else:
-                self._put(self.tbl_batches, i, 4, "⚠️ 未分配（没有积分足够的浏览器）", YELLOW)
+        self.tbl_batches.setUpdatesEnabled(False)
+        try:
+            self.tbl_batches.setRowCount(len(self.batches))
+            for i, b in enumerate(self.batches):
+                self._put(self.tbl_batches, i, 0, b["project_label"], tip=b["project_path"])
+                self._put(self.tbl_batches, i, 1, f"第 {b['batch_no']} 批", center=True)
+                self._put(self.tbl_batches, i, 2, ", ".join(str(x + 1) for x in b["seg_indices"]))
+                small = b["points"] < self.small_threshold
+                self._put(self.tbl_batches, i, 3, f"{b['points']}" + (" (小)" if small else ""), center=True)
+                if b.get("cid"):
+                    self._put(self.tbl_batches, i, 4, self._label(b) + ("  [低积分号]" if b.get("to_low") else ""))
+                else:
+                    self._put(self.tbl_batches, i, 4, "⚠️ 未分配（没有积分足够的浏览器）", YELLOW)
 
-            # 上传
-            st = b["upload_state"]
-            fails = b["upload_failed"]
-            if st == "成功":
-                txt, col = f"✅ 成功 {len(b['images'])}/{len(b['images'])}", GREEN
-            elif st == "失败":
-                names = "、".join(Path(p).name for p in fails)
-                txt, col = f"❌ 失败 {len(fails)} 张：{names}", RED
-            elif st == "上传中":
-                txt, col = "⏳ 上传中...", BLUE
-            else:
-                txt, col = f"未上传（{len(b['images'])} 张）", None
-            tip = "\n".join(f"{Path(p).name}: {r}" for p, r in fails.items()) if fails else "\n".join(b["images"])
-            self._put(self.tbl_batches, i, 5, txt, col, tip=tip)
+                # 上传
+                st = b["upload_state"]
+                fails = b["upload_failed"]
+                if st == "成功":
+                    txt, col = f"✅ 成功 {len(b['images'])}/{len(b['images'])}", GREEN
+                elif st == "失败":
+                    names = "、".join(Path(p).name for p in fails)
+                    txt, col = f"❌ 失败 {len(fails)} 张：{names}", RED
+                elif st == "上传中":
+                    txt, col = "⏳ 上传中...", BLUE
+                else:
+                    txt, col = f"未上传（{len(b['images'])} 张）", None
+                tip = "\n".join(f"{Path(p).name}: {r}" for p, r in fails.items()) if fails else "\n".join(b["images"])
+                self._put(self.tbl_batches, i, 5, txt, col, tip=tip)
 
-            # 生成
-            rs = b["run_state"]
-            n = len(b["tasks"])
-            col = {"完成": GREEN if b["fail"] == 0 else YELLOW, "生成中": BLUE, "已发送": BLUE,
-                   "发送失败": RED, "连接断开": RED}.get(rs)
-            txt = rs
-            if rs == "未开始" and self.running and b.get("cid") and b["upload_state"] == "成功" and b["cid"] not in self.run_released_cids:
-                txt = "⏳ 排队等待下一批"
-                col = YELLOW
-            elif rs in ("生成中", "完成", "连接断开", "已发送"):
-                txt = f"{rs} | ✅{b['ok']} ❌{b['fail']} / {n}"
-            fail_tip = "\n".join(f"{Path(k).name}: {v}" for k, v in b["fail_msgs"].items())
-            self._put(self.tbl_batches, i, 6, txt, col, tip=fail_tip or None)
+                # 生成
+                rs = b["run_state"]
+                n = len(b["tasks"])
+                col = {"完成": GREEN if b["fail"] == 0 else YELLOW, "生成中": BLUE, "已发送": BLUE,
+                       "发送失败": RED, "连接断开": RED}.get(rs)
+                txt = rs
+                if rs == "未开始" and self.running and b.get("cid") and b["upload_state"] == "成功" and b["cid"] not in self.run_released_cids:
+                    txt = "⏳ 排队等待下一批"
+                    col = YELLOW
+                elif rs in ("生成中", "完成", "连接断开", "已发送"):
+                    txt = f"{rs} | ✅{b['ok']} ❌{b['fail']} / {n}"
+                fail_tip = "\n".join(f"{Path(k).name}: {v}" for k, v in b["fail_msgs"].items())
+                self._put(self.tbl_batches, i, 6, txt, col, tip=fail_tip or None)
+        finally:
+            self.tbl_batches.setUpdatesEnabled(True)
 
     def _put(self, table, row, col, text, color=None, center=False, tip=None):
         it = QTableWidgetItem(str(text))

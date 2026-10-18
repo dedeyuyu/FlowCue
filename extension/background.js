@@ -355,6 +355,9 @@ async function dispatchNativeHover(tabId, x, y) {
   });
 }
 
+// 记录近期已发起的自动下载（按 submissionId/mediaId/filename 去重），彻底杜绝同一视频触发两次 chrome.downloads.download
+const recentAutoDownloads = new Map();
+
 // 2. 处理直接下载逻辑
 async function handleDownload(url, filename, task) {
   try {
@@ -417,47 +420,77 @@ async function handleDownload(url, filename, task) {
       console.error(`[Background] ❌ 拒绝下载: 仅允许下载 .mp4 视频文件: ${sanitizedFilename}`);
       throw new Error("文件类型不安全，仅允许 .mp4 视频");
     }
-    // 在 Chrome 触发文件命名事件之前保存这个 URL 的独立文件名。
-    await chrome.storage.session.set({ [`filename_${url}`]: sanitizedFilename });
-    console.log(`[Background] 🚀 开始调用 Chrome API 下载视频: URL=${url}, Filename=${sanitizedFilename}`);
-    
-    const tryChromeDownload = (targetFilename) => new Promise((resolve) => {
-      chrome.downloads.download({
-        url: url,
-        filename: targetFilename,
-        conflictAction: 'uniquify',
-        saveAs: false
-      }, async (downloadId) => {
-        try {
-          if (chrome.runtime.lastError) {
-            console.error(`[Background] ❌ chrome.downloads.download (${targetFilename}) 失败:`, chrome.runtime.lastError.message);
-            resolve({ error: chrome.runtime.lastError.message });
-          } else {
-            console.log(`[Background] ✅ chrome.downloads.download 已启动，分配 ID=${downloadId}, Filename=${targetFilename}`);
-            await chrome.storage.session.set({ [`download_${downloadId}`]: { ...task, filename: targetFilename, url } });
-            resolve({ success: true, downloadId: downloadId, filename: targetFilename });
-            // 下载可能在关联信息落盘之前就完成。
-            const items = await chrome.downloads.search({ id: downloadId });
-            if (items[0]?.state === "complete" || items[0]?.state === "interrupted") {
-              await notifyDownload(downloadId, items[0].state, items[0].error);
-            }
-          }
-        } catch (err) {
-          console.error("[Background] 下载跟踪失败", err);
-          resolve({ error: err.message });
-        }
-      });
-    });
 
-    let res = await tryChromeDownload(sanitizedFilename);
-    // 如果部分多开浏览器因多级子目录限制导致下载失败，自动降级为单层文件名重命名下载
-    if (!res.success && sanitizedFilename.includes("/")) {
-      const flatName = task?.flatFilename || sanitizedFilename.split("/").pop();
-      console.warn(`[Background] ⚠️ 子目录下载失败，自动降级为单层文件名重试: ${flatName}`);
-      await chrome.storage.session.set({ [`filename_${url}`]: flatName });
-      res = await tryChromeDownload(flatName);
+    // 自动下载幂等去重保护：防止同一视频因重复消息或并发检测触发两次下载（产生 (1).mp4）
+    const dedupKey = !isManual ? `${task.submissionId || ""}::${task.mediaId || mediaId || ""}::${sanitizedFilename}` : null;
+    const mediaFileKey = !isManual ? `${task.mediaId || mediaId || ""}::${sanitizedFilename}` : null;
+    if (!isManual) {
+      const now = Date.now();
+      for (const [k, v] of recentAutoDownloads.entries()) {
+        if (now - v.ts > 300000) recentAutoDownloads.delete(k);
+      }
+      const existing = (dedupKey && recentAutoDownloads.get(dedupKey)) || (mediaFileKey && recentAutoDownloads.get(mediaFileKey));
+      if (existing && (now - existing.ts < 300000)) {
+        console.warn(`[Background] 🛡️ 拦截到重复的自动下载请求 (${sanitizedFilename}, mediaId=${mediaId})，直接复用已有下载请求!`);
+        return await existing.promise;
+      }
     }
-    return res;
+
+    const executeDownload = async () => {
+      // 在 Chrome 触发文件命名事件之前保存这个 URL 的独立文件名。
+      await chrome.storage.session.set({ [`filename_${url}`]: sanitizedFilename });
+      console.log(`[Background] 🚀 开始调用 Chrome API 下载视频: URL=${url}, Filename=${sanitizedFilename}`);
+      
+      const tryChromeDownload = (targetFilename) => new Promise((resolve) => {
+        chrome.downloads.download({
+          url: url,
+          filename: targetFilename,
+          conflictAction: 'uniquify',
+          saveAs: false
+        }, async (downloadId) => {
+          try {
+            if (chrome.runtime.lastError) {
+              console.error(`[Background] ❌ chrome.downloads.download (${targetFilename}) 失败:`, chrome.runtime.lastError.message);
+              resolve({ error: chrome.runtime.lastError.message });
+            } else {
+              console.log(`[Background] ✅ chrome.downloads.download 已启动，分配 ID=${downloadId}, Filename=${targetFilename}`);
+              await chrome.storage.session.set({ [`download_${downloadId}`]: { ...task, filename: targetFilename, sanitizedFilename, url } });
+              resolve({ success: true, downloadId: downloadId, filename: targetFilename });
+              // 下载可能在关联信息落盘之前就完成。
+              const items = await chrome.downloads.search({ id: downloadId });
+              if (items[0]?.state === "complete" || items[0]?.state === "interrupted") {
+                await notifyDownload(downloadId, items[0].state, items[0].error);
+              }
+            }
+          } catch (err) {
+            console.error("[Background] 下载跟踪失败", err);
+            resolve({ error: err.message });
+          }
+        });
+      });
+
+      let res = await tryChromeDownload(sanitizedFilename);
+      // 如果部分多开浏览器因多级子目录限制导致下载失败，自动降级为单层文件名重命名下载
+      if (!res.success && sanitizedFilename.includes("/")) {
+        const flatName = task?.flatFilename || sanitizedFilename.split("/").pop();
+        console.warn(`[Background] ⚠️ 子目录下载失败，自动降级为单层文件名重试: ${flatName}`);
+        await chrome.storage.session.set({ [`filename_${url}`]: flatName });
+        res = await tryChromeDownload(flatName);
+      }
+      if (!res.success && !isManual) {
+        if (dedupKey) recentAutoDownloads.delete(dedupKey);
+        if (mediaFileKey) recentAutoDownloads.delete(mediaFileKey);
+      }
+      return res;
+    };
+
+    const dlPromise = executeDownload();
+    if (!isManual) {
+      const entry = { ts: Date.now(), promise: dlPromise };
+      if (dedupKey) recentAutoDownloads.set(dedupKey, entry);
+      if (mediaFileKey) recentAutoDownloads.set(mediaFileKey, entry);
+    }
+    return await dlPromise;
   } catch (e) {
     console.error(`[Background] 下载函数捕获到异常:`, e);
     return { error: e.message };
@@ -484,6 +517,10 @@ async function notifyDownload(id, state, error) {
   const saved = await chrome.storage.session.get(key);
   const task = saved[key];
   if (!task || task.tabId == null) return;
+  if (state !== "complete" && task.sanitizedFilename) {
+    recentAutoDownloads.delete(`${task.submissionId || ""}::${task.mediaId || ""}::${task.sanitizedFilename}`);
+    recentAutoDownloads.delete(`${task.mediaId || ""}::${task.sanitizedFilename}`);
+  }
   try {
     console.log(`[Background] 📢 notifyDownload: 通知标签页 tabId=${task.tabId}, downloadId=${id}, state=${state}, error=${error}`);
     await chrome.tabs.sendMessage(task.tabId, {

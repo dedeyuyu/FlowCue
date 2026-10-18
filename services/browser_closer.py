@@ -147,24 +147,63 @@ def window_exists(hwnd):
     return bool(user32.IsWindow(hwnd)) and bool(user32.IsWindowVisible(hwnd))
 
 # --- New robust closing method using TCP connection PID mapping ---
+import threading
 
-def _get_pid_from_port(port):
-    """Finds the process ID owning the given local TCP port."""
+_port_map_lock = threading.Lock()
+_port_map_cache = (0.0, {})      # (timestamp, {port_int: pid_int})
+_tree_cache = (0.0, {})          # (timestamp, {pid: {'ppid': ppid, 'name': name}})
+_cmdline_cache = {}              # pid_int -> (timestamp, cmdline_str)
+
+
+def _refresh_port_map():
     import subprocess
+    mapping = {}
     try:
-        output = subprocess.check_output(['netstat', '-ano'], creationflags=subprocess.CREATE_NO_WINDOW).decode('utf-8', errors='ignore')
+        output = subprocess.check_output(
+            ['netstat', '-ano', '-p', 'tcp'],
+            creationflags=subprocess.CREATE_NO_WINDOW
+        ).decode('utf-8', errors='ignore')
         for line in output.splitlines():
             parts = line.split()
             if len(parts) >= 5 and parts[0] == 'TCP':
                 local_addr = parts[1]
-                if local_addr.endswith(f':{port}'):
-                    return int(parts[-1])
+                colon_idx = local_addr.rfind(':')
+                if colon_idx != -1:
+                    try:
+                        p = int(local_addr[colon_idx + 1:])
+                        mapping[p] = int(parts[-1])
+                    except ValueError:
+                        pass
     except Exception as e:
         logger.error(f"netstat failed: {e}")
-    return None
+    return mapping
 
-def _get_process_tree_ctypes():
-    """Returns {pid: {'ppid': ppid, 'name': name}} for all processes."""
+
+def _get_pid_from_port(port):
+    """Finds the process ID owning the given local TCP port (with short-lived batch cache for 100+ browsers)."""
+    global _port_map_cache
+    try:
+        port_int = int(port)
+    except Exception:
+        return None
+    with _port_map_lock:
+        now = time.time()
+        ts, cached_map = _port_map_cache
+        if now - ts < 2.5 and port_int in cached_map:
+            return cached_map[port_int]
+        new_map = _refresh_port_map()
+        _port_map_cache = (time.time(), new_map)
+        return new_map.get(port_int)
+
+
+def _get_process_tree_ctypes(force_Pid=None):
+    """Returns {pid: {'ppid': ppid, 'name': name}} for all processes (cached 2s)."""
+    global _tree_cache
+    now = time.time()
+    ts, cached_tree = _tree_cache
+    if now - ts < 2.0 and cached_tree and (force_Pid is None or force_Pid in cached_tree):
+        return cached_tree
+
     TH32CS_SNAPPROCESS = 0x00000002
     class PROCESSENTRY32(ctypes.Structure):
         _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD), ("th32ProcessID", wt.DWORD),
@@ -190,12 +229,67 @@ def _get_process_tree_ctypes():
             if not kernel32.Process32Next(hProcessSnap, ctypes.byref(pe32)):
                 break
     kernel32.CloseHandle(hProcessSnap)
+    _tree_cache = (time.time(), tree)
     return tree
 
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", wt.USHORT), ("MaximumLength", wt.USHORT), ("Buffer", wt.LPWSTR)]
+
+
+def _get_process_cmdline_win32(pid_int):
+    """Reads process command line directly via ntdll.NtQueryInformationProcess (ProcessCommandLineInformation=60) in <0.1ms."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ProcessCommandLineInformation = 60
+    kernel32 = ctypes.windll.kernel32
+    ntdll = ctypes.windll.ntdll
+    hProcess = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_int)
+    if not hProcess:
+        return None
+    try:
+        buf_size = wt.ULONG(16384)
+        buf = ctypes.create_string_buffer(buf_size.value)
+        status = ntdll.NtQueryInformationProcess(
+            hProcess, ProcessCommandLineInformation, buf, buf_size, ctypes.byref(buf_size)
+        )
+        if status != 0 and buf_size.value > 16384 and buf_size.value <= 262144:
+            buf = ctypes.create_string_buffer(buf_size.value)
+            status = ntdll.NtQueryInformationProcess(
+                hProcess, ProcessCommandLineInformation, buf, buf_size, ctypes.byref(buf_size)
+            )
+        if status == 0:
+            us = _UNICODE_STRING.from_buffer(buf)
+            if us.Buffer and us.Length > 0:
+                return us.Buffer[:us.Length // 2]
+            return ""
+    except Exception:
+        pass
+    finally:
+        kernel32.CloseHandle(hProcess)
+    return None
+
+
 def _get_process_cmdline(pid):
-    import subprocess
     try:
         pid_int = int(pid)
+    except Exception:
+        return ""
+    now = time.time()
+    cached = _cmdline_cache.get(pid_int)
+    if cached and (now - cached[0] < 120):
+        return cached[1]
+    if len(_cmdline_cache) > 2000:
+        _cmdline_cache.clear()
+
+    # 优先使用零子进程开销的 Win32 原生 API (耗时 < 0.1ms，避免拉起上百个 powershell.exe 导致系统卡顿)
+    cmdline = _get_process_cmdline_win32(pid_int)
+    if cmdline is not None:
+        _cmdline_cache[pid_int] = (now, cmdline)
+        return cmdline
+
+    # 极端情况兜底
+    import subprocess
+    try:
         args = [
             "powershell",
             "-NoProfile",
@@ -204,6 +298,7 @@ def _get_process_cmdline(pid):
             f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid_int}").CommandLine'
         ]
         out = subprocess.check_output(args, shell=False, creationflags=subprocess.CREATE_NO_WINDOW).decode('utf-8', 'ignore').strip()
+        _cmdline_cache[pid_int] = (now, out)
         return out
     except Exception:
         return ""
@@ -214,7 +309,9 @@ def _find_main_browser_pid(start_pid, tree):
     The Main Browser Process is identified as the first process that does NOT have '--type=' in its command line.
     """
     current_pid = start_pid
-    while current_pid in tree:
+    visited = set()
+    while current_pid in tree and current_pid not in visited:
+        visited.add(current_pid)
         cmdline = _get_process_cmdline(current_pid)
         if cmdline and "--type=" not in cmdline:
             return current_pid, cmdline

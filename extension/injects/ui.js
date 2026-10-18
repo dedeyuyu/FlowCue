@@ -135,6 +135,9 @@
           const tBinding = state.tasks[r]?.mediaBindings?.[l];
           if (state.tasks[r]?.taskId === taskInfo.taskId && tBinding?.submissionId === taskInfo.submissionId) {
             if (event.data.event === "downloadFailed") {
+              tBinding.downloadInitiated = false;
+              if (taskInfo.mediaId) inFlightOrCompletedDownloads.delete(`media:${taskInfo.mediaId}`);
+              if (taskInfo.submissionId) inFlightOrCompletedDownloads.delete(`sub:${taskInfo.submissionId}`);
               tBinding.downloadFailCount = (tBinding.downloadFailCount || 0) + 1;
               if (state.tasks[r].downloadIds) state.tasks[r].downloadIds[l] = null;
               if (tBinding.downloadFailCount < 3 && state.isRunning) {
@@ -147,10 +150,14 @@
               updateLineStatus(r, l, "failed", `下载失败: ${event.data.data.error}`);
               return;
             }
+            tBinding.downloadInitiated = true;
+            if (taskInfo.mediaId) inFlightOrCompletedDownloads.add(`media:${taskInfo.mediaId}`);
+            if (taskInfo.submissionId) inFlightOrCompletedDownloads.add(`sub:${taskInfo.submissionId}`);
             if (state.tasks[r].downloadIds) state.tasks[r].downloadIds[l] = null;
-            if (Array.isArray(state.tasks[r].downloaded)) {
-              state.tasks[r].downloaded[l] = true;
+            if (!Array.isArray(state.tasks[r].downloaded)) {
+              state.tasks[r].downloaded = [];
             }
+            state.tasks[r].downloaded[l] = true;
             updateLineStatus(r, l, "success", `自动下载成功: ${taskInfo.download_path}`);
             saveState();
           }
@@ -173,6 +180,7 @@
 
   const downloadedUrlsSet = new Set();
   const discoveredVideoUrlsById = new Map();
+  const inFlightOrCompletedDownloads = new Set();
 
   // ----------------------------------------------------
   // 2. 状态管理与配置项
@@ -5328,6 +5336,7 @@ ${presetAfter || ""}`.trim();
       }
       task.downloadIds[lineIndex] = null;
     }
+    binding.downloadInitiated = false;
     const mediaId = binding.readyIds?.[0] || binding.mediaIds?.[0];
     let url = binding.urls?.[mediaId];
     if (url && !isValidFlowVideoUrl(url)) {
@@ -5432,8 +5441,12 @@ ${presetAfter || ""}`.trim();
       console.warn(`[FlowUI] [AutoDownload] 🚫 拒绝下载: mediaId (${mediaId}) 尚未就绪 (不在 readyIds 中)! 当前 readyIds:`, binding.readyIds);
       return false;
     }
-    if (binding.downloading) {
-      console.warn(`[FlowUI] [AutoDownload] 🚫 拒绝下载: 任务当前正在下载中 (binding.downloading=true)`);
+    if (binding.downloading || binding.downloadInitiated) {
+      console.warn(`[FlowUI] [AutoDownload] 🚫 拒绝下载: 任务已发起下载或正在下载中 (downloading=${!!binding.downloading}, downloadInitiated=${!!binding.downloadInitiated})`);
+      return false;
+    }
+    if (inFlightOrCompletedDownloads.has(`media:${mediaId}`) || (binding.submissionId && inFlightOrCompletedDownloads.has(`sub:${binding.submissionId}`))) {
+      console.warn(`[FlowUI] [AutoDownload] 🚫 拒绝下载: 媒体 (${mediaId}) 已在下载队列或已完成下载，跳过重复触发`);
       return false;
     }
     if (task.downloaded?.[lineIndex]) {
@@ -5450,6 +5463,10 @@ ${presetAfter || ""}`.trim();
       return false;
     }
     binding.downloading = true;
+    binding.downloadInitiated = true;
+    inFlightOrCompletedDownloads.add(`media:${mediaId}`);
+    if (binding.submissionId) inFlightOrCompletedDownloads.add(`sub:${binding.submissionId}`);
+    downloadedUrlsSet.add(cleanUrl);
     try {
       task.videoUrls = task.videoUrls || [];
       task.videoUrls[lineIndex] = cleanUrl;
@@ -5462,19 +5479,29 @@ ${presetAfter || ""}`.trim();
       });
       console.log("[FlowUI] [AutoDownload] 后台下载响应结果:", result);
       if (!result?.success) {
+        binding.downloadInitiated = false;
+        inFlightOrCompletedDownloads.delete(`media:${mediaId}`);
+        if (binding.submissionId) inFlightOrCompletedDownloads.delete(`sub:${binding.submissionId}`);
         console.error(`[FlowUI] [AutoDownload] ❌ 对应视频下载失败: ${result?.error || "无下载响应"}`);
         updateLineStatus(rowIndex, lineIndex, "failed", `对应视频下载失败: ${result?.error || "无下载响应"}`);
         return false;
       }
       task.downloadIds = task.downloadIds || [];
-      task.downloadIds[lineIndex] = result.downloadId;
-      downloadedUrlsSet.add(cleanUrl);
+      if (!task.downloaded?.[lineIndex]) {
+        task.downloadIds[lineIndex] = result.downloadId;
+      }
       // 同步把该视频卡片所属的缩略图 URL 登记进 downloadedUrlsSet，防止 /asb/ 缩略图与视频 ID 不同时被后续任务重复识别
       try {
         const vEl = Array.from(document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video")).find(v => {
           const vSrc = (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&");
           return vSrc && mediaIdFromVideoUrl(vSrc) === mediaId;
         });
+        if (vEl) {
+          try {
+            vEl.removeAttribute("autoplay");
+            if (!vEl.paused) vEl.pause();
+          } catch (_) {}
+        }
         const tile = vEl && typeof vEl.closest === "function" ? (vEl.closest("flow-video-tile") || vEl.closest("flow-grid-tile-container")) : null;
         const thumbImg = tile ? tile.querySelector("img.thumbnail, img[src*='flow.google.com/asb/'], img[src*='flow-content.google/image/']") : null;
         const thumbSrc = thumbImg ? (thumbImg.getAttribute("src") || thumbImg.src || "").trim().replace(/&amp;/g, "&") : "";
@@ -5484,10 +5511,26 @@ ${presetAfter || ""}`.trim();
       if (!task.downloaded?.[lineIndex] && task.status?.[lineIndex] !== "failed") updateLineStatus(rowIndex, lineIndex, "generating", `正在下载 ${binding.downloadPath}`);
       await saveState();
       return true;
+    } catch (err) {
+      binding.downloadInitiated = false;
+      inFlightOrCompletedDownloads.delete(`media:${mediaId}`);
+      if (binding.submissionId) inFlightOrCompletedDownloads.delete(`sub:${binding.submissionId}`);
+      throw err;
     } finally { binding.downloading = false; }
   }
 
-  // 模拟真实用户鼠标悬停，唤醒 Google Flow 视频卡片及 <img class="thumbnail"> 缩略图的懒加载预览机制 (严禁点击与聚焦)
+  // 记录每个视频图块的悬停唤醒次数与时间戳，避免对已加载/已下载的旧视频重复悬停和后台解码播放
+  const tileHoverHistory = new WeakMap();
+
+  function pauseVideoQuietly(videoEl) {
+    if (!videoEl) return;
+    try {
+      videoEl.removeAttribute("autoplay");
+      if (!videoEl.paused) videoEl.pause();
+    } catch (_) {}
+  }
+
+  // 模拟真实用户鼠标悬停，仅针对尚未加载出 <video src> 的新生成视频卡片唤醒懒加载预览机制 (严禁滚动页面、严禁唤醒旧视频)
   function triggerTileHover(tile) {
     if (!tile) return;
     // 严禁触碰任何图片卡片
@@ -5495,28 +5538,54 @@ ${presetAfter || ""}`.trim();
       return;
     }
 
-    try {
-      if (typeof tile.scrollIntoView === "function") {
-        tile.scrollIntoView({ block: "nearest", behavior: "instant" });
-      }
-    } catch (_) {}
-
     const videoTile = tile.tagName === "FLOW-VIDEO-TILE"
       ? tile
       : ((typeof tile.closest === "function" && tile.closest("flow-video-tile")) || (tile.querySelector && tile.querySelector("flow-video-tile")) || tile);
     const gridContainer = typeof videoTile.closest === "function" ? videoTile.closest("flow-grid-tile-container") : null;
+
+    // 1. 如果该卡片内部已经渲染出有效签名直链的 <video>，说明懒加载早已完成，无需再派发悬停事件；
+    //    若该视频已在已下载/初始快照集合中，顺便暂停其后台播放以释放 GPU/CPU 解码占用
+    const existingVideo = videoTile.querySelector && videoTile.querySelector("video");
+    if (existingVideo) {
+      const vSrc = (existingVideo.getAttribute("src") || existingVideo.currentSrc || existingVideo.src || "").trim().replace(/&amp;/g, "&");
+      if (vSrc && isValidFlowVideoUrl(vSrc)) {
+        const vId = mediaIdFromVideoUrl(vSrc);
+        if (downloadedUrlsSet.has(vSrc) || (vId && inFlightOrCompletedDownloads.has(`media:${vId}`)) || wasVideoSeen(vSrc, existingVideo)) {
+          pauseVideoQuietly(existingVideo);
+        }
+        return;
+      }
+    }
+
     const thumbImg = videoTile.tagName === "IMG" ? videoTile : (videoTile.querySelector && videoTile.querySelector("img.thumbnail, img[src*='flow-content.google/image/'], img[src*='flow.google.com/asb/']"));
+    const thumbSrc = thumbImg ? (thumbImg.getAttribute("src") || thumbImg.src || "").trim().replace(/&amp;/g, "&") : "";
+
+    // 2. 如果缩略图本身已在已下载快照中，或其对应的 mediaId 已经拿到视频直链 / 已下载，直接跳过
+    if (thumbSrc) {
+      if (downloadedUrlsSet.has(thumbSrc)) return;
+      const thumbId = mediaIdFromImageThumbnailUrl(thumbSrc);
+      if (thumbId && (inFlightOrCompletedDownloads.has(`media:${thumbId}`) || discoveredVideoUrlsById.has(thumbId))) {
+        return;
+      }
+    }
+
+    // 3. 对同一个未就绪的新卡片做节流限制（间隔 >= 2.5s，且同一缩略图最多尝试唤醒 5 次），防止高频重排和事件风暴
+    const now = Date.now();
+    const histKey = gridContainer || videoTile;
+    const prev = tileHoverHistory.get(histKey);
+    if (prev && prev.thumbSrc === thumbSrc) {
+      if (now - prev.lastAt < 2500 || prev.count >= 5) return;
+      prev.count += 1;
+      prev.lastAt = now;
+    } else {
+      tileHoverHistory.set(histKey, { thumbSrc, count: 1, lastAt: now });
+    }
 
     const elementsToTrigger = [
       gridContainer,
       videoTile,
-      videoTile.parentElement,
       thumbImg,
-      thumbImg && thumbImg.parentElement,
-      videoTile.querySelector && videoTile.querySelector(".container"),
-      videoTile.querySelector && videoTile.querySelector(".pre-hover-overlay"),
-      videoTile.querySelector && videoTile.querySelector(".hover-overlay-has-progress-bar"),
-      videoTile.querySelector && videoTile.querySelector(".type-icon-container")
+      videoTile.querySelector && videoTile.querySelector(".pre-hover-overlay")
     ].filter(Boolean);
 
     let clientX = 100, clientY = 100;
@@ -5587,10 +5656,18 @@ ${presetAfter || ""}`.trim();
       const renderedUrl = (rawUrl || "").trim().replace(/&amp;/g, "&");
       if (!renderedUrl || !isValidFlowVideoUrl(renderedUrl)) return;
       const renderedId = mediaIdFromVideoUrl(renderedUrl);
+      // 如果该视频属于已下载完成或初始历史快照，立即暂停其后台播放并静默跳过，彻底消除旧视频循环播放导致的卡顿
+      if (downloadedUrlsSet.has(renderedUrl) || (renderedId && inFlightOrCompletedDownloads.has(`media:${renderedId}`))) {
+        pauseVideoQuietly(videoEl);
+        return;
+      }
       if (renderedId) discoveredVideoUrlsById.set(renderedId, renderedUrl);
       let bound = findMediaBinding(renderedId);
       // 如果该任务视频已经下载完成或正在下载中，直接忽略，避免生命周期事件造成重复日志
-      if (bound && (bound.task?.downloaded?.[bound.lineIndex] || bound.task?.downloadIds?.[bound.lineIndex] || bound.binding?.downloading)) return;
+      if (bound && (bound.task?.downloaded?.[bound.lineIndex] || bound.task?.downloadIds?.[bound.lineIndex] || bound.binding?.downloading || bound.binding?.downloadInitiated)) {
+        pauseVideoQuietly(videoEl);
+        return;
+      }
 
       const isFlowProjectVideoUrl = /^https:\/\/flow-content\.google\/video\/[a-zA-Z0-9_-]+/i.test(renderedUrl) || /^https:\/\/flow\.google\.com\/asb\/[a-zA-Z0-9_-]+/i.test(renderedUrl);
       const inTile = isFlowProjectVideoUrl || !!(videoEl.closest("flow-video-tile") || videoEl.closest("flow-grid-tile-container") || videoEl.closest("[data-tile-id]"));
@@ -5616,15 +5693,12 @@ ${presetAfter || ""}`.trim();
         }
       }
 
-      console.log(`[FlowUI] [DOMWatcher] 检查 video 元素: src=${renderedUrl.substring(0, 80)}, renderedId=${renderedId}, readyState=${videoEl.readyState}, inTile=${inTile}, isBound=${!!bound}`);
       if (bound && (videoEl.readyState >= 1 || videoEl.currentTime > 0 || isFlowProjectVideoUrl) && !videoEl.error && inTile) {
         console.log(`[FlowUI] [DOMWatcher] 视频元素已就绪 (readyState=${videoEl.readyState})，更新 readyId 并启动下载: renderedId=${renderedId}`);
         if (!bound.binding.readyIds.includes(renderedId)) bound.binding.readyIds.push(renderedId);
         bound.binding.urls = bound.binding.urls || {};
         bound.binding.urls[renderedId] = renderedUrl;
         triggerAutoDownload(renderedUrl, renderedId);
-      } else if (bound && videoEl.readyState < 1) {
-        console.log(`[FlowUI] [DOMWatcher] 视频元素匹配到任务 (Row=${bound.rowIndex}, Line=${bound.lineIndex})，但 readyState=${videoEl.readyState} < 1，等待 loadedmetadata...`);
       }
 
       if (!bound && (renderedUrl.startsWith("http://") || renderedUrl.startsWith("https://"))) {
@@ -5640,19 +5714,20 @@ ${presetAfter || ""}`.trim();
             console.log("[FlowUI] DOM 观察器嗅探到新生成的视频元素:", renderedUrl.substring(0, 100));
             triggerAutoDownload(renderedUrl);
           }
+        } else {
+          pauseVideoQuietly(videoEl);
         }
       }
     }
 
-    for (const eventName of ["loadedmetadata", "loadeddata", "canplay"]) {
+    for (const eventName of ["loadedmetadata", "loadeddata"]) {
       document.addEventListener(eventName, event => {
-        if (event.target?.tagName === "VIDEO") {
-          console.log(`[FlowUI] [DOMWatcher] 监听到视频事件 [${eventName}], src=${(event.target.currentSrc || event.target.src || '').substring(0, 80)}`);
+        if (event.target?.tagName === "VIDEO" && state.isRunning) {
           checkVideoElement(event.target);
         }
       }, true);
     }
-    // 监听 DOM 树变化
+    // 监听 DOM 树中新增的 <video> 或新视频卡片
     const observer = new MutationObserver((mutations) => {
       if (!state.isRunning) return;
       for (const m of mutations) {
@@ -5661,26 +5736,19 @@ ${presetAfter || ""}`.trim();
             if (node.nodeType === Node.ELEMENT_NODE) {
               if (node.tagName === "VIDEO") {
                 checkVideoElement(node);
-              } else if (node.tagName === "IMG" && isVideoThumbnailImg(node)) {
+              } else if (node.tagName === "FLOW-VIDEO-TILE" || (node.tagName === "IMG" && isVideoThumbnailImg(node))) {
                 triggerTileHover(node);
-              } else {
-                if (node.tagName === "FLOW-VIDEO-TILE") {
-                  triggerTileHover(node);
-                }
-                if (node.querySelectorAll) {
-                  node.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile)), img.thumbnail").forEach(triggerTileHover);
-                  node.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video").forEach(checkVideoElement);
-                }
+              } else if (node.querySelector) {
+                const v = node.querySelector("video");
+                if (v) checkVideoElement(v);
+                const tile = node.querySelector("flow-video-tile");
+                if (tile) triggerTileHover(tile);
               }
             }
           }
         }
-        if (m.type === "attributes" && m.target) {
-          if (m.target.tagName === "VIDEO") {
-            checkVideoElement(m.target);
-          } else if (m.target.tagName === "IMG" && isVideoThumbnailImg(m.target)) {
-            triggerTileHover(m.target);
-          }
+        if (m.type === "attributes" && m.target && m.target.tagName === "VIDEO") {
+          checkVideoElement(m.target);
         }
       }
     });
@@ -5689,22 +5757,19 @@ ${presetAfter || ""}`.trim();
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["src", "currentSrc"]
+      attributeFilter: ["src"]
     });
 
-    // 周期性主动扫描保底 (每 2 秒，仅在任务运行中，同时扫描当前批次与全页面视频/缩略图)
+    // 周期性保底扫描 (每 4 秒，且仅在未由 batchPromise 主循环轮询时触发，避免双重全表扫描)
     setInterval(() => {
-      if (!state.isRunning) return;
+      if (!state.isRunning || batchPromise) return;
       const hasActiveWork = (state.activeTasksQueue && state.activeTasksQueue.length > 0) ||
                             (state.tasks && state.tasks.some(t => t.status && t.status.some(s => s === "generating")));
       if (hasActiveWork) {
-        document.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile))").forEach(triggerTileHover);
-        document.querySelectorAll("img.thumbnail, img[src*='flow-content.google/image/'], img[src*='flow.google.com/asb/']").forEach(img => {
-          if (isVideoThumbnailImg(img)) triggerTileHover(img);
-        });
-        document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video").forEach(checkVideoElement);
+        document.querySelectorAll("flow-video-tile").forEach(triggerTileHover);
+        document.querySelectorAll("flow-video-tile video, video").forEach(checkVideoElement);
       }
-    }, 2000);
+    }, 4000);
   }
 
   function setupEvents() {
@@ -5862,17 +5927,32 @@ ${presetAfter || ""}`.trim();
 
   // 全局托管模式：桥接模块在运行托管批次时设置此回调，把每行状态变化实时上报给桌面软件
   let hostedStatusHook = null;
+  let lastGeneratingSaveAt = 0;
 
   function updateLineStatus(rowIndex, lineIndex, status, message) {
     const task = state.tasks[rowIndex];
     if (task) {
+      const prevStatus = task.status?.[lineIndex];
+      const prevMsg = task.message?.[lineIndex];
+      if (prevStatus === status && prevMsg === message) return;
+
       task.status[lineIndex] = status;
       task.message[lineIndex] = message;
-      saveState();
-      
-      const rows = document.querySelectorAll("#flow-tasks-table tbody tr");
-      if (rows && rows[rowIndex]) {
-        renderTableStatusCell(rows[rowIndex], task, rowIndex);
+
+      const isProgressTick = (prevStatus === "generating" && status === "generating");
+      const now = Date.now();
+      if (!isProgressTick || (now - lastGeneratingSaveAt >= 12000)) {
+        lastGeneratingSaveAt = now;
+        saveState();
+      }
+
+      // 仅当状态发生实质变化，或控制面板处于打开可见状态时，才更新表格单元格 DOM
+      const isPanelVisible = !!(overlayEl && overlayEl.classList.contains("active"));
+      if (!isProgressTick || isPanelVisible) {
+        const rows = document.querySelectorAll("#flow-tasks-table tbody tr");
+        if (rows && rows[rowIndex]) {
+          renderTableStatusCell(rows[rowIndex], task, rowIndex);
+        }
       }
       if (typeof hostedStatusHook === "function") {
         try { hostedStatusHook(rowIndex, lineIndex, status, message); } catch (_) {}
@@ -5888,7 +5968,8 @@ ${presetAfter || ""}`.trim();
   let activityCheckInterval = null;
 
   function checkForUnusualActivity() {
-    const text = document.body.innerText || "";
+    // 使用 textContent 替代 innerText，避免每轮检查触发全页面同步 Layout 重排
+    const text = (document.body && document.body.textContent) || "";
     return text.includes("异常活动") || text.includes("異常活動") || text.includes("不尋常的活動") || text.includes("Unusual activity") || text.includes("unusual activity");
   }
 
@@ -5922,7 +6003,7 @@ ${presetAfter || ""}`.trim();
           handleUnusualActivityDetected();
         }
       }
-    }, 1500);
+    }, 2500);
   }
 
   function stopActivityCheck() {
@@ -6027,10 +6108,10 @@ ${presetAfter || ""}`.trim();
     snapshotExistingVideos();
     window.addEventListener("load", () => snapshotExistingVideos());
 
-    // 立即启动单页应用保活检查：防止 Google Flow 路由二次重绘冲掉挂载在 body 上的 FAB
+    // 启动单页应用保活检查：防止 Google Flow 路由二次重绘冲掉挂载在 body 上的 FAB
     setInterval(() => {
       createUI();
-    }, 1500);
+    }, 3500);
 
     // 加载先前保存的状态
     await loadState();
@@ -6142,7 +6223,7 @@ ${presetAfter || ""}`.trim();
         if (cur !== want) document.title = want;
       } catch (_) {}
     }
-    setInterval(applyTitleBadge, 1500);
+    setInterval(applyTitleBadge, 3500);
 
     // 在页面上显示醒目的定位横幅
     function showLocateBanner(seconds) {

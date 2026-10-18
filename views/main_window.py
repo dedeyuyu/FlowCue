@@ -752,10 +752,13 @@ class MainWindow(QMainWindow):
         """Opens the templates and motions configuration dialog."""
         from views.template_config_dialog import TemplateConfigDialog
         dialog = TemplateConfigDialog(self.template_manager, self)
-        if dialog.exec() == TemplateConfigDialog.DialogCode.Accepted:
-            # Refresh project details dropdowns if a project is loaded
-            if self.detail_widget.project_model:
-                self.detail_widget.refresh_template_comboboxes()
+        dialog.exec()
+        # Refresh project details dropdowns if a project is loaded
+        if hasattr(self, "detail_widget") and self.detail_widget.project_model:
+            self.detail_widget.refresh_template_comboboxes()
+        # Refresh batch generate tab template dropdown as well
+        if hasattr(self, "batch_generate_tab"):
+            self.batch_generate_tab.refresh_template_list()
 
     def open_batch_video_check_dialog(self):
         """Opens batch video completeness dialog for all projects in storage_manager."""
