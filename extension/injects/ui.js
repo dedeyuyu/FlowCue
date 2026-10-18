@@ -68,6 +68,19 @@
     return new Promise((resolve) => {
       const callbackId = Math.random().toString(36).substring(2, 9);
       extensionCallbacks.set(callbackId, resolve);
+
+      const postPayload = () => {
+        if (!extensionCallbacks.has(callbackId)) return;
+        window.postMessage({
+          sender: "flow-main",
+          callbackId: callbackId,
+          payload: { action, ...data }
+        }, "*");
+      };
+
+      // 若 document_start 阶段 content-isolated.js 尚未完成挂载，800ms / 2500ms 自动重发握手机制
+      setTimeout(postPayload, 800);
+      setTimeout(postPayload, 2500);
       
       // 15秒超时保底，防止扩展桥接未就绪导致初始化永久阻塞
       setTimeout(() => {
@@ -78,11 +91,7 @@
         }
       }, 15000);
 
-      window.postMessage({
-        sender: "flow-main",
-        callbackId: callbackId,
-        payload: { action, ...data }
-      }, "*");
+      postPayload();
     });
   }
 
@@ -117,10 +126,11 @@
               updateLineStatus(r, l, "failed", `下载失败: ${event.data.data.error}`);
               return;
             }
-            updateLineStatus(r, l, "success", `自动下载成功: ${taskInfo.download_path}`);
+            if (state.tasks[r].downloadIds) state.tasks[r].downloadIds[l] = null;
             if (Array.isArray(state.tasks[r].downloaded)) {
               state.tasks[r].downloaded[l] = true;
             }
+            updateLineStatus(r, l, "success", `自动下载成功: ${taskInfo.download_path}`);
             saveState();
           }
         }
@@ -239,7 +249,9 @@
         }
         return;
       }
-      if (saved[`tasks_${key}`]) state.tasks = saved[`tasks_${key}`];
+      // 关键保护：当批量队列正在内存中运行时，严禁用 Storage 快照覆盖内存中的 state.tasks 引用，否则会导致 runBatch 持有旧对象引用而丢失下载完成状态！
+      const isLiveRunning = state.isRunning && Array.isArray(state.tasks) && state.tasks.length > 0;
+      if (!isLiveRunning && saved[`tasks_${key}`]) state.tasks = saved[`tasks_${key}`];
       if (saved.settings) state.settings = { ...state.settings, ...saved.settings };
       // 迁移: 旧默认值 VIDEO_REFERENCES / veo_fast 自动升级为标准模型 ID
       if (state.settings.videoModel === "VIDEO_REFERENCES" || !state.settings.videoModel) {
@@ -248,15 +260,17 @@
         state.settings.videoModel = "veo_3_1_fast";
       }
       if (saved.presets) state.presets = saved.presets;
-      if (saved[`taskRecord_${key}`]) state.taskRecord = saved[`taskRecord_${key}`];
+      if (!isLiveRunning && saved[`taskRecord_${key}`]) state.taskRecord = saved[`taskRecord_${key}`];
       if (saved[`downloadedUrls_${key}`] && Array.isArray(saved[`downloadedUrls_${key}`])) {
         state.downloadedUrls = saved[`downloadedUrls_${key}`];
         saved[`downloadedUrls_${key}`].forEach(u => downloadedUrlsSet.add(u));
       }
-      if (saved[`isRunning_${key}`] !== undefined) state.isRunning = saved[`isRunning_${key}`];
-      if (saved[`currentIndex_${key}`] !== undefined) state.currentIndex = saved[`currentIndex_${key}`];
-      if (saved[`currentLineIndex_${key}`] !== undefined) state.currentLineIndex = saved[`currentLineIndex_${key}`];
-      if (saved[`retryCount_${key}`] !== undefined) state.retryCount = saved[`retryCount_${key}`];
+      if (!isLiveRunning) {
+        if (saved[`isRunning_${key}`] !== undefined) state.isRunning = saved[`isRunning_${key}`];
+        if (saved[`currentIndex_${key}`] !== undefined) state.currentIndex = saved[`currentIndex_${key}`];
+        if (saved[`currentLineIndex_${key}`] !== undefined) state.currentLineIndex = saved[`currentLineIndex_${key}`];
+        if (saved[`retryCount_${key}`] !== undefined) state.retryCount = saved[`retryCount_${key}`];
+      }
     }
   }
 
@@ -644,7 +658,9 @@
     }
 
     try {
-      await loadState();
+      if (!state.isRunning || !Array.isArray(state.tasks) || state.tasks.length === 0) {
+        await loadState();
+      }
     } catch (e) {
       console.warn("[FlowUI] 读取状态异常:", e);
     }
@@ -2940,12 +2956,13 @@
       state.currentIndex = rIdx;
       await saveState();
 
-      const task = state.tasks[rIdx];
+      let task = state.tasks[rIdx];
       const lines = splitTextToLines(task.text);
       if (!lines.length) continue;
       if (!task.image) task.image = { displayName: `任务_${rIdx + 1}`, primaryMediaKey: "" };
 
       for (let lIdx = state.currentLineIndex || 0; lIdx < lines.length; lIdx++) {
+        task = state.tasks[rIdx] || task;
         state.currentLineIndex = lIdx;
         await saveState();
 
@@ -3037,6 +3054,8 @@
           if (isStopRequested) break;
           if (state.isSuspended) { await delay(500); continue; }
 
+          // 始终获取最新内存引用，严防中途面板重载或存储同步导致引用分离
+          task = state.tasks[rIdx] || task;
           const binding = task.mediaBindings?.[lIdx];
           console.log(`[Batch] ⏳ 等待中 (${Math.round(waitedSec)}s/${maxWaitSec}s): Row=${rIdx}, Line=${lIdx}, status=${task.status[lIdx]}, downloaded=${task.downloaded[lIdx]}, downloadId=${task.downloadIds?.[lIdx] || '无'}, mediaIds=${JSON.stringify(binding?.mediaIds || [])}, readyIds=${JSON.stringify(binding?.readyIds || [])}`);
 
@@ -3045,6 +3064,7 @@
             const downloadState = await sendToExtension("getDownloadStatus", { downloadId: task.downloadIds[lIdx] });
             console.log(`[Batch] 📥 后台下载状态返回: downloadId=${task.downloadIds[lIdx]}, state=${downloadState?.state}, error=${downloadState?.error || '无'}`);
             if (downloadState?.state === "complete") {
+              task.downloadIds[lIdx] = null;
               task.downloaded[lIdx] = true;
               updateLineStatus(rIdx, lIdx, "success", "视频下载已完成");
             } else if (downloadState?.state === "interrupted") {
@@ -3072,7 +3092,10 @@
             break;
           }
           // 1. 检查该任务行是否已经完成下载 (status 变为 success 或 downloaded[lIdx] 变为 true)
-          if (task.status[lIdx] === "success" && (Array.isArray(task.downloaded) && task.downloaded[lIdx])) {
+          if (task.status[lIdx] === "success" || (Array.isArray(task.downloaded) && task.downloaded[lIdx])) {
+            if (task.status[lIdx] !== "success") {
+              updateLineStatus(rIdx, lIdx, "success", "视频下载已完成");
+            }
             isTaskCompleted = true;
             console.log(`[Batch] 任务已确认生成并下载成功！(Row=${rIdx}, Line=${lIdx}, 耗时=${Math.round(waitedSec)}s)`);
             break;
@@ -3169,6 +3192,8 @@
               if (src && !isStaticShowcaseAsset(src) && isValidFlowVideoUrl(src)) {
                 const vidId = mediaIdFromVideoUrl(src);
                 if (vidId) discoveredVideoUrlsById.set(vidId, src);
+                const isFlowProjectVideo = /^https:\/\/flow-content\.google\/video\//i.test(src) || /^https:\/\/flow\.google\.com\/asb\//i.test(src);
+                const inVideoTile = typeof v.closest === "function" ? !!(v.closest("flow-video-tile") || (v.closest("flow-grid-tile-container") && !v.closest("flow-image-tile"))) : true;
                 if (vidId && boundMediaIds.length > 0 && boundMediaIds.includes(vidId)) {
                   console.log(`[Batch] 🎯 DOM 视频匹配到当前任务 boundMediaId=${vidId}: ${src.substring(0, 80)}`);
                   isVideoGenerated = true;
@@ -3177,9 +3202,10 @@
                   binding.urls = binding.urls || {};
                   binding.urls[vidId] = src;
                   break;
-                } else if (vidId && boundMediaIds.length === 0 && !wasVideoSeen(src) && /^https:\/\/flow-content\.google\/video\//i.test(src)) {
-                  console.log(`[Batch] 🎯 DOM 发现提交后新生成的 Flow 视频 (mediaId=${vidId})，自动认领绑定到当前任务: ${src.substring(0, 80)}`);
-                  binding.mediaIds = [vidId];
+                } else if (vidId && (!binding.readyIds || binding.readyIds.length === 0) && !wasVideoSeen(src, v) && isFlowProjectVideo && inVideoTile) {
+                  console.log(`[Batch] 🎯 DOM 发现提交后新生成的 Flow 视频 (mediaId=${vidId})，自动关联绑定到当前任务: ${src.substring(0, 80)}`);
+                  binding.mediaIds = Array.isArray(binding.mediaIds) ? binding.mediaIds : [];
+                  if (!binding.mediaIds.includes(vidId)) binding.mediaIds.push(vidId);
                   if (!binding.readyIds.includes(vidId)) binding.readyIds.push(vidId);
                   binding.urls = binding.urls || {};
                   binding.urls[vidId] = src;
@@ -3194,11 +3220,13 @@
 
           // 5. 视频生成就绪后，调度自动下载
           if (isVideoGenerated && targetVideoUrl) {
-            if (!downloadTriggered && !(Array.isArray(task.downloaded) && task.downloaded[lIdx])) {
+            if (task.downloadIds?.[lIdx]) {
+              downloadTriggered = true;
+            } else if (!downloadTriggered && !(Array.isArray(task.downloaded) && task.downloaded[lIdx])) {
               console.log("[Batch] 🚀 当前任务视频已就绪，发起自动下载:", targetVideoUrl.substring(0, 80));
               const dlOk = await triggerAutoDownload(targetVideoUrl, mediaIdFromVideoUrl(targetVideoUrl));
               console.log("[Batch] triggerAutoDownload 执行结果:", dlOk);
-              if (dlOk) {
+              if (dlOk || task.downloadIds?.[lIdx]) {
                 downloadTriggered = true;
                 updateLineStatus(rIdx, lIdx, "generating", `视频已就绪，已发起下载，正在等待保存文件 (${Math.round(waitedSec)}s)...`);
               }
@@ -4345,13 +4373,12 @@ ${presetAfter || ""}`.trim();
     // 重新获取最新 DOM 引用，防止异步等待期间按钮被 Angular 重绘替换
     button = findFlowGenerateButton() || button;
     const arrowIcon = Array.from(button.querySelectorAll("mat-icon, .google-symbols")).find(ic => (ic.textContent || "").trim() === "arrow_forward") || button.querySelector("mat-icon");
-    const touchTarget = button.querySelector(".mat-mdc-button-touch-target");
     const clickEl = arrowIcon || button;
     const rect = clickEl.getBoundingClientRect();
     const cx = rect.width > 0 ? Math.round(rect.left + rect.width / 2) : 0;
     const cy = rect.height > 0 ? Math.round(rect.top + rect.height / 2) : 0;
 
-    console.log("[FlowUI] 🚀 正在触发生成按钮点击发送 (目标 button & mat-icon arrow_forward):", { button, arrowIcon, cx, cy });
+    console.log("[FlowUI] 🚀 正在触发生成按钮单次点击发送 (目标 button & mat-icon arrow_forward):", { button, arrowIcon, cx, cy });
     try {
       if (typeof PointerEvent !== "undefined") {
         clickEl.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, pointerId: 1, isPrimary: true, button: 0, buttons: 1 }));
@@ -4361,41 +4388,19 @@ ${presetAfter || ""}`.trim();
       clickEl.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 0 }));
     } catch (_) {}
     button.click();
-    await delay(750);
+    await delay(1800);
 
-    // 校验是否已成功进入提交/生成态；若提示词仍残留在输入框且按钮仍可用未旋转，执行多级保底触发
-    const isStillUnsubmitted = () => {
-      const boundIds = task.mediaBindings?.[lineIndex]?.mediaIds || [];
-      if (boundIds.length > 0 || isFlowCurrentlyGenerating()) return false;
+    // 仅当首次点击 1.8s 后完全未发出任何生成请求 (generateRequestSent !== true) 且无绑定 ID 时，才执行单次兜底点击，严禁连续点击 3 次
+    const boundIds = task.mediaBindings?.[lineIndex]?.mediaIds || [];
+    if (!params.generateRequestSent && boundIds.length === 0 && !isFlowCurrentlyGenerating()) {
       const curEditor = document.querySelector("flow-rich-text-editor div.ProseMirror") || document.querySelector("div.ProseMirror[contenteditable='true']");
       const editorHasText = curEditor && (curEditor.textContent || "").trim().length > 0;
       const curBtn = findFlowGenerateButton();
-      return !!(editorHasText && curBtn && isBtnReady(curBtn));
-    };
-
-    if (isStillUnsubmitted()) {
-      console.log("[FlowUI] 🔁 检测到首次点击后仍未触发提交，针对 <mat-icon>arrow_forward</mat-icon> 与 touch-target 执行二次精准点击...");
-      const curBtn = findFlowGenerateButton() || button;
-      const curIcon = Array.from(curBtn.querySelectorAll("mat-icon, .google-symbols")).find(ic => (ic.textContent || "").trim() === "arrow_forward") || curBtn.querySelector("mat-icon");
-      const curTouch = curBtn.querySelector(".mat-mdc-button-touch-target");
-      if (curIcon) {
-        curIcon.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy }));
+      if (editorHasText && curBtn && isBtnReady(curBtn)) {
+        console.log("[FlowUI] 🔁 首次点击 1.8s 后未检测到生成网络请求，执行单次兜底点击...");
+        curBtn.click();
+        await delay(600);
       }
-      if (curTouch && typeof curTouch.click === "function") {
-        curTouch.click();
-      }
-      if (curBtn.form && typeof curBtn.form.requestSubmit === "function") {
-        try { curBtn.form.requestSubmit(curBtn); } catch (_) {}
-      }
-      await delay(650);
-    }
-
-    if (isStillUnsubmitted() && cx > 0 && cy > 0) {
-      console.log(`[FlowUI] 🖱️ 启用内核级硬件点击 (nativeClick) 触发发送按钮 @(${cx}, ${cy})...`);
-      try {
-        await sendToExtension("nativeClick", { x: cx, y: cy });
-      } catch (_) {}
-      await delay(500);
     }
   }
 
@@ -4466,13 +4471,16 @@ ${presetAfter || ""}`.trim();
     return null;
   }
 
-  // 从视频缩略图 <img class="thumbnail" alt="生成的视频缩略图" src="https://flow-content.google/image/<uuid>?..."> 提取视频 UUID
+  // 从视频缩略图 <img class="thumbnail" alt="生成的视频缩略图" src="https://flow-content.google/image/<uuid>?..."> 或 /asb/<token> 提取视频 ID
   function mediaIdFromImageThumbnailUrl(value) {
     if (!value || typeof value !== "string") return null;
     try {
       const url = new URL(value.trim().replace(/&amp;/g, "&"));
       if (url.hostname === "flow-content.google") {
         return url.pathname.match(/^\/image\/([a-zA-Z0-9_-]+)$/)?.[1] || null;
+      }
+      if (url.hostname === "flow.google.com" && url.pathname.startsWith("/asb/")) {
+        return url.pathname.match(/^\/asb\/([a-zA-Z0-9_-]+)/)?.[1] || null;
       }
     } catch (_) {}
     return null;
@@ -4497,19 +4505,26 @@ ${presetAfter || ""}`.trim();
       if (src) {
         downloadedUrlsSet.add(src);
         const vId = mediaIdFromVideoUrl(src);
-        if (vId) downloadedUrlsSet.add(`https://flow-content.google/video/${vId}`);
+        if (vId) {
+          downloadedUrlsSet.add(`https://flow-content.google/video/${vId}`);
+          downloadedUrlsSet.add(`https://flow.google.com/asb/${vId}`);
+        }
       }
     });
-    document.querySelectorAll("img[src*='flow-content.google/image/']").forEach(img => {
+    document.querySelectorAll("flow-video-tile img, img.thumbnail, img[src*='flow-content.google/image/'], img[src*='flow.google.com/asb/']").forEach(img => {
       if (isVideoThumbnailImg(img)) {
         const src = (img.getAttribute("src") || img.src || "").trim().replace(/&amp;/g, "&");
+        if (src) downloadedUrlsSet.add(src);
         const mId = mediaIdFromImageThumbnailUrl(src);
-        if (mId) downloadedUrlsSet.add(`https://flow-content.google/video/${mId}`);
+        if (mId) {
+          downloadedUrlsSet.add(`https://flow-content.google/video/${mId}`);
+          downloadedUrlsSet.add(`https://flow.google.com/asb/${mId}`);
+        }
       }
     });
   }
 
-  function wasVideoSeen(url) {
+  function wasVideoSeen(url, videoEl = null) {
     const identity = videoIdentity(url);
     if (Array.from(downloadedUrlsSet).some(seen => videoIdentity(seen) === identity)) return true;
     const mId = mediaIdFromVideoUrl(url);
@@ -4517,6 +4532,21 @@ ${presetAfter || ""}`.trim();
       const bound = findMediaBinding(mId);
       if (bound && (bound.rowIndex !== state.currentIndex || bound.lineIndex !== state.currentLineIndex || bound.task?.downloaded?.[bound.lineIndex])) {
         return true;
+      }
+    }
+    // 针对 /asb/ 缩略图与视频 ID 不同的情况：检查该 <video> 所属 flow-video-tile 的缩略图是否已在旧快照集合中
+    const el = videoEl || Array.from(document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video")).find(v => {
+      const vSrc = (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&");
+      return vSrc && videoIdentity(vSrc) === identity;
+    });
+    if (el && typeof el.closest === "function") {
+      const tile = el.closest("flow-video-tile") || el.closest("flow-grid-tile-container");
+      if (tile) {
+        const thumbImg = tile.querySelector("img.thumbnail, img[src*='flow.google.com/asb/'], img[src*='flow-content.google/image/']");
+        const thumbSrc = thumbImg ? (thumbImg.getAttribute("src") || thumbImg.src || "").trim().replace(/&amp;/g, "&") : "";
+        if (thumbSrc && Array.from(downloadedUrlsSet).some(seen => videoIdentity(seen) === videoIdentity(thumbSrc))) {
+          return true;
+        }
       }
     }
     return false;
@@ -4554,7 +4584,7 @@ ${presetAfter || ""}`.trim();
             return container;
           }
         }
-        const thumbs = Array.from(container.querySelectorAll("img[src*='flow-content.google/image/']"));
+        const thumbs = Array.from(container.querySelectorAll("img.thumbnail, img[src*='flow-content.google/image/'], img[src*='flow.google.com/asb/']"));
         for (const img of thumbs) {
           const imgId = mediaIdFromImageThumbnailUrl(img.getAttribute("src") || img.src);
           if (imgId && boundIds.includes(imgId)) {
@@ -4672,8 +4702,8 @@ ${presetAfter || ""}`.trim();
     console.log(`[FlowUI] [retrySavedVideo] readyMediaId=${mediaId}, boundUrl=${url}`);
     if (!mediaId || !url || !isValidFlowVideoUrl(url)) {
       console.warn(`[FlowUI] [retrySavedVideo] 缺少就绪或有效签名的 url (mediaId=${mediaId}, url=${url})，尝试悬停对应缩略图并等待完整直链...`);
-      for (const img of document.querySelectorAll("img[src*='flow-content.google/image/']")) {
-        if (mediaIdFromImageThumbnailUrl(img.getAttribute("src") || img.src) === mediaId) {
+      for (const img of document.querySelectorAll("img.thumbnail, img[src*='flow-content.google/image/'], img[src*='flow.google.com/asb/']")) {
+        if (mediaIdFromImageThumbnailUrl(img.getAttribute("src") || img.src) === mediaId || isVideoThumbnailImg(img)) {
           triggerTileHover(img);
         }
       }
@@ -4714,17 +4744,18 @@ ${presetAfter || ""}`.trim();
       const activeTask = state.tasks[state.currentIndex];
       const activeBinding = activeTask?.mediaBindings?.[state.currentLineIndex];
       const isGenerating = activeTask?.status?.[state.currentLineIndex] === "generating" && !activeTask?.downloaded?.[state.currentLineIndex];
-      if (isGenerating && activeBinding && (!activeBinding.mediaIds || activeBinding.mediaIds.length === 0) && !wasVideoSeen(cleanUrl) && !isStaticShowcaseAsset(cleanUrl)) {
-        const isFlowProjectVideoUrl = /^https:\/\/flow-content\.google\/video\/[a-zA-Z0-9_-]+/i.test(cleanUrl);
+      if (isGenerating && activeBinding && (!activeBinding.readyIds || activeBinding.readyIds.length === 0) && !isStaticShowcaseAsset(cleanUrl)) {
+        const isFlowProjectVideoUrl = /^https:\/\/flow-content\.google\/video\/[a-zA-Z0-9_-]+/i.test(cleanUrl) || /^https:\/\/flow\.google\.com\/asb\/[a-zA-Z0-9_-]+/i.test(cleanUrl);
         const matchingVideoEl = Array.from(document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video")).find(v => {
           if (!v) return false;
           const vSrc = (typeof v.getAttribute === "function" ? v.getAttribute("src") : null) || v.currentSrc || v.src;
           const hasTileParent = isFlowProjectVideoUrl || (typeof v.closest === "function" ? !!(v.closest("flow-video-tile") || (v.closest("flow-grid-tile-container") && !v.closest("flow-image-tile"))) : true);
           return mediaIdFromVideoUrl(vSrc) === mediaId && hasTileParent;
         });
-        if (matchingVideoEl || isFlowProjectVideoUrl) {
-          console.log(`[FlowUI] 🎯 [AutoDownload] 验证新生成的 Flow 视频属于当前任务! 自动建立绑定: mediaId=${mediaId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
-          activeBinding.mediaIds = [mediaId];
+        if (!wasVideoSeen(cleanUrl, matchingVideoEl) && (matchingVideoEl || isFlowProjectVideoUrl)) {
+          console.log(`[FlowUI] 🎯 [AutoDownload] 验证新生成的 Flow 视频属于当前任务! 自动关联绑定: mediaId=${mediaId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
+          activeBinding.mediaIds = Array.isArray(activeBinding.mediaIds) ? activeBinding.mediaIds : [];
+          if (!activeBinding.mediaIds.includes(mediaId)) activeBinding.mediaIds.push(mediaId);
           if (!activeBinding.readyIds.includes(mediaId)) activeBinding.readyIds.push(mediaId);
           activeBinding.urls = activeBinding.urls || {};
           activeBinding.urls[mediaId] = cleanUrl;
@@ -4783,6 +4814,17 @@ ${presetAfter || ""}`.trim();
       task.downloadIds = task.downloadIds || [];
       task.downloadIds[lineIndex] = result.downloadId;
       downloadedUrlsSet.add(cleanUrl);
+      // 同步把该视频卡片所属的缩略图 URL 登记进 downloadedUrlsSet，防止 /asb/ 缩略图与视频 ID 不同时被后续任务重复识别
+      try {
+        const vEl = Array.from(document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video")).find(v => {
+          const vSrc = (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&");
+          return vSrc && mediaIdFromVideoUrl(vSrc) === mediaId;
+        });
+        const tile = vEl && typeof vEl.closest === "function" ? (vEl.closest("flow-video-tile") || vEl.closest("flow-grid-tile-container")) : null;
+        const thumbImg = tile ? tile.querySelector("img.thumbnail, img[src*='flow.google.com/asb/'], img[src*='flow-content.google/image/']") : null;
+        const thumbSrc = thumbImg ? (thumbImg.getAttribute("src") || thumbImg.src || "").trim().replace(/&amp;/g, "&") : "";
+        if (thumbSrc) downloadedUrlsSet.add(thumbSrc);
+      } catch (_) {}
       console.log(`[FlowUI] [AutoDownload] ✅ 下载成功启动! downloadId=${result.downloadId}`);
       if (!task.downloaded?.[lineIndex] && task.status?.[lineIndex] !== "failed") updateLineStatus(rowIndex, lineIndex, "generating", `正在下载 ${binding.downloadPath}`);
       await saveState();
@@ -4808,7 +4850,7 @@ ${presetAfter || ""}`.trim();
       ? tile
       : ((typeof tile.closest === "function" && tile.closest("flow-video-tile")) || (tile.querySelector && tile.querySelector("flow-video-tile")) || tile);
     const gridContainer = typeof videoTile.closest === "function" ? videoTile.closest("flow-grid-tile-container") : null;
-    const thumbImg = videoTile.tagName === "IMG" ? videoTile : (videoTile.querySelector && videoTile.querySelector("img.thumbnail, img[src*='flow-content.google/image/']"));
+    const thumbImg = videoTile.tagName === "IMG" ? videoTile : (videoTile.querySelector && videoTile.querySelector("img.thumbnail, img[src*='flow-content.google/image/'], img[src*='flow.google.com/asb/']"));
 
     const elementsToTrigger = [
       gridContainer,
@@ -4892,23 +4934,24 @@ ${presetAfter || ""}`.trim();
       const renderedId = mediaIdFromVideoUrl(renderedUrl);
       if (renderedId) discoveredVideoUrlsById.set(renderedId, renderedUrl);
       let bound = findMediaBinding(renderedId);
-      // 如果该任务视频已经下载完成，直接忽略，避免生命周期事件造成重复日志
-      if (bound && bound.task?.downloaded?.[bound.lineIndex]) return;
+      // 如果该任务视频已经下载完成或正在下载中，直接忽略，避免生命周期事件造成重复日志
+      if (bound && (bound.task?.downloaded?.[bound.lineIndex] || bound.task?.downloadIds?.[bound.lineIndex] || bound.binding?.downloading)) return;
 
-      const isFlowProjectVideoUrl = /^https:\/\/flow-content\.google\/video\/[a-zA-Z0-9_-]+/i.test(renderedUrl);
+      const isFlowProjectVideoUrl = /^https:\/\/flow-content\.google\/video\/[a-zA-Z0-9_-]+/i.test(renderedUrl) || /^https:\/\/flow\.google\.com\/asb\/[a-zA-Z0-9_-]+/i.test(renderedUrl);
       const inTile = isFlowProjectVideoUrl || !!(videoEl.closest("flow-video-tile") || videoEl.closest("flow-grid-tile-container") || videoEl.closest("[data-tile-id]"));
 
-      // 核心救砖兜底：若网络 RPC 未能提取绑定 mediaIds (binding.mediaIds 为空)，
-      // 但 DOM 中新渲染出了提交前未见过的项目视频卡片 (flow-content.google/video/...)：
+      // 核心救砖兜底：若网络 RPC 绑定的 UUID 与 DOM 实际视频直链 ID 不同 (如 /asb/ANqvLO...) 或 mediaIds 为空，
+      // 只要当前任务尚未取得 readyIds 且 DOM 中新渲染出了提交前未见过的项目视频卡片，自动关联到当前任务！
       if (!bound && state.isRunning && renderedId && inTile && renderedUrl) {
-        if (!isStaticShowcaseAsset(renderedUrl) && !wasVideoSeen(renderedUrl)) {
+        if (!isStaticShowcaseAsset(renderedUrl) && !wasVideoSeen(renderedUrl, videoEl)) {
           const activeTask = state.tasks[state.currentIndex];
           const activeBinding = activeTask?.mediaBindings?.[state.currentLineIndex];
           const isGenerating = activeTask?.status?.[state.currentLineIndex] === "generating" && !activeTask?.downloaded?.[state.currentLineIndex];
 
-          if (isGenerating && activeBinding && (!activeBinding.mediaIds || activeBinding.mediaIds.length === 0)) {
-            console.log(`[FlowUI] 🎯 [DOMWatcher] 识别到当前生成任务对应的新视频图块! 自动建立绑定: mediaId=${renderedId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
-            activeBinding.mediaIds = [renderedId];
+          if (isGenerating && activeBinding && (!activeBinding.readyIds || activeBinding.readyIds.length === 0)) {
+            console.log(`[FlowUI] 🎯 [DOMWatcher] 识别到当前生成任务对应的新视频图块! 自动关联绑定: mediaId=${renderedId}, Row=${state.currentIndex}, Line=${state.currentLineIndex}`);
+            activeBinding.mediaIds = Array.isArray(activeBinding.mediaIds) ? activeBinding.mediaIds : [];
+            if (!activeBinding.mediaIds.includes(renderedId)) activeBinding.mediaIds.push(renderedId);
             if (!activeBinding.readyIds.includes(renderedId)) activeBinding.readyIds.push(renderedId);
             activeBinding.urls = activeBinding.urls || {};
             activeBinding.urls[renderedId] = renderedUrl;
@@ -4929,11 +4972,16 @@ ${presetAfter || ""}`.trim();
         console.log(`[FlowUI] [DOMWatcher] 视频元素匹配到任务 (Row=${bound.rowIndex}, Line=${bound.lineIndex})，但 readyState=${videoEl.readyState} < 1，等待 loadedmetadata...`);
       }
 
-      if (renderedUrl.startsWith("http://") || renderedUrl.startsWith("https://")) {
-        if (!isStaticShowcaseAsset(renderedUrl) && !wasVideoSeen(renderedUrl)) {
-          const hasActiveWork = (state.activeTasksQueue && state.activeTasksQueue.length > 0) ||
-                                (state.tasks && state.tasks.some(t => t.status && t.status.some(s => s === "generating")));
-          if (hasActiveWork) {
+      if (!bound && (renderedUrl.startsWith("http://") || renderedUrl.startsWith("https://"))) {
+        if (!isStaticShowcaseAsset(renderedUrl) && !wasVideoSeen(renderedUrl, videoEl)) {
+          const activeTask = state.tasks[state.currentIndex];
+          const activeBinding = activeTask?.mediaBindings?.[state.currentLineIndex];
+          const hasUnboundActiveWork = activeTask &&
+            activeTask.status?.[state.currentLineIndex] === "generating" &&
+            !activeTask.downloaded?.[state.currentLineIndex] &&
+            !activeTask.downloadIds?.[state.currentLineIndex] &&
+            (!activeBinding?.readyIds || activeBinding.readyIds.length === 0);
+          if (hasUnboundActiveWork) {
             console.log("[FlowUI] DOM 观察器嗅探到新生成的视频元素:", renderedUrl.substring(0, 100));
             triggerAutoDownload(renderedUrl);
           }
@@ -4996,7 +5044,7 @@ ${presetAfter || ""}`.trim();
                             (state.tasks && state.tasks.some(t => t.status && t.status.some(s => s === "generating")));
       if (hasActiveWork) {
         document.querySelectorAll("flow-video-tile, flow-grid-tile-container:not(:has(flow-image-tile))").forEach(triggerTileHover);
-        document.querySelectorAll("img[src*='flow-content.google/image/']").forEach(img => {
+        document.querySelectorAll("img.thumbnail, img[src*='flow-content.google/image/'], img[src*='flow.google.com/asb/']").forEach(img => {
           if (isVideoThumbnailImg(img)) triggerTileHover(img);
         });
         document.querySelectorAll("flow-video-tile video, flow-grid-tile-container video, video").forEach(checkVideoElement);
@@ -5006,9 +5054,9 @@ ${presetAfter || ""}`.trim();
 
   function setupEvents() {
     window.addEventListener("flow-task-media-bound", event => {
-      const { submissionId, mediaIds } = event.detail || {};
+      const { submissionId, mediaIds, source } = event.detail || {};
       const process = window.currentProcess;
-      console.log("[FlowUI] 📥 收到 flow-task-media-bound 事件:", { submissionId, mediaIds, currentProcessSubId: process?.submissionId, isRunning: state.isRunning });
+      console.log("[FlowUI] 📥 收到 flow-task-media-bound 事件:", { submissionId, mediaIds, source, currentProcessSubId: process?.submissionId, isRunning: state.isRunning });
       if (!state.isRunning) {
         console.warn("[FlowUI] [media-bound] 忽略: state.isRunning 为 false");
         return;
@@ -5021,9 +5069,17 @@ ${presetAfter || ""}`.trim();
         console.warn(`[FlowUI] [media-bound] 忽略: submissionId 不匹配 (当前=${process.submissionId}, 事件=${submissionId})`);
         return;
       }
-      const binding = state.tasks[process.rowIndex]?.mediaBindings?.[process.lineIndex];
+      const taskRow = state.tasks[process.rowIndex];
+      const binding = taskRow?.mediaBindings?.[process.lineIndex];
       if (binding?.submissionId !== submissionId) {
         console.warn(`[FlowUI] [media-bound] 忽略: 存储的 binding.submissionId (${binding?.submissionId}) 与事件 (${submissionId}) 不匹配`);
+        return;
+      }
+      if (taskRow?.downloaded?.[process.lineIndex] || taskRow?.downloadIds?.[process.lineIndex] || binding?.downloading) {
+        console.log("[FlowUI] [media-bound] 忽略: 当前任务已在下载或已完成下载");
+        return;
+      }
+      if (source === "poll" && Array.isArray(binding.mediaIds) && binding.mediaIds.length > 0) {
         return;
       }
       binding.mediaIds = [...new Set(mediaIds.filter(id => typeof id === "string" && /^[a-zA-Z0-9_-]+$/.test(id)))];
@@ -5366,11 +5422,26 @@ ${presetAfter || ""}`.trim();
     if (window.__flowAccountBridgeLoaded) return;
     window.__flowAccountBridgeLoaded = true;
 
-    const WS_URL = "ws://127.0.0.1:18188";
+    // 针对多开指纹浏览器（比特、AdsPower、MoreLogin 等）本地代理可能劫持 127.0.0.1 的情况，
+    // 提供 IPv4 / localhost / IPv6 [::1] 及多端口 (18188, 8000, 8765) 自动轮询与 FlowCue 双向握手校验
+    const WS_ENDPOINTS = [
+      "ws://127.0.0.1:18188",
+      "ws://localhost:18188",
+      "ws://[::1]:18188",
+      "ws://127.0.0.1:8000",
+      "ws://localhost:8000",
+      "ws://[::1]:8000",
+      "ws://127.0.0.1:8765",
+      "ws://localhost:8765",
+      "ws://[::1]:8765"
+    ];
+    let endpointIdx = 0;
     const clientId = "flow_ext_" + Math.random().toString(36).substring(2, 9);
     let socket = null;
-    let retryDelay = 3000;          // 断线重连：3s 起步，最长 10s（本机连接失败几乎无开销，软件后启动也能很快连上）
-    const MAX_RETRY = 10000;
+    let handshakeVerified = false;
+    let handshakeTimer = null;
+    let retryDelay = 2000;
+    const MAX_RETRY = 8000;
     let cachedPoints = null;
     let cachedEmail = "";
     let lastProbeAt = 0;
@@ -5389,43 +5460,56 @@ ${presetAfter || ""}`.trim();
           const m = metaAcct.content.match(EMAIL_RE);
           if (m) return (cachedEmail = m[1]);
         }
-        const panel = document.querySelector("flow-account-panel");
+        const panel = document.querySelector("flow-account-panel, .flow-account-panel-overlay, .cdk-overlay-pane");
         if (panel) {
-          const m = panel.textContent.match(EMAIL_RE);
+          const m = (panel.textContent || "").match(EMAIL_RE);
           if (m) return (cachedEmail = m[1]);
         }
-        const els = document.querySelectorAll("[aria-label*='@']");
+        const els = document.querySelectorAll("[aria-label*='@'], [title*='@'], [data-email*='@']");
         for (const el of els) {
-          const m = (el.getAttribute("aria-label") || "").match(EMAIL_RE);
+          const raw = (el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("data-email") || "");
+          const m = raw.match(EMAIL_RE);
           if (m) return (cachedEmail = m[1]);
         }
       } catch (e) {}
       return "";
     }
 
+    function parseCreditNumber(str) {
+      if (!str) return null;
+      const clean = String(str).replace(/,/g, "");
+      const m = clean.match(/(\d+)/);
+      if (!m) return null;
+      const n = parseInt(m[1], 10);
+      return (!isNaN(n) && n >= 0 && n < 1000000) ? n : null;
+    }
+
     function readPointsFromDom() {
       if (isVidsPage()) return 9999; // Google Vids 无 50 积分限制
       try {
-        const span = document.querySelector("span.credits-count");
+        const span = document.querySelector("span.credits-count, [class*='credits-count']");
         if (span) {
-          const m = span.textContent.trim().match(/(\d+)/);
-          if (m) return parseInt(m[1], 10);
+          const n = parseCreditNumber(span.textContent);
+          if (n !== null) return n;
         }
-        const link = document.querySelector("a.credits-link");
+        const link = document.querySelector("a.credits-link, a[href*='flow_ai_credits_page'], a[href*='credits']");
         if (link) {
-          const m = link.textContent.trim().match(/(\d+)/);
-          if (m) return parseInt(m[1], 10);
+          const n = parseCreditNumber(link.textContent);
+          if (n !== null) return n;
         }
-        const panel = document.querySelector("flow-account-panel");
-        if (panel) {
-          for (const el of panel.querySelectorAll("span, div, a, p")) {
-            if (el.children.length > 2) continue;
+        const containers = document.querySelectorAll("flow-account-panel, .flow-account-panel-overlay, .cdk-overlay-pane");
+        for (const panel of containers) {
+          for (const el of panel.querySelectorAll("span, div, a, p, button")) {
+            if (el.children.length > 3) continue;
             const t = (el.textContent || "").trim();
-            if (t.includes("点数") || t.includes("點數") || t.includes("积分") || t.includes("積分") || /credits|points/i.test(t) || /\b\d+\s*點\b/.test(t)) {
-              const m = t.match(/(\d+)/);
-              if (m) {
-                const n = parseInt(m[1], 10);
-                if (n >= 0 && n < 100000) return n;
+            if (!t) continue;
+            if (t.includes("点数") || t.includes("點數") || t.includes("积分") || t.includes("積分") || /credits|points|ai\s*credits/i.test(t) || /\b[\d,]+\s*點\b/.test(t)) {
+              let n = parseCreditNumber(t);
+              if (n !== null) return n;
+              // 兼容英文/窄窗口下文字与数字分属相邻兄弟节点的情况 (例如 <span>AI Credits</span><span>1,000</span>)
+              if (el.parentElement) {
+                n = parseCreditNumber(el.parentElement.textContent);
+                if (n !== null) return n;
               }
             }
           }
@@ -5445,8 +5529,8 @@ ${presetAfter || ""}`.trim();
 
       const avatarBtn = document.querySelector('div.header-user-button[role="button"]') ||
                         document.querySelector("div.header-user-button") ||
-                        document.querySelector('[aria-label="账号详情"], [aria-label="帳戶詳細資料"], [aria-label*="账号"], [aria-label*="帳戶"], [aria-label*="帳號"], [aria-label*="Account" i]') ||
-                        document.querySelector('flow-header-user-icon [role="button"]');
+                        document.querySelector('[aria-label="账号详情"], [aria-label="帳戶詳細資料"], [aria-label*="账号"], [aria-label*="帳戶"], [aria-label*="帳號"], [aria-label*="Account" i], [aria-label*="Google Account" i], [aria-label*="profile" i]') ||
+                        document.querySelector('flow-header-user-icon [role="button"], flow-header-user-icon button, flow-header-user-icon img.avatar');
       if (!avatarBtn) { log("未找到头像按钮"); return null; }
 
       avatarBtn.click();
@@ -5455,9 +5539,9 @@ ${presetAfter || ""}`.trim();
         await sleep(300);
         pts = readPointsFromDom();
       }
-      const panel = document.querySelector("flow-account-panel");
+      const panel = document.querySelector("flow-account-panel, .flow-account-panel-overlay, .cdk-overlay-pane");
       if (panel) {
-        const m = panel.textContent.match(EMAIL_RE);
+        const m = (panel.textContent || "").match(EMAIL_RE);
         if (m) cachedEmail = m[1];
       }
       // 关闭菜单
@@ -5559,8 +5643,27 @@ ${presetAfter || ""}`.trim();
       } catch (e) {}
     }
 
-    async function handleMessage(msg) {
+    function confirmHandshake(wsUrl) {
+      if (handshakeVerified) return;
+      handshakeVerified = true;
+      if (handshakeTimer) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
+      retryDelay = 2000;
+      log(`✅ 已连接桌面软件 (${wsUrl})`);
+    }
+
+    async function handleMessage(msg, wsUrl) {
       const action = msg.action || msg.type;
+      if (action === "server_hello" || action === "pong" || msg.server === "FlowCue") {
+        confirmHandshake(wsUrl);
+        if (action === "server_hello" || action === "pong") return;
+      }
+      if (["ping", "get_points", "clear_tasks", "clear_media", "upload_images", "run_tasks", "stop_tasks", "close_browser"].includes(action)) {
+        confirmHandshake(wsUrl);
+      }
+
       if (action === "ping") { send({ type: "pong" }); return; }
 
       if (action === "get_points") {
@@ -5704,16 +5807,33 @@ ${presetAfter || ""}`.trim();
     }
 
     function connect() {
+      if (handshakeTimer) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
+      handshakeVerified = false;
+      const wsUrl = WS_ENDPOINTS[endpointIdx % WS_ENDPOINTS.length];
+      let currentSocket = null;
       try {
-        socket = new WebSocket(WS_URL);
+        currentSocket = new WebSocket(wsUrl);
+        socket = currentSocket;
       } catch (e) {
-        scheduleReconnect();
+        endpointIdx = (endpointIdx + 1) % WS_ENDPOINTS.length;
+        scheduleReconnect(600);
         return;
       }
-      socket.onopen = () => {
-        retryDelay = 3000;
-        log("已连接桌面软件");
+      currentSocket.onopen = () => {
+        if (socket !== currentSocket) return;
         send({ type: "online", client_id: clientId, email: readEmailCheap(), url: location.href });
+        send({ type: "ping", client_id: clientId });
+        // 2.5秒握手验证：若多开浏览器的本地代理劫持了 127.0.0.1（假连接成功但未到达 FlowCue），立即切换至 localhost / [::1] / 备用端口
+        handshakeTimer = setTimeout(() => {
+          if (socket === currentSocket && !handshakeVerified) {
+            log(`⚠️ 端点 ${wsUrl} 握手超时（可能被多开浏览器的代理规则拦截了本地回环地址），自动切换下一通道...`);
+            endpointIdx = (endpointIdx + 1) % WS_ENDPOINTS.length;
+            try { currentSocket.close(); } catch (_) {}
+          }
+        }, 2500);
         // 检测插件后台是否为新版本（旧后台没有拖放上传/关闭浏览器等能力）
         sendToExtension("getBgVersion", {}).then(r => {
           const ok = !!(r && r.version);
@@ -5721,23 +5841,50 @@ ${presetAfter || ""}`.trim();
                  native_drag: !!(r && r.nativeDrag), error: ok ? "" : String((r && r.error) || "插件后台无响应") });
           if (!ok) log("⚠️ 插件后台不是最新版本，请在扩展管理页点击「刷新」重新加载插件");
         });
+        // 若首次连接时页面头像 DOM 尚未加载出邮箱，延迟补发一次邮箱识别
+        if (!cachedEmail) {
+          setTimeout(() => {
+            const em = readEmailCheap();
+            if (em && socket === currentSocket && currentSocket.readyState === WebSocket.OPEN) {
+              send({ type: "online", client_id: clientId, email: em, url: location.href });
+            }
+          }, 4000);
+        }
       };
-      socket.onmessage = (ev) => {
+      currentSocket.onmessage = (ev) => {
+        if (socket !== currentSocket) return;
         let msg;
         try { msg = JSON.parse(ev.data); } catch (e) { return; }
-        handleMessage(msg);
+        handleMessage(msg, wsUrl);
       };
-      socket.onclose = () => { socket = null; scheduleReconnect(); };
-      socket.onerror = () => { /* onclose 会负责重连 */ };
+      currentSocket.onclose = () => {
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+        if (socket === currentSocket) {
+          socket = null;
+          if (!handshakeVerified) {
+            endpointIdx = (endpointIdx + 1) % WS_ENDPOINTS.length;
+            scheduleReconnect(600);
+          } else {
+            scheduleReconnect();
+          }
+        }
+      };
+      currentSocket.onerror = () => { /* onclose 会负责重连 */ };
     }
 
-    function scheduleReconnect() {
-      setTimeout(connect, retryDelay);
-      retryDelay = Math.min(retryDelay * 2, MAX_RETRY);
+    function scheduleReconnect(customDelay) {
+      const waitMs = typeof customDelay === "number" ? customDelay : retryDelay;
+      setTimeout(connect, waitMs);
+      if (typeof customDelay !== "number") {
+        retryDelay = Math.min(retryDelay * 1.5, MAX_RETRY);
+      }
     }
 
     // 页面加载完成后再连接，避免影响页面初始化
-    setTimeout(connect, 3000);
+    setTimeout(connect, 2000);
   })();
 
 })();

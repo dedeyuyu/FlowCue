@@ -270,6 +270,8 @@ async function handleDownload(url, filename, task) {
     );
     const isGoogleFlowHost = (
       parsed.hostname === "flow-content.google" ||
+      parsed.hostname === "flow.google.com" ||
+      parsed.hostname.endsWith(".flow.google.com") ||
       parsed.hostname === "labs.google" ||
       parsed.hostname.endsWith(".labs.google")
     );
@@ -284,6 +286,8 @@ async function handleDownload(url, filename, task) {
     }
 
     const mediaId = parsed.hostname === "flow-content.google" ? parsed.pathname.match(/^\/video\/([a-zA-Z0-9_-]+)$/)?.[1] :
+      (parsed.hostname === "flow.google.com" || parsed.hostname.endsWith(".flow.google.com")) && parsed.pathname.startsWith("/asb/") ?
+        parsed.pathname.match(/^\/asb\/([a-zA-Z0-9_-]+)/)?.[1] :
       parsed.hostname === "labs.google" && parsed.pathname === "/fx/api/trpc/media.getMediaUrlRedirect" ?
         ((parsed.searchParams.get("name") || "").split("/media/").pop().replace(/^media\//, "")) :
       isVidsHost ? task.mediaId : null;

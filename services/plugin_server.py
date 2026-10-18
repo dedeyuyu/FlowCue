@@ -29,27 +29,32 @@ class PluginServer(QObject):
         self.client_id_counter = 1
 
     def start(self):
-        """Starts the WebSocket server listening on ports 18188, 8000, 8765."""
+        """Starts the WebSocket server listening on ports 18188, 8000, 8765 (both IPv4 127.0.0.1 and IPv6 ::1)."""
         if self.servers:
             return True
 
         started_any = False
+        bind_targets = [
+            ("127.0.0.1", QHostAddress.SpecialAddress.LocalHost),
+            ("[::1]", QHostAddress.SpecialAddress.LocalHostIPv6),
+        ]
         for p in self.ports:
-            try:
-                server = QWebSocketServer(
-                    f"FlowPluginServer_{p}",
-                    QWebSocketServer.SslMode.NonSecureMode,
-                    self
-                )
-                if server.listen(QHostAddress.SpecialAddress.LocalHost, p):
-                    logger.info(f"WebSocket server started listening on ws://127.0.0.1:{p}")
-                    server.newConnection.connect(lambda s=server: self.on_new_connection_from_server(s))
-                    self.servers.append(server)
-                    started_any = True
-                else:
-                    logger.warning(f"Port {p} in use or unavailable: {server.errorString()}")
-            except Exception as e:
-                logger.warning(f"Failed to start server on port {p}: {e}")
+            for label, addr in bind_targets:
+                try:
+                    server = QWebSocketServer(
+                        f"FlowPluginServer_{p}_{label}",
+                        QWebSocketServer.SslMode.NonSecureMode,
+                        self
+                    )
+                    if server.listen(addr, p):
+                        logger.info(f"WebSocket server started listening on ws://{label}:{p}")
+                        server.newConnection.connect(lambda s=server: self.on_new_connection_from_server(s))
+                        self.servers.append(server)
+                        started_any = True
+                    else:
+                        server.close()
+                except Exception as e:
+                    logger.warning(f"Failed to start server on {label}:{p}: {e}")
 
         return started_any
 
@@ -84,7 +89,7 @@ class PluginServer(QObject):
             host = (parsed.hostname or "").lower()
             if origin.startswith("chrome-extension://") or origin.startswith("file://"):
                 return True
-            allowed_hosts = {"labs.google", "flow.google.com", "docs.google.com", "localhost", "127.0.0.1"}
+            allowed_hosts = {"labs.google", "flow.google.com", "docs.google.com", "localhost", "127.0.0.1", "::1", "[::1]"}
             if host in allowed_hosts or host.endswith(".labs.google") or host.endswith(".flow.google.com") or host == "docs.google.com":
                 return True
         except Exception as e:
@@ -123,12 +128,20 @@ class PluginServer(QObject):
 
         self.clients[socket] = client_info
 
+        # Read peerPort on main thread before spawning worker thread (Qt objects are not thread-safe)
+        try:
+            peer_port = socket.peerPort()
+        except Exception:
+            peer_port = 0
+
         # Fetch profile async to not block
         import threading
-        def fetch_profile():
+        def fetch_profile(port_val=peer_port):
             try:
+                if not port_val:
+                    return
                 from services.browser_closer import get_browser_profile_by_port
-                prof = get_browser_profile_by_port(socket.peerPort())
+                prof = get_browser_profile_by_port(port_val)
                 client_info["profile"] = prof
                 self.client_updated_signal.emit(client_info)
             except Exception as e:
@@ -137,6 +150,16 @@ class PluginServer(QObject):
 
         socket.textMessageReceived.connect(lambda msg, s=socket: self.on_message_received(s, msg))
         socket.disconnected.connect(lambda s=socket: self.on_client_disconnected(s))
+
+        # Immediately send server_hello so extension can verify it reached FlowCue (and not a multi-open proxy relay)
+        try:
+            socket.sendTextMessage(json.dumps({
+                "type": "server_hello",
+                "server": "FlowCue",
+                "client_id": temp_id
+            }))
+        except Exception:
+            pass
 
         self.client_connected_signal.emit(client_info)
         self.client_updated_signal.emit(client_info)
@@ -172,13 +195,22 @@ class PluginServer(QObject):
         # 0. 心跳包 (Ping/Pong)
         if msg_type == "ping":
             try:
-                socket.sendTextMessage(json.dumps({"type": "pong"}))
+                socket.sendTextMessage(json.dumps({"type": "pong", "server": "FlowCue"}))
             except Exception:
                 pass
             return
 
         # 1. 客户端首次上线/注册 / 欢迎握手注册 / 点数响应 (以真实 Google 邮箱或唯一 client_id 更新)
         if msg_type in ("online", "client_connected", "get_points_response") or str(msg_type).startswith("get_points"):
+            if msg_type == "online":
+                try:
+                    socket.sendTextMessage(json.dumps({
+                        "type": "server_hello",
+                        "server": "FlowCue",
+                        "client_id": info.get("client_id", "")
+                    }))
+                except Exception:
+                    pass
             data_obj = msg.get("data") if isinstance(msg.get("data"), dict) else {}
             
             raw_email = msg.get("email") or data_obj.get("email") or ""

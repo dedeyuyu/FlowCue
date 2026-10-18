@@ -336,15 +336,16 @@
       console.log(`[FlowProxy] [${submission.rpc}] 提取到的 mediaIds:`, ids);
       if (ids.length) {
         boundInThisResponse = true;
+        activeProcess.mediaBound = true;
         console.log(`[FlowProxy] 🚀 [${submission.rpc}] 成功匹配媒体 ID! 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaIds=`, ids);
-        window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: activeProcess.submissionId, mediaIds: [...new Set(ids)] } }));
+        window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: activeProcess.submissionId, mediaIds: [...new Set(ids)], source: "submission" } }));
       } else {
         console.warn(`[FlowProxy] ⚠️ [${submission.rpc}] 帧存在，暂未直接提取到 mediaIds，将继续通过轮询帧/DOM 认领`);
       }
     }
 
-    // 检查所有 BoQ 轮询帧 (兼容 jwpduf / Iyc41d / bOKtO / as29s / nzlxg 等所有新老 RPC ID)
-    if (!boundInThisResponse && activeProcess?.submissionId && window.currentProcess === activeProcess) {
+    // 检查所有 BoQ 轮询帧 (仅在当前任务尚未绑定 mediaId 时尝试通过当前行独有文案认领，严禁使用预设前缀匹配或覆盖已有绑定)
+    if (!boundInThisResponse && activeProcess?.submissionId && window.currentProcess === activeProcess && !activeProcess.mediaBound) {
       for (const frame of frames) {
         if (frame.payload) {
           const candidateItems = [];
@@ -363,28 +364,30 @@
           };
           scanItems(frame.payload);
 
-          const targetPrompt = (activeProcess.finalPrompt || activeProcess.lineText || "").trim();
           const targetLine = (activeProcess.lineText || "").trim();
+          const cleanTargetLine = targetLine.replace(/\s+/g, "");
+          const lineSnippet = cleanTargetLine.length >= 6 ? cleanTargetLine.substring(0, Math.min(cleanTargetLine.length, 28)) : "";
 
           for (const item of candidateItems) {
             const mId = item[0];
             const itemStrings = [];
             const collectStrings = v => {
               if (!v) return;
-              if (typeof v === "string" && v.trim().length > 3) itemStrings.push(v.trim());
+              if (typeof v === "string" && v.trim().length >= 8) itemStrings.push(v.trim());
               else if (Array.isArray(v)) v.forEach(collectStrings);
               else if (typeof v === "object") Object.values(v).forEach(collectStrings);
             };
             collectStrings(item);
 
-            const promptMatches = itemStrings.some(rpcStr =>
-              (targetPrompt && (targetPrompt.includes(rpcStr) || rpcStr.includes(targetPrompt) || rpcStr.substring(0, 15) === targetPrompt.substring(0, 15))) ||
-              (targetLine && (rpcStr.includes(targetLine) || targetLine.includes(rpcStr)))
-            );
-            if (promptMatches || candidateItems.length === 1) {
+            const promptMatches = lineSnippet && itemStrings.some(rpcStr => {
+              const cleanRpc = rpcStr.replace(/\s+/g, "");
+              return cleanRpc.includes(lineSnippet);
+            });
+            if (promptMatches) {
               boundInThisResponse = true;
-              console.log(`[FlowProxy] 🚀 [${frame.rpc}] 识别到当前任务媒体 ID! 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaId=${mId}`);
-              window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: activeProcess.submissionId, mediaIds: [mId] } }));
+              activeProcess.mediaBound = true;
+              console.log(`[FlowProxy] 🚀 [${frame.rpc}] 通过当前行独有文案识别到任务媒体 ID! 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaId=${mId}`);
+              window.dispatchEvent(new CustomEvent("flow-task-media-bound", { detail: { submissionId: activeProcess.submissionId, mediaIds: [mId], source: "poll" } }));
               break;
             }
           }
@@ -421,9 +424,10 @@
     if (!boundInThisResponse && isGenerateRequest && activeProcess?.submissionId && window.currentProcess === activeProcess) {
       const ids = lists.flat().map(media => mediaIdOf(media?.name)).filter(Boolean);
       if (ids.length) {
+        activeProcess.mediaBound = true;
         console.log(`[FlowProxy] 🚀 [mediaLists] 派发 flow-task-media-bound: submissionId=${activeProcess.submissionId}, mediaIds=`, ids);
         window.dispatchEvent(new CustomEvent("flow-task-media-bound", {
-          detail: { submissionId: activeProcess.submissionId, mediaIds: [...new Set(ids)] }
+          detail: { submissionId: activeProcess.submissionId, mediaIds: [...new Set(ids)], source: "submission" }
         }));
       } else {
         console.log(`[FlowProxy] ℹ️ 生成请求响应未直接返回 mediaLists ID (submissionId=${activeProcess.submissionId})，继续等待后续轮询帧或 DOM 视频渲染认领`);
@@ -490,8 +494,17 @@
     window.fetch = function(input, init) {
       const url = getUrlString(input);
       const process = window.currentProcess;
-      const isFlowInternal = /labs\.google|_\/LabsFlowUi|FlowService|batchexecute|flow-content\.google|trpc/i.test(url);
+      const isFlowInternal = /labs\.google|_\/LabsFlowUi|_\/AiSandboxAngularFrontend|FlowService|batchexecute|flow-content\.google|trpc/i.test(url);
+      if (process && classify(url, "").generate) {
+        process.generateRequestSent = true;
+      }
       const bodyPromise = getFetchBodyText(input, init);
+      void bodyPromise.then(text => {
+        const type = classify(url, text);
+        if (type.generate && process) {
+          process.generateRequestSent = true;
+        }
+      }).catch(() => {});
       const result = originalFetch.apply(this, arguments);
       result.then(response => {
         const copy = response.clone();
@@ -542,6 +555,9 @@
       const bodyText = getXhrBodyText(body);
       const isFlowInternal = /labs\.google|_\/LabsFlowUi|FlowService|batchexecute|flow-content\.google|trpc/i.test(this._flowUrl || "");
       const type = classifyRequest(this._flowUrl || "", bodyText);
+      if (type.generate && process) {
+        process.generateRequestSent = true;
+      }
       if (isFlowInternal || type.generate || type.status) {
         console.log(`[FlowProxy] 🌐 捕获网络请求 (XHR): URL=${(this._flowUrl || "").substring(0, 120)}, generate=${type.generate}, status=${type.status}, activeProcess=${process?.submissionId || '无'}`);
       }
