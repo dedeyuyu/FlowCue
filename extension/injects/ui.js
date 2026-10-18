@@ -387,14 +387,15 @@
             <table class="flow-table" id="flow-tasks-table">
               <thead>
                 <tr>
+                  <th style="width: 145px; text-align: center;">任务序号 / 项目</th>
                   <th style="width: 115px; text-align: center;">图片</th>
                   <th>提示词文本 (分行分割)</th>
-                  <th style="width: 145px;">提示词模板</th>
-                  <th style="width: 135px;">素材类型</th>
-                  <th style="width: 85px;">时长（秒）</th>
-                  <th style="width: 70px;">生成数</th>
+                  <th style="width: 135px;">提示词模板</th>
+                  <th style="width: 125px;">素材类型</th>
+                  <th style="width: 80px;">时长（秒）</th>
+                  <th style="width: 65px;">生成数</th>
                   <th style="width: 220px;">状态与日志</th>
-                  <th style="width: 80px; text-align: center;">操作</th>
+                  <th style="width: 155px; text-align: center;">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -1607,7 +1608,12 @@
         aspectRatio: taskAspect,
         resolution: taskRes,
         videoModel: taskModel,
-        interval: taskInterval
+        interval: taskInterval,
+        project_id: item.project_id || item.projectId || "",
+        project_short: item.project_short || item.projectShort || "",
+        segment_index: item.segment_index ?? item.segmentIndex ?? item.index ?? null,
+        segment_no: item.segment_no || item.segmentNo || "",
+        batch_no: item.batch_no ?? item.batchNo ?? null
       });
       importCount++;
     });
@@ -1659,8 +1665,449 @@
   }
 
   // ----------------------------------------------------
-  // 6. 任务表格渲染
+  // 6. 任务序号/项目简称解析、手动下载并重命名、任务表格渲染
   // ----------------------------------------------------
+  function escapeHtmlAttr(str) {
+    return String(str || "")
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  // 解析任务所属项目简称 (01_用户名称前10字符) 与软件任务序号 (如 08 / 08.mp4)
+  function parseTaskIdentity(task, rowIndex) {
+    const dlPath = String(task?.download_path || "").trim();
+    const imgPath = String(task?.image?.localImagePath || task?.local_image_path || "").trim();
+    const normDl = dlPath.replace(/\\/g, "/");
+    const normImg = imgPath.replace(/\\/g, "/");
+
+    // 1. 提取项目文件夹完整名称 (如 01_用户的名称_备注-flow)
+    let rawFolder = String(task?.project_id || "").trim();
+    if (!rawFolder) {
+      const pickFolderFromPath = (p) => {
+        if (!p) return "";
+        const parts = p.split("/").filter(Boolean);
+        const flowFolder = parts.find(seg => /-flow$/i.test(seg));
+        if (flowFolder) return flowFolder;
+        const dlIdx = parts.findIndex(seg => seg.toLowerCase() === "downloads");
+        if (dlIdx > 0) return parts[dlIdx - 1];
+        if (parts.length >= 2) return parts[parts.length - 2];
+        return "";
+      };
+      rawFolder = pickFolderFromPath(normDl) || pickFolderFromPath(normImg);
+    }
+
+    // 2. 提取「项目序号(01、02...) + 用户名称前10个字符」
+    let projectShort = String(task?.project_short || "").trim();
+    if (!projectShort && rawFolder) {
+      const cleanFolder = rawFolder.replace(/-flow$/i, "").trim();
+      const m = cleanFolder.match(/^(\d+)(?:[_\-\s]+(.*))?$/);
+      if (m) {
+        const numStr = m[1].padStart(2, "0");
+        const rest = (m[2] || "").trim();
+        let userNamePart = rest;
+        const lastUnderscore = rest.lastIndexOf("_");
+        if (lastUnderscore > 0) {
+          userNamePart = rest.slice(0, lastUnderscore);
+        }
+        if (userNamePart.startsWith(`${numStr}_`)) {
+          userNamePart = userNamePart.slice(numStr.length + 1).trim();
+        }
+        const first10 = Array.from(userNamePart).slice(0, 10).join("");
+        projectShort = first10 ? `${numStr}_${first10}` : numStr;
+      } else {
+        projectShort = Array.from(cleanFolder).slice(0, 12).join("");
+      }
+    }
+    if (!projectShort) {
+      projectShort = "当前网页任务";
+    }
+
+    // 3. 提取软件中的具体任务序号 (如 01, 02, 08 -> 对应 08.mp4，与图片名称不同)
+    let segmentNo = String(task?.segment_no || "").trim();
+    let videoFileName = "";
+    if (normDl) {
+      const base = normDl.substring(normDl.lastIndexOf("/") + 1);
+      if (base) {
+        videoFileName = base;
+        const stem = base.replace(/\.\w+$/, "");
+        if (!segmentNo && stem) {
+          segmentNo = /^\d+$/.test(stem) ? stem.padStart(2, "0") : stem;
+        }
+      }
+    }
+    if (!segmentNo && task?.segment_index != null && task.segment_index !== "") {
+      const n = Number(task.segment_index);
+      if (Number.isFinite(n) && n > 0) segmentNo = String(n).padStart(2, "0");
+    }
+    if (!segmentNo) {
+      segmentNo = String(rowIndex + 1).padStart(2, "0");
+    }
+    if (!videoFileName) {
+      videoFileName = `${segmentNo}.mp4`;
+    }
+
+    const batchNo = (task?.batch_no != null && task.batch_no !== "") ? Number(task.batch_no) : null;
+    const saveDirPath = dlPath ? dlPath.replace(/[\\/][^\\/]+$/, "") : "";
+
+    return {
+      projectFull: rawFolder || projectShort,
+      projectShort,
+      segmentNo,
+      videoFileName,
+      batchNo: Number.isFinite(batchNo) && batchNo > 0 ? batchNo : null,
+      fullSavePath: dlPath,
+      saveDirPath
+    };
+  }
+
+  // 浏览器端直接拉取视频 Blob 并触发重命名下载 (针对部分拦截 chrome.downloads 的特殊多开浏览器保底)
+  async function triggerBrowserBlobRenameDownload(videoUrl, targetFileName, task, rowIndex, lineIdx = 0) {
+    const cleanUrl = String(videoUrl || "").trim().replace(/&amp;/g, "&");
+    if (!cleanUrl) return false;
+    try {
+      showToast(`⏳ 正在拉取视频数据并重命名为 ${targetFileName}...`, 4000);
+      const resp = await fetch(cleanUrl, { credentials: "include" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = targetFileName;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        try { a.remove(); URL.revokeObjectURL(blobUrl); } catch (_) {}
+      }, 15000);
+      if (task) {
+        task.downloaded = task.downloaded || [];
+        task.downloaded[lineIdx] = true;
+        updateLineStatus(rowIndex, lineIdx, "success", `已手动下载并重命名: ${targetFileName}`);
+      }
+      showToast(`✅ 已通过浏览器直存下载并重命名为: ${targetFileName}\n📋 完整保存路径已复制到剪贴板`, 5000);
+      return true;
+    } catch (err) {
+      console.warn("[FlowUI] Blob 拉取重命名失败，降级为 a[download] 直链触发:", err);
+      try {
+        const a = document.createElement("a");
+        a.href = cleanUrl;
+        a.download = targetFileName;
+        a.target = "_blank";
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        showToast(`⚠️ 已打开视频直链，请按 Ctrl+S 保存并粘贴剪贴板中的路径/文件名 (${targetFileName})`, 6000);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+  }
+
+  // 执行手动下载并自动重命名 (优先走插件后台目录+重命名通道，失败自动降级为页面 Blob 重命名下载)
+  async function executeManualDownloadAndRename(videoUrl, task, rowIndex, lineIdx = 0) {
+    const cleanUrl = String(videoUrl || "").trim().replace(/&amp;/g, "&");
+    if (!cleanUrl) {
+      showToast("❌ 视频链接为空，无法下载");
+      return false;
+    }
+    const identity = parseTaskIdentity(task, rowIndex);
+    const targetRelPath = resolveDownloadPath(task?.download_path, { image: task?.image, rowIndex, lineIndex: lineIdx });
+    const flatFileName = identity.videoFileName;
+    const copyText = identity.fullSavePath || flatFileName;
+
+    try {
+      await navigator.clipboard.writeText(copyText);
+    } catch (_) {}
+
+    const mediaId = mediaIdFromVideoUrl(cleanUrl) || task?.mediaBindings?.[lineIdx]?.mediaIds?.[0] || "manual";
+    console.log(`[FlowUI] 📥 手动下载并重命名启动: 项目=${identity.projectShort}, 序号=#${identity.segmentNo}, 目标=${targetRelPath}, URL=${cleanUrl.substring(0, 90)}`);
+
+    const res = await sendToExtension("download", {
+      url: cleanUrl,
+      filename: targetRelPath,
+      task: {
+        manual: true,
+        flatFilename: flatFileName,
+        rowIndex,
+        lineIndex: lineIdx,
+        taskId: task?.taskId || `manual_${rowIndex}`,
+        submissionId: task?.mediaBindings?.[lineIdx]?.submissionId || `manual_sub_${Date.now()}`,
+        mediaId,
+        projectId: getStorageKey(),
+        download_path: targetRelPath
+      }
+    });
+
+    if (res && res.success) {
+      if (task) {
+        task.videoUrls = task.videoUrls || [];
+        task.videoUrls[lineIdx] = cleanUrl;
+        task.downloadIds = task.downloadIds || [];
+        task.downloadIds[lineIdx] = res.downloadId;
+        task.downloaded = task.downloaded || [];
+        task.downloaded[lineIdx] = true;
+        updateLineStatus(rowIndex, lineIdx, "success", `已手动下载: ${identity.videoFileName}`);
+      }
+      showToast(`✅ 已手动下载并重命名: [${identity.projectShort}] #${identity.segmentNo} ➔ ${identity.videoFileName}\n📋 保存路径已复制到剪贴板`, 4500);
+      return true;
+    }
+
+    console.warn("[FlowUI] 后台扩展下载返回失败，启动页面级 Blob 重命名保底下载:", res?.error);
+    return await triggerBrowserBlobRenameDownload(cleanUrl, flatFileName, task, rowIndex, lineIdx);
+  }
+
+  // 自动查找当前任务行在页面或缓存中对应的视频候选列表
+  async function findTaskVideoCandidates(task, lineIdx = 0) {
+    const candidates = [];
+    const seenUrls = new Set();
+    const addCandidate = (url, thumbSrc = "", promptText = "", source = "") => {
+      const clean = String(url || "").trim().replace(/&amp;/g, "&");
+      if (!clean || isStaticShowcaseAsset(clean)) return;
+      const key = videoIdentity(clean);
+      if (seenUrls.has(key)) return;
+      seenUrls.add(key);
+      candidates.push({ url: clean, mediaId: mediaIdFromVideoUrl(clean), thumbSrc, promptText, source });
+    };
+
+    // 1. 已记录在 task.videoUrls 中的直链
+    if (task?.videoUrls?.[lineIdx]) {
+      addCandidate(task.videoUrls[lineIdx], "", task.text || "", "任务已缓存直链");
+    }
+
+    // 2. 已记录在 mediaBindings 或全局拦截表中的直链
+    const binding = task?.mediaBindings?.[lineIdx];
+    const boundIds = [
+      ...(Array.isArray(binding?.readyIds) ? binding.readyIds : []),
+      ...(Array.isArray(binding?.mediaIds) ? binding.mediaIds : [])
+    ];
+    for (const mId of boundIds) {
+      if (binding?.urls?.[mId]) addCandidate(binding.urls[mId], "", task.text || "", `绑定ID (${mId.slice(0, 8)})`);
+      if (discoveredVideoUrlsById.has(mId)) addCandidate(discoveredVideoUrlsById.get(mId), "", task.text || "", `网络拦截ID (${mId.slice(0, 8)})`);
+    }
+
+    // 3. 根据任务独有提示词或 mediaId 在当前页面定位所属批次容器，并自动唤醒懒加载 <video>
+    const container = findCurrentBatchContainer(task, lineIdx);
+    if (container) {
+      const tiles = Array.from(container.querySelectorAll("flow-video-tile"));
+      if (tiles.length > 0) {
+        tiles.forEach(t => triggerTileHover(t));
+        await delay(380);
+      }
+      const promptEl = container.querySelector(".prompt-text, flow-expandable-prompt");
+      const containerPrompt = promptEl ? (promptEl.innerText || promptEl.textContent || "").trim() : (task?.text || "");
+      const videos = Array.from(container.querySelectorAll("video"));
+      for (const v of videos) {
+        const src = (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&");
+        const tile = typeof v.closest === "function" ? (v.closest("flow-video-tile") || v.closest("flow-grid-tile-container")) : null;
+        const thumbImg = tile ? tile.querySelector("img.thumbnail, img[src*='flow.google.com/asb/'], img[src*='flow-content.google/image/']") : null;
+        const thumbSrc = thumbImg ? (thumbImg.getAttribute("src") || thumbImg.src || "") : "";
+        if (src) addCandidate(src, thumbSrc, containerPrompt, "页面提示词精准匹配");
+      }
+    }
+
+    return candidates;
+  }
+
+  // 打开可视化「手动选择页面视频并重命名下载」弹窗
+  async function openManualDownloadPickerModal(task, rowIndex, lineIdx = 0, preloadedCandidates = null) {
+    const existingModal = document.getElementById("flow-manual-dl-modal");
+    if (existingModal) existingModal.remove();
+
+    const identity = parseTaskIdentity(task, rowIndex);
+    const autoList = Array.isArray(preloadedCandidates) ? preloadedCandidates : await findTaskVideoCandidates(task, lineIdx);
+
+    // 扫描页面上所有批次容器中的视频卡片，先唤醒可见区域的缩略图懒加载
+    const allTiles = Array.from(document.querySelectorAll("flow-video-tile"));
+    for (const tile of allTiles.slice(0, 12)) {
+      const v = tile.querySelector("video");
+      const hasSrc = v && (v.getAttribute("src") || v.currentSrc || v.src);
+      if (!hasSrc) triggerTileHover(tile);
+    }
+    if (allTiles.length > 0) await delay(380);
+
+    const pageVideos = [];
+    const seenKeys = new Set();
+    const autoKeys = new Set(autoList.map(c => videoIdentity(c.url)));
+
+    // 先加入自动匹配的候选视频
+    for (const item of autoList) {
+      const k = videoIdentity(item.url);
+      seenKeys.add(k);
+      pageVideos.push({ ...item, isMatched: true });
+    }
+
+    // 再扫描页面上所有 video 元素
+    const allVideoEls = Array.from(document.querySelectorAll("flow-video-tile video, .batch-container video, .virtual-item-container video, video"));
+    for (const v of allVideoEls) {
+      if (v.closest && v.closest("#flow-batch-overlay")) continue;
+      const src = (v.getAttribute("src") || v.currentSrc || v.src || "").trim().replace(/&amp;/g, "&");
+      if (!src || isStaticShowcaseAsset(src)) continue;
+      const k = videoIdentity(src);
+      if (seenKeys.has(k)) continue;
+      seenKeys.add(k);
+
+      const tile = typeof v.closest === "function" ? (v.closest("flow-video-tile") || v.closest("flow-grid-tile-container")) : null;
+      const thumbImg = tile ? tile.querySelector("img.thumbnail, img[src*='flow.google.com/asb/'], img[src*='flow-content.google/image/']") : null;
+      const thumbSrc = thumbImg ? (thumbImg.getAttribute("src") || thumbImg.src || "") : "";
+      const batchContainer = typeof v.closest === "function" ? v.closest(".batch-container, .virtual-item-container") : null;
+      const promptEl = batchContainer ? batchContainer.querySelector(".prompt-text, flow-expandable-prompt") : null;
+      const promptText = promptEl ? (promptEl.innerText || promptEl.textContent || "").trim() : "";
+
+      pageVideos.push({
+        url: src,
+        mediaId: mediaIdFromVideoUrl(src),
+        thumbSrc,
+        promptText,
+        source: "当前页面视频",
+        isMatched: autoKeys.has(k)
+      });
+    }
+
+    const modal = document.createElement("div");
+    modal.id = "flow-manual-dl-modal";
+    modal.style.cssText = "position:fixed; inset:0; z-index:2147483646; background:rgba(9,13,22,0.78); backdrop-filter:blur(6px); display:flex; align-items:center; justify-content:center; padding:20px; font-family:var(--flow-font-body, system-ui, sans-serif);";
+
+    const fullPathDisplay = identity.fullSavePath || `Flow/${identity.projectFull}/${identity.videoFileName}`;
+    const cardsHtml = pageVideos.length > 0 ? pageVideos.map((item, idx) => `
+      <div style="display:flex; align-items:center; gap:12px; padding:10px 12px; border-radius:8px; background:${item.isMatched ? 'rgba(16,185,129,0.14)' : 'rgba(30,41,59,0.75)'}; border:1px solid ${item.isMatched ? '#10b981' : 'rgba(148,163,184,0.22)'};">
+        <div style="width:64px; height:84px; border-radius:6px; overflow:hidden; background:#0f172a; flex-shrink:0; display:flex; align-items:center; justify-content:center; border:1px solid rgba(255,255,255,0.1);">
+          ${item.thumbSrc
+            ? `<img src="${escapeHtmlAttr(item.thumbSrc)}" style="width:100%; height:100%; object-fit:cover;" />`
+            : `<video src="${escapeHtmlAttr(item.url)}" muted preload="metadata" style="width:100%; height:100%; object-fit:cover;"></video>`}
+        </div>
+        <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:5px;">
+          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+            ${item.isMatched
+              ? `<span style="background:#10b981; color:#fff; font-size:11px; font-weight:700; padding:2px 7px; border-radius:4px;">🎯 自动匹配本任务 (#${escapeHtmlAttr(identity.segmentNo)})</span>`
+              : `<span style="background:rgba(148,163,184,0.2); color:#cbd5e1; font-size:11px; padding:2px 7px; border-radius:4px;">页面视频 #${idx + 1}</span>`}
+            <span style="color:#94a3b8; font-size:11px;">${escapeHtmlAttr(item.source || "")}</span>
+          </div>
+          <div style="color:#e2e8f0; font-size:12px; line-height:1.4; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;" title="${escapeHtmlAttr(item.promptText || "")}">
+            ${escapeHtmlAttr(item.promptText || "(未提取到卡片提示词文本)")}
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; flex-shrink:0;">
+          <button class="btn-modal-ext-dl" data-idx="${idx}" style="padding:6px 12px; border-radius:6px; border:none; background:#8b5cf6; color:#fff; font-size:12px; font-weight:600; cursor:pointer; white-space:nowrap;">
+            📥 下载并重命名为 ${escapeHtmlAttr(identity.videoFileName)}
+          </button>
+          <button class="btn-modal-blob-dl" data-idx="${idx}" style="padding:5px 10px; border-radius:6px; border:1px solid rgba(56,189,248,0.45); background:rgba(56,189,248,0.12); color:#38bdf8; font-size:11px; font-weight:600; cursor:pointer; white-space:nowrap;" title="若插件后台下载被浏览器拦截，点击此按钮直接用网页流式下载为 ${escapeHtmlAttr(identity.videoFileName)}">
+            💾 浏览器直存 ${escapeHtmlAttr(identity.videoFileName)}
+          </button>
+        </div>
+      </div>
+    `).join("") : `
+      <div style="text-align:center; padding:32px 16px; color:#94a3b8; font-size:13px;">
+        当前页面暂未检测到已加载出视频直链的卡片。<br/>
+        请先关闭此窗口，将鼠标移动到网页上已生成的视频缩略图上悬停 1 秒，再点击「📥 手动下载」。
+      </div>
+    `;
+
+    setSafeHTML(modal, `
+      <div style="width:740px; max-width:95vw; max-height:86vh; background:#0f172a; border:1px solid rgba(139,92,246,0.45); border-radius:12px; box-shadow:0 24px 60px rgba(0,0,0,0.65); display:flex; flex-direction:column; overflow:hidden; color:#f8fafc;">
+        <div style="padding:14px 18px; background:rgba(30,41,59,0.9); border-bottom:1px solid rgba(148,163,184,0.18); display:flex; align-items:center; justify-content:space-between;">
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <span style="font-size:15px; font-weight:700; color:#f8fafc;">📥 手动下载并重命名</span>
+            <span style="background:rgba(139,92,246,0.22); border:1px solid rgba(139,92,246,0.5); color:#c4b5fd; font-size:12px; font-weight:700; padding:2px 8px; border-radius:5px;">
+              项目: ${escapeHtmlAttr(identity.projectShort)}
+            </span>
+            <span style="background:rgba(16,185,129,0.2); border:1px solid rgba(16,185,129,0.5); color:#6ee7b7; font-size:12px; font-weight:700; padding:2px 8px; border-radius:5px;">
+              任务序号: #${escapeHtmlAttr(identity.segmentNo)} (${escapeHtmlAttr(identity.videoFileName)})${identity.batchNo ? ` · 第${identity.batchNo}批` : ""}
+            </span>
+          </div>
+          <button id="btn-close-manual-dl-modal" style="background:transparent; border:none; color:#94a3b8; font-size:18px; cursor:pointer; padding:2px 6px;">✕</button>
+        </div>
+
+        <div style="padding:12px 18px; background:rgba(15,23,42,0.95); border-bottom:1px solid rgba(148,163,184,0.14); display:flex; flex-direction:column; gap:8px; font-size:12px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+            <div style="color:#cbd5e1; min-width:0; flex:1; word-break:break-all;">
+              <strong style="color:#94a3b8;">软件目标保存位置：</strong>
+              <code style="color:#38bdf8; background:rgba(30,41,59,0.9); padding:2px 6px; border-radius:4px;">${escapeHtmlAttr(fullPathDisplay)}</code>
+            </div>
+            <div style="display:flex; gap:6px; flex-shrink:0;">
+              <button id="btn-copy-full-save-path" style="padding:4px 9px; border-radius:5px; border:1px solid rgba(148,163,184,0.3); background:rgba(51,65,85,0.8); color:#e2e8f0; font-size:11px; cursor:pointer;">📋 复制完整保存路径</button>
+              <button id="btn-copy-only-filename" style="padding:4px 9px; border-radius:5px; border:1px solid rgba(148,163,184,0.3); background:rgba(51,65,85,0.8); color:#e2e8f0; font-size:11px; cursor:pointer;">📋 仅复制 ${escapeHtmlAttr(identity.videoFileName)}</button>
+            </div>
+          </div>
+          <div style="color:#94a3b8; font-size:11px;">
+            💡 提示：点击下方按钮会自动将视频下载并重命名为 <strong style="color:#f8fafc;">${escapeHtmlAttr(identity.videoFileName)}</strong>。若浏览器弹出“另存为”窗口，可直接按 <strong style="color:#f8fafc;">Ctrl+V</strong> 粘贴上方已为您复制好的完整路径！
+          </div>
+        </div>
+
+        <div style="padding:14px 18px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; max-height:58vh;">
+          ${cardsHtml}
+        </div>
+      </div>
+    `);
+
+    document.body.appendChild(modal);
+
+    const closeBtn = modal.querySelector("#btn-close-manual-dl-modal");
+    if (closeBtn) closeBtn.addEventListener("click", () => modal.remove());
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) modal.remove();
+    });
+
+    const copyPathBtn = modal.querySelector("#btn-copy-full-save-path");
+    if (copyPathBtn) {
+      copyPathBtn.addEventListener("click", () => {
+        navigator.clipboard.writeText(fullPathDisplay).then(() => {
+          showToast(`✅ 已复制完整保存路径: ${fullPathDisplay}`);
+        }).catch(() => {});
+      });
+    }
+    const copyNameBtn = modal.querySelector("#btn-copy-only-filename");
+    if (copyNameBtn) {
+      copyNameBtn.addEventListener("click", () => {
+        navigator.clipboard.writeText(identity.videoFileName).then(() => {
+          showToast(`✅ 已复制目标文件名: ${identity.videoFileName}`);
+        }).catch(() => {});
+      });
+    }
+
+    modal.querySelectorAll(".btn-modal-ext-dl").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const idx = parseInt(e.currentTarget.dataset.idx, 10);
+        const targetItem = pageVideos[idx];
+        if (!targetItem) return;
+        await executeManualDownloadAndRename(targetItem.url, task, rowIndex, lineIdx);
+        modal.remove();
+      });
+    });
+
+    modal.querySelectorAll(".btn-modal-blob-dl").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const idx = parseInt(e.currentTarget.dataset.idx, 10);
+        const targetItem = pageVideos[idx];
+        if (!targetItem) return;
+        try { await navigator.clipboard.writeText(fullPathDisplay); } catch (_) {}
+        await triggerBrowserBlobRenameDownload(targetItem.url, identity.videoFileName, task, rowIndex, lineIdx);
+        modal.remove();
+      });
+    });
+  }
+
+  // 点击任务行「📥 手动下载」按钮的主入口
+  async function handleManualDownloadForTask(task, rowIndex, lineIdx = 0, forcePicker = false) {
+    const identity = parseTaskIdentity(task, rowIndex);
+    const copyText = identity.fullSavePath || identity.videoFileName;
+    try {
+      await navigator.clipboard.writeText(copyText);
+    } catch (_) {}
+
+    const candidates = await findTaskVideoCandidates(task, lineIdx);
+    // 如果精准找到了唯一匹配的本任务视频且未要求强制打开选择器，直接一键下载并重命名！
+    if (!forcePicker && candidates.length === 1 && !task?.downloaded?.[lineIdx]) {
+      const ok = await executeManualDownloadAndRename(candidates[0].url, task, rowIndex, lineIdx);
+      if (ok) return;
+    }
+    // 若未自动匹配到唯一视频、或已下载过想重新选择、或按住 Shift 点击，则打开可视化页面视频选择与重命名弹窗
+    await openManualDownloadPickerModal(task, rowIndex, lineIdx, candidates);
+  }
+
   function renderTable() {
     const tbody = document.querySelector("#flow-tasks-table tbody");
     if (!tbody) return;
@@ -1692,7 +2139,7 @@
     if (!state.tasks.length) {
       setSafeHTML(tbody, `
         <tr>
-          <td colspan="8" style="text-align: center; color: var(--flow-text-secondary); padding: 40px 0;">
+          <td colspan="9" style="text-align: center; color: var(--flow-text-secondary); padding: 40px 0;">
             暂无任务。请点击“导入外部 JSON”粘贴任务数据，或点击“加载页面图片”直接导入当前网页上的原料。
           </td>
         </tr>
@@ -1702,6 +2149,42 @@
 
     state.tasks.forEach((task, rowIndex) => {
       const tr = document.createElement("tr");
+      const identity = parseTaskIdentity(task, rowIndex);
+
+      // 0. 任务序号 / 所属项目简称列 (显示 01_用户名称前10字符 + 软件中的具体任务序号如 #08 / 08.mp4)
+      const seqTd = document.createElement("td");
+      seqTd.style.width = "145px";
+      seqTd.style.textAlign = "center";
+      seqTd.style.verticalAlign = "middle";
+      const fullTooltip = `所属项目: ${identity.projectFull}\n软件任务序号: #${identity.segmentNo} (${identity.videoFileName})${identity.batchNo ? `\n所属批次: 第 ${identity.batchNo} 批` : ""}\n关联图片: ${task.image?.displayName || "无"}\n保存位置: ${identity.fullSavePath || "默认下载目录"}\n(点击可复制完整保存路径)`;
+      setSafeHTML(seqTd, `
+        <div class="cell-seq-project-box" title="${escapeHtmlAttr(fullTooltip)}" style="display:flex; flex-direction:column; align-items:center; gap:4px; padding:4px 2px; cursor:pointer; user-select:none;">
+          <div style="display:flex; align-items:center; justify-content:center; gap:4px; flex-wrap:wrap;">
+            <span style="background:linear-gradient(135deg, #8b5cf6, #6366f1); color:#fff; font-weight:800; font-size:12px; padding:2px 7px; border-radius:5px; letter-spacing:0.3px; box-shadow:0 2px 6px rgba(139,92,246,0.35);">
+              序号 #${escapeHtmlAttr(identity.segmentNo)}
+            </span>
+            ${identity.batchNo ? `<span style="background:rgba(56,189,248,0.16); border:1px solid rgba(56,189,248,0.4); color:#38bdf8; font-size:10px; font-weight:700; padding:1px 5px; border-radius:4px;">第${identity.batchNo}批</span>` : ""}
+          </div>
+          <div style="font-size:11px; font-weight:700; color:#e2e8f0; max-width:136px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtmlAttr(identity.projectFull)}">
+            ${escapeHtmlAttr(identity.projectShort)}
+          </div>
+          <div style="font-size:10px; color:#94a3b8; background:rgba(30,41,59,0.75); border:1px solid rgba(148,163,184,0.2); padding:1px 6px; border-radius:4px; display:inline-flex; align-items:center; gap:3px;">
+            <span>🎬 ${escapeHtmlAttr(identity.videoFileName)}</span>
+            <span style="color:#38bdf8;">📋</span>
+          </div>
+        </div>
+      `);
+      const seqBox = seqTd.querySelector(".cell-seq-project-box");
+      if (seqBox) {
+        seqBox.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const copyTarget = identity.fullSavePath || identity.videoFileName;
+          navigator.clipboard.writeText(copyTarget).then(() => {
+            showToast(`📋 已复制 [${identity.projectShort} #${identity.segmentNo}] 保存路径:\n${copyTarget}`, 3500);
+          }).catch(() => {});
+        });
+      }
+      tr.appendChild(seqTd);
       
       // 1. 图片预览与名称展示列
       const imgTd = document.createElement("td");
@@ -1864,15 +2347,15 @@
       tr.appendChild(statusTd);
       renderTableStatusCell(tr, task, rowIndex);
 
-      // 7. 操作列 (单项运行 + 删除)
+      // 7. 操作列 (单项运行 + 手动下载并重命名 + 删除)
       const actionTd = document.createElement("td");
       actionTd.style.textAlign = "center";
-      actionTd.style.width = "125px";
+      actionTd.style.width = "155px";
       actionTd.style.whiteSpace = "nowrap";
 
       const runBtn = document.createElement("button");
       runBtn.className = "flow-btn primary";
-      runBtn.style.cssText = "padding: 3px 8px; font-size: 11px; margin-right: 6px; border-radius: 4px; display: inline-flex; align-items: center; gap: 3px; background: #10b981; border: none; color: #fff; cursor: pointer;";
+      runBtn.style.cssText = "padding: 3px 7px; font-size: 11px; margin-right: 4px; border-radius: 4px; display: inline-flex; align-items: center; gap: 3px; background: #10b981; border: none; color: #fff; cursor: pointer;";
       runBtn.title = "仅运行当前这一项任务，生成并下载完毕后即停止";
       setSafeHTML(runBtn, `
         <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
@@ -1888,6 +2371,19 @@
       });
       actionTd.appendChild(runBtn);
 
+      const manualDlBtn = document.createElement("button");
+      manualDlBtn.className = "flow-btn secondary";
+      manualDlBtn.style.cssText = "padding: 3px 7px; font-size: 11px; margin-right: 4px; border-radius: 4px; display: inline-flex; align-items: center; gap: 3px; background: #3b82f6; border: none; color: #fff; cursor: pointer;";
+      manualDlBtn.title = `手动下载并重命名为 ${identity.videoFileName} (${identity.projectShort})\n同时自动复制完整保存路径到剪贴板；按住 Shift 点击可直接打开页面视频选择列表`;
+      setSafeHTML(manualDlBtn, `
+        <span>📥 手动下载</span>
+      `);
+      manualDlBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        handleManualDownloadForTask(task, rowIndex, 0, !!e.shiftKey);
+      });
+      actionTd.appendChild(manualDlBtn);
+
       const delBtn = document.createElement("button");
       delBtn.className = "cell-btn-delete";
       delBtn.title = "单独删除此项任务配置";
@@ -1901,7 +2397,7 @@
           showToast("当前任务正在生成中，请先停止队列再删除该任务");
           return;
         }
-        const taskName = task.image?.displayName || `任务 #${rowIndex + 1}`;
+        const taskName = `${identity.projectShort} #${identity.segmentNo} (${task.image?.displayName || ""})`;
         if (state.currentIndex > rowIndex) {
           state.currentIndex--;
         } else if (state.currentIndex === rowIndex) {
@@ -1925,6 +2421,7 @@
     
     container.replaceChildren();
     const lines = splitTextToLines(task.text);
+    const identity = parseTaskIdentity(task, rowIndex);
     
     if (lines.length === 0) {
       setSafeHTML(container, `<span style="color: var(--flow-text-secondary); font-size:12px;">待输入文本</span>`);
@@ -1949,12 +2446,13 @@
       } else if (status === "success") {
         badgeHtml = `<span class="status-badge success">✓ 成功</span>`;
       } else if (status === "failed") {
-        badgeHtml = `<span class="status-badge failed" title="${message}">✗ 失败</span>`;
+        badgeHtml = `<span class="status-badge failed" title="${escapeHtmlAttr(message)}">✗ 失败</span>`;
       }
 
+      const seqPrefix = lines.length > 1 ? `#${identity.segmentNo}-${lineIdx + 1}` : `#${identity.segmentNo}`;
       const hasBoundVideo = !!(task.mediaBindings?.[lineIdx]?.schema === 2 && Array.isArray(task.mediaBindings?.[lineIdx]?.mediaIds) && task.mediaBindings[lineIdx].mediaIds.length > 0);
       setSafeHTML(lineRow, `
-        <span class="status-line-text" title="${line}">#${lineIdx+1}: ${line}</span>
+        <span class="status-line-text" title="${escapeHtmlAttr(`[${identity.projectShort} ${seqPrefix}] ${message ? message + ' | ' : ''}${line}`)}">${escapeHtmlAttr(seqPrefix)}: ${escapeHtmlAttr(line)}</span>
         <div class="status-line-actions">
           ${badgeHtml}
           ${status !== "pending" && status !== "generating" ? `
@@ -5191,7 +5689,7 @@ ${presetAfter || ""}`.trim();
   }
 
   function sanitizePathName(name) {
-    return name.replace(/[\\/:*?"<>|]/g, "_").trim();
+    return String(name || "").replace(/[\\/:*?"<>|\r\n\t]/g, "_").replace(/\.+$/, "").trim();
   }
 
   function delay(ms) {

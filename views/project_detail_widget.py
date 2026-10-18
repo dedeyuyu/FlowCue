@@ -2518,6 +2518,25 @@ class ProjectDetailWidget(QWidget):
         dialog = BatchExportDialog(self, res["batches"], self.config_manager, skipped_count=res["skipped"])
         dialog.exec()
 
+    def _get_project_short_name(self):
+        """Returns project number (e.g. 01) + first 10 chars of user's project name."""
+        pid = getattr(self.project_model, "project_id", "") or (self.project_path.name if self.project_path else "")
+        idx_val = getattr(self.project_model, "index", 0) if self.project_model else 0
+        col1 = (getattr(self.project_model, "col1_name", "") or "").strip() if self.project_model else ""
+        idx_str = f"{int(idx_val):02d}" if idx_val else "01"
+        if pid:
+            clean_pid = re.sub(r'-flow$', '', str(pid), flags=re.IGNORECASE)
+            m = re.match(r'^(\d+)(?:[_\-\s]+(.*))?$', clean_pid)
+            if m:
+                idx_str = m.group(1).zfill(2)
+                if not col1 and m.group(2):
+                    rest = m.group(2)
+                    col1 = rest.rsplit("_", 1)[0] if "_" in rest else rest
+        if col1.startswith(f"{idx_str}_"):
+            col1 = col1[len(idx_str) + 1:].strip()
+        short_user = col1[:10]
+        return f"{idx_str}_{short_user}" if short_user else idx_str
+
     def build_batches(self):
         """
         按积分上限把当前项目未完成的分句拆成批次（与「导出批量 JSON」完全同一套逻辑）。
@@ -2551,6 +2570,8 @@ class ProjectDetailWidget(QWidget):
             
         all_tasks = []
         skipped_copied_count = 0
+        project_id_str = getattr(self.project_model, "project_id", "") or (self.project_path.name if self.project_path else "")
+        project_short_str = self._get_project_short_name()
         
         videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
         for idx, seg in enumerate(segments):
@@ -2608,6 +2629,10 @@ class ProjectDetailWidget(QWidget):
             end_image_name, end_local_image_path, _ = self.resolve_segment_end_image_and_data(idx, seg)
 
             task_dict = {
+                "project_id": project_id_str,
+                "project_short": project_short_str,
+                "segment_index": idx + 1,
+                "segment_no": f"{idx+1:02d}",
                 "prompt": final_prompt,
                 "mode": mode,
                 "aspect_ratio": default_aspect,
@@ -2713,8 +2738,10 @@ class ProjectDetailWidget(QWidget):
                     break
                 
         # Sort tasks within each batch by their original chronological index for clear display
-        for batch in batches:
+        for batch_idx, batch in enumerate(batches):
             batch.sort(key=lambda t: t["_original_index"])
+            for t in batch:
+                t["batch_no"] = batch_idx + 1
             
         return {"batches": batches, "skipped": skipped_copied_count, "error": ""}
 
@@ -3090,7 +3117,13 @@ class ProjectDetailWidget(QWidget):
             download_name = f"{idx+1:02d}.mp4"
             download_path = str((videos_dir / download_name).resolve())
             
+            project_id_str = getattr(self.project_model, "project_id", "") or (self.project_path.name if self.project_path else "")
+            project_short_str = self._get_project_short_name()
             task_dict = {
+                "project_id": project_id_str,
+                "project_short": project_short_str,
+                "segment_index": idx + 1,
+                "segment_no": f"{idx+1:02d}",
                 "index": idx,
                 "prompt": final_prompt,
                 "mode": mode,

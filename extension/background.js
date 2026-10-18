@@ -257,10 +257,14 @@ async function dispatchNativeHover(tabId, x, y) {
 async function handleDownload(url, filename, task) {
   try {
     console.log(`[Background] 🎬 handleDownload 启动: URL=${url}, Filename=${filename}, task=`, task);
+    const isManual = !!(task && task.manual);
     // 规范化文件名中的斜杠，防止创建非法的多层级路径
-    if (!task?.mediaId || !task.submissionId || !task.taskId || !filename || filename !== task.download_path) {
+    if (!isManual && (!task?.mediaId || !task.submissionId || !task.taskId || !filename || filename !== task.download_path)) {
       console.error("[Background] ❌ 拒绝下载: 缺少媒体 ID 或任务文件名绑定", { task, filename });
       throw new Error("缺少媒体 ID 或任务文件名绑定，拒绝下载");
+    }
+    if (isManual && !filename) {
+      throw new Error("缺少目标文件名");
     }
     const parsed = new URL(url);
     const isVidsHost = (
@@ -280,7 +284,7 @@ async function handleDownload(url, filename, task) {
       throw new Error("下载域名不受信任，已安全拦截");
     }
 
-    if (parsed.hostname === "flow-content.google" && (!parsed.searchParams.get("Signature") || !parsed.searchParams.get("Expires"))) {
+    if (!isManual && parsed.hostname === "flow-content.google" && (!parsed.searchParams.get("Signature") || !parsed.searchParams.get("Expires"))) {
       console.error(`[Background] ❌ 拒绝下载: flow-content.google 视频直链缺少完整 CDN 签名参数 (Expires/Signature): ${url}`);
       throw new Error("视频直链缺少完整签名参数，等待有效签名直链");
     }
@@ -291,12 +295,18 @@ async function handleDownload(url, filename, task) {
       parsed.hostname === "labs.google" && parsed.pathname === "/fx/api/trpc/media.getMediaUrlRedirect" ?
         ((parsed.searchParams.get("name") || "").split("/media/").pop().replace(/^media\//, "")) :
       isVidsHost ? task.mediaId : null;
-    console.log(`[Background] URL 解析出的 mediaId: ${mediaId}, task.mediaId: ${task.mediaId}, isVidsHost: ${isVidsHost}`);
-    if (mediaId !== task.mediaId) {
+    console.log(`[Background] URL 解析出的 mediaId: ${mediaId}, task.mediaId: ${task?.mediaId}, isVidsHost: ${isVidsHost}, isManual: ${isManual}`);
+    if (!isManual && mediaId !== task.mediaId) {
       console.error(`[Background] ❌ 拒绝下载: 下载地址的媒体 ID (${mediaId}) 与任务 (${task.mediaId}) 不一致`);
       throw new Error("下载地址的媒体 ID 与任务不一致");
     }
-    const sanitizedFilename = filename.replace(/\\/g, "/").replace(/^\/+/, "");
+    const sanitizedFilename = filename
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "")
+      .split("/")
+      .map(part => part.replace(/[<>:"|?*\r\n\t]/g, "_").replace(/\.+$/, "").trim())
+      .filter(Boolean)
+      .join("/");
     if (sanitizedFilename.split("/").some(part => !part || part === "." || part === ".." || /[<>:"|?*]/.test(part))) {
       console.error(`[Background] ❌ 拒绝下载: 文件名包含非法字符: ${sanitizedFilename}`);
       throw new Error("下载文件名无效");
@@ -309,33 +319,43 @@ async function handleDownload(url, filename, task) {
     await chrome.storage.session.set({ [`filename_${url}`]: sanitizedFilename });
     console.log(`[Background] 🚀 开始调用 Chrome API 下载视频: URL=${url}, Filename=${sanitizedFilename}`);
     
-    return new Promise((resolve) => {
+    const tryChromeDownload = (targetFilename) => new Promise((resolve) => {
       chrome.downloads.download({
         url: url,
-        filename: sanitizedFilename,
+        filename: targetFilename,
         conflictAction: 'uniquify',
         saveAs: false
       }, async (downloadId) => {
         try {
-        if (chrome.runtime.lastError) {
-          console.error(`[Background] ❌ chrome.downloads.download 失败:`, chrome.runtime.lastError.message);
-          resolve({ error: chrome.runtime.lastError.message });
-        } else {
-          console.log(`[Background] ✅ chrome.downloads.download 已启动，分配 ID=${downloadId}`);
-          await chrome.storage.session.set({ [`download_${downloadId}`]: { ...task, filename: sanitizedFilename, url } });
-          resolve({ success: true, downloadId: downloadId });
-          // 下载可能在关联信息落盘之前就完成。
-          const items = await chrome.downloads.search({ id: downloadId });
-          if (items[0]?.state === "complete" || items[0]?.state === "interrupted") {
-            await notifyDownload(downloadId, items[0].state, items[0].error);
+          if (chrome.runtime.lastError) {
+            console.error(`[Background] ❌ chrome.downloads.download (${targetFilename}) 失败:`, chrome.runtime.lastError.message);
+            resolve({ error: chrome.runtime.lastError.message });
+          } else {
+            console.log(`[Background] ✅ chrome.downloads.download 已启动，分配 ID=${downloadId}, Filename=${targetFilename}`);
+            await chrome.storage.session.set({ [`download_${downloadId}`]: { ...task, filename: targetFilename, url } });
+            resolve({ success: true, downloadId: downloadId, filename: targetFilename });
+            // 下载可能在关联信息落盘之前就完成。
+            const items = await chrome.downloads.search({ id: downloadId });
+            if (items[0]?.state === "complete" || items[0]?.state === "interrupted") {
+              await notifyDownload(downloadId, items[0].state, items[0].error);
+            }
           }
-        }
         } catch (err) {
           console.error("[Background] 下载跟踪失败", err);
           resolve({ error: err.message });
         }
       });
     });
+
+    let res = await tryChromeDownload(sanitizedFilename);
+    // 如果部分多开浏览器因多级子目录限制导致下载失败，自动降级为单层文件名重命名下载
+    if (!res.success && sanitizedFilename.includes("/")) {
+      const flatName = task?.flatFilename || sanitizedFilename.split("/").pop();
+      console.warn(`[Background] ⚠️ 子目录下载失败，自动降级为单层文件名重试: ${flatName}`);
+      await chrome.storage.session.set({ [`filename_${url}`]: flatName });
+      res = await tryChromeDownload(flatName);
+    }
+    return res;
   } catch (e) {
     console.error(`[Background] 下载函数捕获到异常:`, e);
     return { error: e.message };
