@@ -20,9 +20,11 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from version import __version__, GITHUB_REPO
 
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+FALLBACK_EXT_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/FlowCue-Extension.7z"
 ALLOWED_DOWNLOAD_HOSTS = ("github.com", "objects.githubusercontent.com",
                           "release-assets.githubusercontent.com")
 SETUP_RE = re.compile(r"^FlowCue-Setup-.*\.exe$", re.IGNORECASE)
+EXT_RE = re.compile(r"^FlowCue-Extension.*\.(7z|zip)$", re.IGNORECASE)
 
 
 def parse_version(v):
@@ -46,12 +48,13 @@ def _host_allowed(url):
 
 
 class CheckUpdateThread(QThread):
-    """结果: finished_signal(dict) —— {ok, error, has_update, version, notes, url, size, name}"""
+    """结果: finished_signal(dict) —— {ok, error, has_update, version, notes, url, size, name, ext_url, ext_size, ext_name}"""
     finished_signal = pyqtSignal(dict)
 
     def run(self):
         res = {"ok": False, "error": "", "has_update": False, "version": "", "notes": "",
-               "url": "", "size": 0, "name": ""}
+               "url": "", "size": 0, "name": "",
+               "ext_url": FALLBACK_EXT_URL, "ext_size": 0, "ext_name": "FlowCue-Extension.7z"}
         try:
             r = requests.get(API_URL, timeout=15,
                              headers={"Accept": "application/vnd.github+json", "User-Agent": "FlowCue-Updater"})
@@ -64,9 +67,11 @@ class CheckUpdateThread(QThread):
                 tag = data.get("tag_name", "")
                 res.update(ok=True, version=tag.lstrip("vV"), notes=data.get("body") or "")
                 for a in data.get("assets", []):
-                    if SETUP_RE.match(a.get("name", "")):
-                        res.update(url=a.get("browser_download_url", ""), size=a.get("size", 0), name=a["name"])
-                        break
+                    aname = a.get("name", "")
+                    if SETUP_RE.match(aname) and not res["url"]:
+                        res.update(url=a.get("browser_download_url", ""), size=a.get("size", 0), name=aname)
+                    elif EXT_RE.match(aname):
+                        res.update(ext_url=a.get("browser_download_url", ""), ext_size=a.get("size", 0), ext_name=aname)
                 res["has_update"] = is_newer(tag) and bool(res["url"])
                 if is_newer(tag) and not res["url"]:
                     res["error"] = "发现新版本，但发布页没有安装包（FlowCue-Setup-*.exe）。"
@@ -79,17 +84,22 @@ class DownloadUpdateThread(QThread):
     progress_signal = pyqtSignal(int, int)      # downloaded, total
     finished_signal = pyqtSignal(bool, str)     # success, path_or_error
 
-    def __init__(self, url, name, expected_size=0):
+    def __init__(self, url, name, expected_size=0, dest_path=None):
         super().__init__()
         self.url, self.name, self.expected_size = url, name, expected_size
+        self.dest_path = dest_path
 
     def run(self):
         if not _host_allowed(self.url):
             self.finished_signal.emit(False, "下载地址不在允许的域名范围内，已拒绝。")
             return
-        dest_dir = os.path.join(tempfile.gettempdir(), "FlowCue_update")
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, os.path.basename(self.name))
+        if self.dest_path:
+            dest = self.dest_path
+            os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        else:
+            dest_dir = os.path.join(tempfile.gettempdir(), "FlowCue_update")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, os.path.basename(self.name))
         part = dest + ".part"
         try:
             with requests.get(self.url, stream=True, timeout=30,
