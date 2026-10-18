@@ -730,11 +730,16 @@ class TemplateConfigDialog(QDialog):
             
         item = self.list_batch.item(row)
         bt_id = item.data(Qt.ItemDataRole.UserRole)
+        matched = False
         for t in self.tm.batch_templates:
             if t.get("id") == bt_id:
                 t["name"] = name
                 t["content"] = self.txt_batch_content.toPlainText()
+                matched = True
                 break
+        if not matched and row < len(self.tm.batch_templates):
+            self.tm.batch_templates[row]["name"] = name
+            self.tm.batch_templates[row]["content"] = self.txt_batch_content.toPlainText()
         if self.tm.save_batch_templates():
             item.setText(name)
             QMessageBox.information(self, "成功", "批量模板已保存！")

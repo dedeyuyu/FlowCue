@@ -234,7 +234,8 @@ class TemplateManager:
         try:
             data = {
                 "templates": self.templates,
-                "motions": self.motions
+                "motions": self.motions,
+                "batch_templates": self.batch_templates,
             }
             with open(export_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
@@ -252,6 +253,9 @@ class TemplateManager:
                 self.templates = data["templates"]
             if "motions" in data and isinstance(data["motions"], list):
                 self.motions = data["motions"]
+            if "batch_templates" in data and isinstance(data["batch_templates"], list):
+                self.batch_templates = data["batch_templates"]
+                self.save_batch_templates()
                 
             self.save_templates()
             self.save_motions()
@@ -278,8 +282,10 @@ class TemplateManager:
             import json
             with open(self.batch_templates_path, 'w', encoding='utf-8') as f:
                 json.dump(self.batch_templates, f, ensure_ascii=False, indent=2)
+            return True
         except Exception as e:
             print(f'Error saving batch templates: {e}')
+            return False
 
     def init_default_batch_templates(self):
         self.batch_templates = [
