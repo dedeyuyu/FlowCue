@@ -7,6 +7,9 @@ from PyQt6.QtNetwork import QHostAddress
 
 logger = logging.getLogger(__name__)
 
+import threading as _threading
+_PROFILE_SEM = _threading.Semaphore(4)  # 同时最多 4 个进程信息查询（netstat / PowerShell）
+
 class PluginServer(QObject):
     """
     WebSocket server for managing multi-browser extension connections and real-time task dispatching.
@@ -140,9 +143,13 @@ class PluginServer(QObject):
             try:
                 if not port_val:
                     return
-                from services.browser_closer import get_browser_profile_by_port
-                prof = get_browser_profile_by_port(port_val)
-                client_info["profile"] = prof
+                from services.browser_closer import get_browser_info_by_port
+                with _PROFILE_SEM:
+                    binfo = get_browser_info_by_port(port_val)
+                client_info["profile"] = binfo.get("profile", "")
+                client_info["browser_pid"] = binfo.get("main_pid")
+                client_info["browser_exe"] = binfo.get("exe", "")
+                client_info["user_data_dir"] = binfo.get("user_data_dir", "")
                 self.client_updated_signal.emit(client_info)
             except Exception as e:
                 logger.error(f"Failed to fetch profile: {e}")
@@ -175,6 +182,16 @@ class PluginServer(QObject):
                     self.client_disconnected_signal.emit(client_id)
                 except Exception:
                     pass
+                # 同一浏览器的另一个标签页接替主 ID
+                iid = info.get("instance_id")
+                if iid and client_id == iid:
+                    for other in self.clients.values():
+                        if other.get("instance_id") == iid:
+                            other["client_id"] = iid
+                            other["secondary_tab"] = False
+                            logger.info(f"浏览器 {iid} 的另一个标签页已接替主连接")
+                            self.client_updated_signal.emit(other)
+                            break
         except Exception:
             pass
 
@@ -213,17 +230,48 @@ class PluginServer(QObject):
                     pass
             data_obj = msg.get("data") if isinstance(msg.get("data"), dict) else {}
             
-            raw_email = msg.get("email") or data_obj.get("email") or ""
+            raw_email = (msg.get("email") or data_obj.get("email") or "").strip().lower()
             raw_name = msg.get("name") or data_obj.get("name") or ""
             raw_client_id = msg.get("client_id") or data_obj.get("client_id") or ""
-            
-            # 为每个独立的 socket 分配唯一且可读的 ID，支持同账号多开窗口以及多账号同时并发
-            socket_suffix = abs(id(socket)) % 10000
-            if raw_email:
-                info["email"] = raw_email
-                info["client_id"] = f"{raw_email} (W#{socket_suffix})"
-            elif raw_client_id:
-                info["client_id"] = f"{raw_client_id}_{socket_suffix}" if not raw_client_id.endswith(str(socket_suffix)) else raw_client_id
+
+            # —— 浏览器唯一 ID（插件生成并永久保存，优先使用）——
+            iid = (msg.get("instance_id") or data_obj.get("instance_id") or "").strip()
+            if iid:
+                if "instance_name" in msg:
+                    info["instance_name"] = (msg.get("instance_name") or "").strip()
+                if info.get("instance_id") != iid:
+                    sess = (msg.get("browser_session") or "").strip()
+                    others = [i for s, i in self.clients.items() if s is not socket and i.get("instance_id") == iid]
+                    if others and sess and all(o.get("browser_session") and o.get("browser_session") != sess for o in others):
+                        # 同一个 ID 出现在另一个正在运行的浏览器里 → 浏览器配置是复制出来的，让新连接的这个重新生成 ID
+                        logger.warning(f"⚠️ 浏览器 ID 重复 {iid}（配置被复制），要求新连接重新生成 ID")
+                        try:
+                            socket.sendTextMessage(json.dumps({"action": "reset_instance_id", "request_id": "", "params": {}}))
+                        except Exception:
+                            pass
+                        return
+                    info["instance_id"] = iid
+                    info["browser_session"] = sess
+                    if others:
+                        n = 2
+                        used = {o.get("client_id") for o in others}
+                        while f"{iid}#{n}" in used:
+                            n += 1
+                        info["client_id"] = f"{iid}#{n}"
+                        info["secondary_tab"] = True
+                    else:
+                        info["client_id"] = iid
+                        info["secondary_tab"] = False
+                if raw_email:
+                    info["email"] = raw_email
+            else:
+                # 旧版插件（没有唯一 ID）：沿用邮箱 / 随机 ID 识别
+                socket_suffix = abs(id(socket)) % 10000
+                if raw_email:
+                    info["email"] = raw_email
+                    info["client_id"] = f"{raw_email} (W#{socket_suffix})"
+                elif raw_client_id:
+                    info["client_id"] = f"{raw_client_id}_{socket_suffix}" if not raw_client_id.endswith(str(socket_suffix)) else raw_client_id
 
             if raw_name:
                 info["name"] = raw_name
@@ -462,3 +510,54 @@ class PluginServer(QObject):
                 except Exception:
                     pass
         return None
+
+    def get_client(self, client_id):
+        for info in self.clients.values():
+            if info.get("client_id") == client_id:
+                return info
+        return None
+
+    def locate_client(self, client_id, seconds=10):
+        """
+        定位浏览器：
+        1) 插件端：激活该标签页、窗口切到前台、页面显示红色横幅、标题闪烁 📍
+        2) 系统端：按浏览器主进程 PID 找到窗口（优先标题含浏览器 ID 的窗口）并强制置顶
+        返回 (ok, message)
+        """
+        info = self.get_client(client_id)
+        if not info:
+            return False, "浏览器未连接"
+        self.send_rpc_action(client_id, "locate_browser", {"seconds": seconds})
+
+        def os_focus():
+            try:
+                from services import browser_closer as bc
+                pid = info.get("browser_pid")
+                iid = info.get("instance_id") or ""
+                target = None
+                if iid:
+                    # 标题里带有 [FC-XXXXX] 徽标的窗口 = 精确目标（插件已先把 Flow 标签页切为当前标签）
+                    tagged = bc.find_windows_by_title_token(f"[{iid}")
+                    if tagged:
+                        target = tagged[0]
+                if target is None and pid:
+                    # 多个配置共用一个浏览器进程时无法区分窗口，只在该进程只有 1 个窗口时才用 PID 兜底
+                    wins = bc.find_windows_by_pid(pid)
+                    if len(wins) == 1:
+                        target = wins[0]
+                if target is not None:
+                    bc.bring_window_to_front(target)
+            except Exception as e:
+                logger.warning(f"定位浏览器窗口失败: {e}")
+
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(700, os_focus)
+        prof = info.get("profile") or ""
+        return True, f"已发送定位指令{('（' + prof + '）') if prof else ''}，该浏览器窗口会切到最前并显示红色横幅"
+
+    def set_instance_name(self, client_id, name):
+        info = self.get_client(client_id)
+        if info is not None:
+            info["instance_name"] = (name or "").strip()
+            self.client_updated_signal.emit(info)
+        return self.send_rpc_action(client_id, "set_instance_name", {"name": name or ""})

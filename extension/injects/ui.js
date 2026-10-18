@@ -581,7 +581,7 @@
     safeOn("btn-copy-report", "click", () => copyExecutionReport());
     safeOn("btn-upload-local", "click", () => {
       if (batchPromise) { showToast("请先停止队列，再手动上传图片"); return; }
-      uploadLocalImagesToFlow();
+      uploadLocalImagesToFlow({ respectRegistry: false });
     });
     
     safeOn("btn-alarm-manual", "click", () => pauseAlarmCountdown());
@@ -1206,7 +1206,11 @@
     if (a === b) return true;
     // Flow 卡片名称可能被截断：较长的一方以较短一方开头，且较短一方足够长
     const [s, l] = a.length <= b.length ? [a, b] : [b, a];
-    return s.length >= 12 && l.startsWith(s);
+    if (!(s.length >= 12 && l.startsWith(s))) return false;
+    // 同一项目的图片名前缀几乎相同（只差结尾编号），结尾编号必须一致，否则会把 01 误判成 02
+    const tailA = (a.match(/(\d+)$/) || [])[1] || "";
+    const tailB = (b.match(/(\d+)$/) || [])[1] || "";
+    return !!tailA && tailA === tailB;
   }
 
   function getTaskUploadName(task) {
@@ -1218,9 +1222,87 @@
     return pageImages.find(img => names.some(n => isStrictImageMatch(n, img.displayName))) || null;
   }
 
+  // ----------------------------------------------------
+  // 上传登记表（防重复上传）
+  //   问题：部分浏览器 / 英文界面下 Flow 素材卡片不显示文件名，按名称比对永远找不到，
+  //        于是「托管上传 → 重新上传失败 → 生成前自动补传」会把同一张图拖进去 2~3 次。
+  //   方案：按「项目 ID + 本地路径」登记每次拖放；
+  //        confirmed = 已确认进入 Flow，之后不再重复拖放；
+  //        pending   = 已拖放但未按名称确认，只要页面图片数达到拖放时的预期数量就视为已到达。
+  // ----------------------------------------------------
+  const UPLOAD_REGISTRY_KEY = "flowcue_upload_registry_v1";
+  const UPLOAD_REGISTRY_TTL_MS = 12 * 60 * 60 * 1000;
+
+  function getProjectKey() {
+    const m = location.pathname.match(/\/project\/([^/?#]+)/);
+    return m ? m[1] : "";
+  }
+  function readUploadRegistry() {
+    try { return JSON.parse(localStorage.getItem(UPLOAD_REGISTRY_KEY) || "{}") || {}; } catch (_) { return {}; }
+  }
+  function writeUploadRegistry(reg) {
+    try { localStorage.setItem(UPLOAD_REGISTRY_KEY, JSON.stringify(reg)); } catch (_) {}
+  }
+  function getProjectUploadEntries() {
+    const pk = getProjectKey();
+    if (!pk) return {};
+    const reg = readUploadRegistry();
+    const proj = reg[pk] || {};
+    const now = Date.now();
+    let changed = false;
+    Object.keys(proj).forEach(k => { if (!proj[k] || now - (proj[k].t || 0) > UPLOAD_REGISTRY_TTL_MS) { delete proj[k]; changed = true; } });
+    if (changed) { reg[pk] = proj; writeUploadRegistry(reg); }
+    return proj;
+  }
+  function registerUploads(paths, info) {
+    const pk = getProjectKey();
+    if (!pk || !paths || !paths.length) return;
+    const reg = readUploadRegistry();
+    const proj = reg[pk] || {};
+    const now = Date.now();
+    paths.forEach(p => {
+      const k = String(p || "").trim().toLowerCase();
+      if (!k) return;
+      if (info.state === "pending" && proj[k] && proj[k].state === "confirmed") return; // 不降级
+      proj[k] = { ...info, t: now };
+    });
+    reg[pk] = proj;
+    writeUploadRegistry(reg);
+  }
+  function clearProjectUploadRegistry() {
+    const pk = getProjectKey();
+    if (!pk) return;
+    const reg = readUploadRegistry();
+    delete reg[pk];
+    writeUploadRegistry(reg);
+  }
+  // 登记表判断该路径是否已经在 Flow 中（无法按名称确认时的兜底）
+  function isRegisteredInFlow(path, currentCount, entries) {
+    const e = (entries || getProjectUploadEntries())[String(path || "").trim().toLowerCase()];
+    if (!e) return false;
+    if (e.state === "confirmed") return currentCount > 0; // 页面媒体被清空后允许重新上传
+    return false; // pending：拖放过但未确认，不能当作已上传
+  }
+
+  // 图块稳定标识（优先媒体 ID / 链接中的 UUID），用于判断「拖放后真正新增了几张图」
+  function imageStableKey(img) {
+    if (img.id && !String(img.id).startsWith("img_")) return String(img.id);
+    const s = String(img.src || "");
+    const m = s.match(/name=([0-9a-zA-Z_-]+)/) || s.match(/\/([0-9a-fA-F-]{36})/);
+    return m ? m[1] : s.split("?")[0];
+  }
+  function snapshotImageKeys(imgs) { return new Set(imgs.map(imageStableKey)); }
+  // 只有「新出现的图块数」和「图块总数增量」都 ≥ 拖放数量时才算数量确认（防止懒加载/重渲染造成假成功）
+  function newTilesConfirmed(beforeKeys, beforeLen, imgs, dispatchedCount) {
+    const fresh = imgs.filter(i => !beforeKeys.has(imageStableKey(i))).length;
+    return dispatchedCount > 0 && fresh >= dispatchedCount && (imgs.length - beforeLen) >= dispatchedCount;
+  }
+
   // 找出「有本地路径但 Flow 页面中还没有」的任务
-  function getTasksNeedingUpload(rowFilter = null) {
+  // respectRegistry=true 时，会跳过之前已拖放过且已到达的图片（自动/托管流程使用，防止重复上传）
+  function getTasksNeedingUpload(rowFilter = null, { respectRegistry = true } = {}) {
     const pageImages = getLoadedPageImages();
+    const regEntries = respectRegistry ? getProjectUploadEntries() : {};
     const out = [];
     state.tasks.forEach((task, idx) => {
       if (rowFilter !== null && idx !== rowFilter) return;
@@ -1229,6 +1311,10 @@
       const path = task.image?.localImagePath || task.local_image_path || "";
       if (!path || !/^([a-zA-Z]:[\\/]|\/|\\\\)/.test(path)) return; // 必须是绝对路径
       if (findStrictPageImage(task, pageImages)) return;
+      if (respectRegistry && isRegisteredInFlow(path, pageImages.length, regEntries)) {
+        console.log(`[FlowUpload] 登记表显示已上传过，跳过重复拖放: ${path}`);
+        return;
+      }
       out.push({ idx, task, path, name: getTaskUploadName(task) });
     });
     // 同一张图被多个任务使用时只上传一次
@@ -1294,13 +1380,13 @@
    * 把缺失的本地图片批量上传到当前 Flow 项目，并等待素材出现在页面中。
    * @returns {Promise<{ok:boolean, uploaded:number, missing:string[]}>}
    */
-  async function uploadLocalImagesToFlow({ rowFilter = null, silent = false } = {}) {
+  async function uploadLocalImagesToFlow({ rowFilter = null, silent = false, respectRegistry = true } = {}) {
     if (uploadInFlight) { showToast("图片正在上传中，请稍候..."); return { ok: false, uploaded: 0, missing: [] }; }
     if (!location.href.includes("/project/")) {
       showToast("请先进入具体的 Flow 项目页面再上传图片", 5000);
       return { ok: false, uploaded: 0, missing: [] };
     }
-    const pending = getTasksNeedingUpload(rowFilter);
+    const pending = getTasksNeedingUpload(rowFilter, { respectRegistry });
     if (!pending.length) {
       if (!silent) showToast("所有任务图片都已在 Flow 中，无需上传");
       return { ok: true, uploaded: 0, missing: [] };
@@ -1313,6 +1399,10 @@
       showToast(`📤 正在把 ${pending.length} 张本地图片上传到 Flow...`, 4000);
       setOverlayHiddenForUpload(true);
       await delay(250);
+
+      const beforeImgs = getLoadedPageImages();
+      const beforeKeys = snapshotImageKeys(beforeImgs);
+      let droppedCount = 0;
 
       // 1) 分批原生拖放
       for (let i = 0; i < pending.length; i += UPLOAD_BATCH_SIZE) {
@@ -1327,10 +1417,12 @@
           showToast(`❌ 图片上传失败：${err}\n（如提示 debugger 权限，请在扩展管理页重新加载插件）`, 8000);
           return { ok: false, uploaded: 0, missing: pending.map(p => p.name) };
         }
+        droppedCount += chunk.length;
+        registerUploads(chunk.map(c => c.path), { state: "pending", expect: beforeImgs.length + droppedCount });
         await delay(1500);
       }
 
-      // 2) 轮询 Flow 素材网格，直到全部图片出现
+      // 2) 轮询 Flow 素材网格，直到全部图片出现（按文件名 或 按新增图块数量 确认）
       const start = Date.now();
       let remaining = pending;
       while (Date.now() - start < UPLOAD_CONFIRM_TIMEOUT_MS) {
@@ -1338,9 +1430,15 @@
         await delay(2000);
         const pageImages = getLoadedPageImages();
         remaining = pending.filter(p => !findStrictPageImage(p.task, pageImages));
+        if (remaining.length && newTilesConfirmed(beforeKeys, beforeImgs.length, pageImages, droppedCount)) {
+          console.log(`[FlowUpload] 无法按文件名确认 ${remaining.length} 张，但新出现的图块数 ≥ 拖放 ${droppedCount}，视为已全部到达`);
+          remaining = [];
+        }
         showToast(`📤 Flow 已接收 ${pending.length - remaining.length}/${pending.length} 张图片...`, 2200);
         if (!remaining.length) break;
       }
+      const remainingSet = new Set(remaining.map(r => r.path));
+      registerUploads(pending.filter(p => !remainingSet.has(p.path)).map(p => p.path), { state: "confirmed" });
       // 给 Flow 一点时间完成缩略图/媒体处理
       if (!remaining.length) await delay(2500);
 
@@ -1391,34 +1489,59 @@
     uploadInFlight = true;
     try {
       let imgs = getLoadedPageImages();
+      const regEntries = getProjectUploadEntries();
       const todo = [];
-      clean.forEach(p => (isPresent(p, imgs) ? result.skipped.push(p) : todo.push(p)));
+      result.verify = {};
+      result.page_images_before = imgs.length;
+      clean.forEach(p => {
+        if (isPresent(p, imgs)) { result.skipped.push(p); result.verify[p] = "name"; return; }
+        if (isRegisteredInFlow(p, imgs.length, regEntries)) {
+          console.log(`[FlowUpload] 托管上传：登记表显示本浏览器已确认上传过，跳过重复拖放: ${p}`);
+          result.skipped.push(p);
+          result.verify[p] = "registry";
+          return;
+        }
+        todo.push(p);
+      });
       if (!todo.length) return result;
 
       setOverlayHiddenForUpload(true);
       await delay(250);
+      const beforeCount = imgs.length;
+      const beforeKeys = snapshotImageKeys(imgs);
       const dispatched = [];
       for (let i = 0; i < todo.length; i += UPLOAD_BATCH_SIZE) {
         const chunk = todo.slice(i, i + UPLOAD_BATCH_SIZE);
         const pt = findFlowDropPoint();
         const res = await sendToExtension("nativeFileDrag", { paths: chunk, x: pt.x, y: pt.y });
         if (!res || res.ok === false || res.error) failAll(chunk, "拖放失败：" + (res?.error || "未知错误"));
-        else dispatched.push(...chunk);
+        else {
+          dispatched.push(...chunk);
+          registerUploads(chunk, { state: "pending" });
+        }
         await delay(1500);
       }
 
-      // 轮询确认
+      // 轮询确认（按文件名，或按「新出现的图块」数量兜底：部分浏览器/英文界面读不到卡片文件名）
       const start = Date.now();
       let waiting = dispatched.slice();
+      let countConfirmed = false;
       while (waiting.length && Date.now() - start < timeoutMs) {
         await delay(2000);
         imgs = getLoadedPageImages();
         waiting = waiting.filter(p => !isPresent(p, imgs));
+        if (waiting.length && newTilesConfirmed(beforeKeys, beforeCount, imgs, dispatched.length)) {
+          console.log(`[FlowUpload] 托管上传：新出现的图块 ≥ 拖放 ${dispatched.length}，视为已全部到达`);
+          countConfirmed = true;
+          break;
+        }
       }
       dispatched.forEach(p => {
-        if (waiting.includes(p)) { result.failed.push(p); result.errors[p] = "Flow 未确认收到该图片（超时）"; }
-        else result.uploaded.push(p);
+        if (!countConfirmed && waiting.includes(p)) { result.failed.push(p); result.errors[p] = "Flow 页面中没有出现这张图片（超时）"; }
+        else { result.uploaded.push(p); result.verify[p] = waiting.includes(p) ? "count" : "name"; }
       });
+      result.page_images_after = imgs.length;
+      registerUploads(result.uploaded, { state: "confirmed" });
       if (result.uploaded.length) await delay(2000);
       return result;
     } finally {
@@ -5681,7 +5804,7 @@ ${presetAfter || ""}`.trim();
     if (match) return match[1];
 
     if (document.title) {
-      const t = document.title.replace(/ - Google Flow.*/i, "").trim();
+      const t = document.title.replace(/^\[FLOWCLOSE-[^\]]*\]\s*/, "").replace(/^📍+\s*/, "").replace(/^\[FC-[0-9A-Z]{4,8}[^\]]*\]\s*/, "").replace(/ - Google Flow.*/i, "").trim();
       if (t && !t.includes("Google Flow")) return t;
     }
 
@@ -5949,25 +6072,110 @@ ${presetAfter || ""}`.trim();
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const EMAIL_RE = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
 
+    // ===== 浏览器唯一身份（由插件后台生成并永久保存在本浏览器配置中）=====
+    let identity = { instance_id: "", instance_name: "", browser_session: "" };
+    async function loadIdentity() {
+      for (let i = 0; i < 2 && !identity.instance_id; i++) {
+        const r = await Promise.race([sendToExtension("getInstanceInfo", {}), sleep(5000).then(() => null)]);
+        if (r && r.instance_id) {
+          identity = { instance_id: r.instance_id, instance_name: r.instance_name || "", browser_session: r.browser_session || "" };
+          break;
+        }
+        await sleep(1000);
+      }
+      if (identity.instance_id) log("本浏览器唯一 ID:", identity.instance_id, identity.instance_name || "");
+      else log("⚠️ 未能获取浏览器唯一 ID（插件后台可能未更新，请在扩展管理页刷新插件）");
+      applyTitleBadge();
+      return identity;
+    }
+    function identityFields() {
+      return { instance_id: identity.instance_id, instance_name: identity.instance_name, browser_session: identity.browser_session };
+    }
+
+    // 在窗口标题前加上 [FC-XXXXX 名称]，多开 100+ 个浏览器时可在任务栏 / Alt+Tab 中直接看到是哪一个
+    const TITLE_BADGE_RE = /^\[FC-[0-9A-Z]{4,8}[^\]]*\]\s*/;
+    const CLOSE_MARK_RE = /^\[FLOWCLOSE-[^\]]*\]\s*/;
+    let locateFlashUntil = 0;
+    function applyTitleBadge() {
+      if (!identity.instance_id) return;
+      try {
+        const cur = document.title || "";
+        const closeMark = (cur.match(CLOSE_MARK_RE) || [""])[0];
+        let rest = cur.replace(CLOSE_MARK_RE, "").replace(/^📍+\s*/, "").replace(TITLE_BADGE_RE, "");
+        const pin = Date.now() < locateFlashUntil ? "📍📍📍 " : "";
+        const badge = `[${identity.instance_id}${identity.instance_name ? " " + identity.instance_name : ""}] `;
+        const want = closeMark + pin + badge + rest;
+        if (cur !== want) document.title = want;
+      } catch (_) {}
+    }
+    setInterval(applyTitleBadge, 1500);
+
+    // 在页面上显示醒目的定位横幅
+    function showLocateBanner(seconds) {
+      try {
+        const old = document.getElementById("flowcue-locate-banner");
+        if (old) old.remove();
+        const el = document.createElement("div");
+        el.id = "flowcue-locate-banner";
+        el.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:2147483647;padding:22px 10px;text-align:center;" +
+          "font:bold 28px/1.4 system-ui,sans-serif;color:#fff;background:linear-gradient(90deg,#dc2626,#f59e0b,#dc2626);" +
+          "box-shadow:0 6px 30px rgba(0,0,0,.6);pointer-events:none;";
+        el.textContent = `📍 FlowCue 正在定位这个浏览器：${identity.instance_id}${identity.instance_name ? "（" + identity.instance_name + "）" : ""}${cachedEmail ? "  ·  " + cachedEmail : ""}`;
+        (document.body || document.documentElement).appendChild(el);
+        let on = true;
+        const iv = setInterval(() => { on = !on; el.style.opacity = on ? "1" : "0.55"; }, 400);
+        setTimeout(() => { clearInterval(iv); el.remove(); }, seconds * 1000);
+      } catch (_) {}
+    }
+
+    // 精确提取邮箱：
+    //   旧做法对整块 textContent 做正则，显示名与邮箱紧挨在一起时会把名字拼进邮箱（多字母），
+    //   或卡片被截断时少字母。现改为：优先找「整段文本恰好就是一个邮箱」的元素，其次找「(邮箱)」格式。
+    const EXACT_EMAIL_RE = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$/;
+    function exactEmailIn(root) {
+      if (!root) return "";
+      try {
+        const nodes = root.querySelectorAll("*");
+        for (const el of nodes) {
+          if (el.children.length) continue;
+          const t = (el.textContent || "").trim();
+          if (t.length <= 254 && EXACT_EMAIL_RE.test(t)) return t.toLowerCase();
+        }
+      } catch (_) {}
+      return "";
+    }
+    function emailFromAttr(raw) {
+      if (!raw) return "";
+      const paren = raw.match(/[(（<]\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*[)）>]/);
+      if (paren) return paren[1].toLowerCase();
+      // 邮箱前后必须是空白/冒号/行首尾，避免把显示名拼进来
+      const iso = raw.match(/(?:^|[\s:：,，])([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?=$|[\s,，)）])/);
+      return iso ? iso[1].toLowerCase() : "";
+    }
+
     function readEmailCheap() {
       if (cachedEmail) return cachedEmail;
       try {
         // Google Vids 页面在 head meta[name="og-profile-acct"] 中直接带有登录邮箱
         const metaAcct = document.querySelector('meta[name="og-profile-acct"]');
         if (metaAcct && metaAcct.content) {
-          const m = metaAcct.content.match(EMAIL_RE);
-          if (m) return (cachedEmail = m[1]);
+          const m = metaAcct.content.trim().match(EXACT_EMAIL_RE) ? metaAcct.content.trim() : emailFromAttr(metaAcct.content);
+          if (m) return (cachedEmail = m.toLowerCase());
         }
         const panel = document.querySelector("flow-account-panel, .flow-account-panel-overlay, .cdk-overlay-pane");
-        if (panel) {
-          const m = (panel.textContent || "").match(EMAIL_RE);
-          if (m) return (cachedEmail = m[1]);
-        }
+        const exact = exactEmailIn(panel);
+        if (exact) return (cachedEmail = exact);
         const els = document.querySelectorAll("[aria-label*='@'], [title*='@'], [data-email*='@']");
         for (const el of els) {
-          const raw = (el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("data-email") || "");
-          const m = raw.match(EMAIL_RE);
-          if (m) return (cachedEmail = m[1]);
+          const de = (el.getAttribute("data-email") || "").trim();
+          if (EXACT_EMAIL_RE.test(de)) return (cachedEmail = de.toLowerCase());
+          const m = emailFromAttr(el.getAttribute("aria-label") || el.getAttribute("title") || "");
+          if (m) return (cachedEmail = m);
+        }
+        // 最后兜底（不缓存，后续精确读取到时会覆盖）
+        if (panel) {
+          const loose = (panel.textContent || "").match(EMAIL_RE);
+          if (loose) return loose[1].toLowerCase();
         }
       } catch (e) {}
       return "";
@@ -6039,8 +6247,8 @@ ${presetAfter || ""}`.trim();
       }
       const panel = document.querySelector("flow-account-panel, .flow-account-panel-overlay, .cdk-overlay-pane");
       if (panel) {
-        const m = (panel.textContent || "").match(EMAIL_RE);
-        if (m) cachedEmail = m[1];
+        const exact = exactEmailIn(panel);
+        if (exact) cachedEmail = exact;
       }
       // 关闭菜单
       await sleep(100);
@@ -6131,13 +6339,17 @@ ${presetAfter || ""}`.trim();
         after = countMediaTiles();
       }
       log(`清空媒体: 删除前 ${before} 个, 删除后 ${after} 个, 确认框=${confirmed}`);
+      if (after < before) { try { clearProjectUploadRegistry(); } catch (_) {} }
       return { success: after < before, before, after, confirmed,
                error: after >= before ? "模拟 Ctrl+A / Delete 未生效" : "" };
     }
 
     function send(obj) {
       try {
-        if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(obj));
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          if (identity.instance_id && obj && typeof obj === "object" && !obj.instance_id) Object.assign(obj, identityFields());
+          socket.send(JSON.stringify(obj));
+        }
       } catch (e) {}
     }
 
@@ -6158,11 +6370,47 @@ ${presetAfter || ""}`.trim();
         confirmHandshake(wsUrl);
         if (action === "server_hello" || action === "pong") return;
       }
-      if (["ping", "get_points", "clear_tasks", "clear_media", "upload_images", "run_tasks", "stop_tasks", "close_browser"].includes(action)) {
+      if (["ping", "get_points", "clear_tasks", "clear_media", "upload_images", "run_tasks", "stop_tasks", "close_browser",
+           "locate_browser", "set_instance_name", "reset_instance_id"].includes(action)) {
         confirmHandshake(wsUrl);
       }
 
       if (action === "ping") { send({ type: "pong" }); return; }
+
+      // ===== 定位浏览器：窗口切到最前 + 页面横幅 + 标题闪烁 =====
+      if (action === "locate_browser") {
+        const secs = Math.max(3, Math.min(30, Number((msg.params || {}).seconds) || 10));
+        locateFlashUntil = Date.now() + secs * 1000;
+        applyTitleBadge();
+        showLocateBanner(secs);
+        const r = await sendToExtension("focusMyTab", {});
+        setTimeout(applyTitleBadge, secs * 1000 + 100);
+        send({ action: "locate_browser_response", request_id: msg.request_id, success: true, client_id: clientId,
+               data: { focused: !!(r && r.ok), error: (r && r.error) || "" } });
+        return;
+      }
+
+      if (action === "set_instance_name") {
+        const name = String((msg.params || {}).name || "");
+        const r = await sendToExtension("setInstanceName", { name });
+        if (r && r.instance_id) identity.instance_name = r.instance_name || "";
+        applyTitleBadge();
+        send({ action: "set_instance_name_response", request_id: msg.request_id, success: !!(r && r.instance_id), client_id: clientId });
+        send({ type: "online", client_id: clientId, email: readEmailCheap(), url: location.href });
+        return;
+      }
+
+      // 桌面软件检测到 ID 重复（浏览器配置被复制）时，要求本浏览器重新生成 ID 并重连
+      if (action === "reset_instance_id") {
+        const r = await sendToExtension("resetInstanceId", {});
+        if (r && r.instance_id) {
+          log("已重新生成浏览器唯一 ID:", identity.instance_id, "→", r.instance_id);
+          identity = { instance_id: r.instance_id, instance_name: r.instance_name || "", browser_session: r.browser_session || "" };
+          applyTitleBadge();
+        }
+        try { socket && socket.close(); } catch (_) {}
+        return;
+      }
 
       if (action === "get_points") {
         const pts = await probePoints();
@@ -6324,6 +6572,13 @@ ${presetAfter || ""}`.trim();
         if (socket !== currentSocket) return;
         send({ type: "online", client_id: clientId, email: readEmailCheap(), url: location.href });
         send({ type: "ping", client_id: clientId });
+        if (!identity.instance_id) {
+          loadIdentity().then(() => {
+            if (identity.instance_id && socket === currentSocket && currentSocket.readyState === WebSocket.OPEN) {
+              send({ type: "online", client_id: clientId, email: readEmailCheap(), url: location.href });
+            }
+          });
+        }
         // 2.5秒握手验证：若多开浏览器的本地代理劫持了 127.0.0.1（假连接成功但未到达 FlowCue），立即切换至 localhost / [::1] / 备用端口
         handshakeTimer = setTimeout(() => {
           if (socket === currentSocket && !handshakeVerified) {
@@ -6381,8 +6636,8 @@ ${presetAfter || ""}`.trim();
       }
     }
 
-    // 页面加载完成后再连接，避免影响页面初始化
-    setTimeout(connect, 2000);
+    // 页面加载完成后再连接，避免影响页面初始化；连接前先取到本浏览器的唯一 ID
+    setTimeout(() => { loadIdentity().finally(connect); }, 1500);
   })();
 
 })();

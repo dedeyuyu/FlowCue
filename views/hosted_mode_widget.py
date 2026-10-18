@@ -259,16 +259,43 @@ class HostedModeWidget(QWidget):
 
         # 表格
         split = QSplitter(Qt.Orientation.Vertical)
-        self.tbl_browsers = QTableWidget(0, 7)
-        self.tbl_browsers.setHorizontalHeaderLabels(["状态标记", "账号", "备注", "积分", "分配批次", "计划消耗 / 剩余", "进度"])
-        self._setup_table(self.tbl_browsers, stretch_cols=(1, 4, 6))
-        split.addWidget(self.tbl_browsers)
+
+        bw = QWidget()
+        bl = QVBoxLayout(bw)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(4)
+        tool = QHBoxLayout()
+        self.btn_locate = self._btn("📍 定位选中的浏览器", "#B45309", "#92400E")
+        self.btn_locate.setToolTip("把选中的浏览器窗口切到最前面，并在页面上显示红色横幅（也可以直接双击表格中的行）")
+        self.btn_locate.clicked.connect(self.on_locate_selected)
+        tool.addWidget(self.btn_locate)
+        self.btn_locate_failed = self._btn("📍 逐个定位上传失败的浏览器", "#DC2626", "#B91C1C")
+        self.btn_locate_failed.setToolTip("每点一次，切换到下一个有上传失败图片的浏览器")
+        self.btn_locate_failed.clicked.connect(self.on_locate_next_failed)
+        tool.addWidget(self.btn_locate_failed)
+        self.btn_rename = self._btn("✏️ 设置浏览器备注", "#4B5563", "#374151")
+        self.btn_rename.setToolTip("给选中的浏览器起个名字（如 Brave-037），会同步显示在该浏览器的窗口标题上")
+        self.btn_rename.clicked.connect(self.on_rename_selected)
+        tool.addWidget(self.btn_rename)
+        tip = QLabel("💡 每个浏览器的窗口标题前都会显示 [FC-XXXXX 备注]，可在任务栏直接找到；双击行即可定位")
+        tip.setStyleSheet("color: #6B7280; font-size: 11px;")
+        tool.addWidget(tip)
+        tool.addStretch()
+        bl.addLayout(tool)
+
+        self.tbl_browsers = QTableWidget(0, 8)
+        self.tbl_browsers.setHorizontalHeaderLabels(["状态标记", "浏览器ID（备注）", "浏览器配置", "账号（仅参考）", "积分", "分配批次", "计划消耗 / 剩余", "进度"])
+        self._setup_table(self.tbl_browsers, stretch_cols=(5, 7))
+        self.tbl_browsers.cellDoubleClicked.connect(self._on_browser_double_clicked)
+        bl.addWidget(self.tbl_browsers)
+        split.addWidget(bw)
 
         self.tbl_batches = QTableWidget(0, 7)
-        self.tbl_batches.setHorizontalHeaderLabels(["项目", "批次", "分镜序号", "积分", "分配浏览器", "图片上传", "生成结果"])
+        self.tbl_batches.setHorizontalHeaderLabels(["项目", "批次", "分镜序号", "积分", "分配浏览器（双击定位）", "图片上传", "生成结果"])
         self._setup_table(self.tbl_batches, stretch_cols=(0, 4, 5, 6))
+        self.tbl_batches.cellDoubleClicked.connect(self._on_batch_double_clicked)
         split.addWidget(self.tbl_batches)
-        split.setSizes([220, 320])
+        split.setSizes([240, 320])
         root.addWidget(split, stretch=1)
 
         self.log_text = QTextEdit()
@@ -306,38 +333,102 @@ class HostedModeWidget(QWidget):
         if e:
             return e
         cid = c.get("client_id", "")
+        if c.get("instance_id"):
+            return ""
         return cid.split(" (W#")[0] if " (W#" in cid else cid
 
-    def _alias(self, email):
-        return self.aliases.get(email, "")
+    @staticmethod
+    def _iid(c):
+        return (c or {}).get("instance_id") or (c or {}).get("iid") or ""
 
-    def _label(self, email):
-        a = self._alias(email)
-        return f"{email}（{a}）" if a else email
+    def _alias(self, key):
+        """备注：优先按浏览器 ID，其次按邮箱（兼容旧数据）。key 可以是 dict 或字符串。"""
+        if isinstance(key, dict):
+            iid = self._iid(key)
+            if iid and self.aliases.get(iid):
+                return self.aliases[iid]
+            if key.get("instance_name"):
+                return key["instance_name"]
+            em = key.get("email") or ""
+            return self.aliases.get(em, "") if em else ""
+        return self.aliases.get(key, "") if key else ""
+
+    def _label(self, x):
+        """
+        浏览器显示名：FC-XXXXX（备注）· 配置 · 邮箱
+        x 可以是在线 client dict、plan entry、batch dict，或旧的邮箱字符串。
+        """
+        if isinstance(x, dict):
+            if x.get("who"):
+                # plan entry / batch：用分配时记录的身份，再补上最新备注
+                c = self._client_for(x)
+                return self._who(c) if c else x["who"]
+            return self._who(x)
+        a = self._alias(x)
+        return f"{x}（{a}）" if a else (x or "")
+
+    def _who(self, c):
+        iid = self._iid(c)
+        alias = self._alias(c)
+        email = self._email(c)
+        prof = c.get("profile") or ""
+        parts = []
+        head = iid or email or c.get("client_id", "")
+        if alias:
+            head += f"（{alias}）"
+        parts.append(head)
+        if prof and prof not in ("未知端口",):
+            parts.append(prof)
+        if iid and email:
+            parts.append(email)
+        return " · ".join(parts)
+
+    def _client_for(self, entry):
+        """只查找，不修改 plan。"""
+        clients = self._clients()
+        cid = entry.get("cid")
+        for c in clients:
+            if cid and c.get("client_id") == cid:
+                return c
+        iid = self._iid(entry)
+        if iid:
+            for c in clients:
+                if c.get("instance_id") == iid and not c.get("secondary_tab"):
+                    return c
+            for c in clients:
+                if c.get("instance_id") == iid:
+                    return c
+        return None
 
     def _is_low(self, c):
         return bool(c.get("points_known")) and int(c.get("remaining_points", 0)) < self.threshold
 
     def _resolve_client(self, entry):
-        """按 client_id 找在线浏览器；页面刷新导致 id 变化时按唯一邮箱重新绑定。"""
+        """按 client_id → 浏览器唯一 ID 找在线浏览器（页面刷新/重连后 ID 不变）；旧版插件才退回按唯一邮箱匹配。"""
         clients = self._clients()
         for c in clients:
             if c.get("client_id") == entry["cid"]:
                 return c
-        if entry.get("email"):
-            m = [c for c in clients if c.get("email") == entry["email"]]
-            if len(m) == 1:
-                old = entry["cid"]
-                entry["cid"] = m[0]["client_id"]
-                if old in self.plan and old != entry["cid"]:
-                    self.plan[entry["cid"]] = self.plan.pop(old)
-                    if hasattr(self, "run_released_cids") and old in self.run_released_cids:
-                        self.run_released_cids.discard(old)
-                        self.run_released_cids.add(entry["cid"])
-                    for b in self.batches:
-                        if b.get("cid") == old:
-                            b["cid"] = entry["cid"]
-                return m[0]
+        m = []
+        iid = self._iid(entry)
+        if iid:
+            m = [c for c in clients if c.get("instance_id") == iid]
+            m.sort(key=lambda c: bool(c.get("secondary_tab")))
+            m = m[:1]
+        elif entry.get("email"):
+            m = [c for c in clients if not c.get("instance_id") and c.get("email") == entry["email"]]
+        if len(m) == 1:
+            old = entry["cid"]
+            entry["cid"] = m[0]["client_id"]
+            if old in self.plan and old != entry["cid"]:
+                self.plan[entry["cid"]] = self.plan.pop(old)
+                if hasattr(self, "run_released_cids") and old in self.run_released_cids:
+                    self.run_released_cids.discard(old)
+                    self.run_released_cids.add(entry["cid"])
+                for b in self.batches:
+                    if b.get("cid") == old:
+                        b["cid"] = entry["cid"]
+            return m[0]
         return None
 
     # ──────────────────────────────── 刷新 UI
@@ -359,11 +450,21 @@ class HostedModeWidget(QWidget):
     def _refresh_browsers(self):
         clients = self._clients()
         low = sum(1 for c in clients if self._is_low(c))
-        self.lbl_conn.setText(f"在线浏览器 {len(clients)} 个 | 已标记低积分 {low} 个")
+        no_id = sum(1 for c in clients if not c.get("instance_id"))
+        self.lbl_conn.setText(f"在线浏览器 {len(clients)} 个 | 已标记低积分 {low} 个"
+                              + (f" | ⚠️ {no_id} 个插件为旧版（无浏览器ID）" if no_id else ""))
 
-        rows = list(clients)
+        # 同一邮箱出现在多个不同浏览器（邮箱读取不准或真的同号多开）→ 提示
+        email_count = {}
+        for c in clients:
+            em = self._email(c)
+            if em and not c.get("secondary_tab"):
+                email_count[em] = email_count.get(em, 0) + 1
+
+        rows = sorted(clients, key=lambda c: (bool(c.get("secondary_tab")), (self._alias(c) or "").lower(), self._iid(c) or c.get("client_id", "")))
         online_ids = {c.get("client_id") for c in clients}
-        offline = [e for cid, e in self.plan.items() if cid not in online_ids]
+        offline = [e for cid, e in self.plan.items() if cid not in online_ids and not self._client_for(e)]
+        self._browser_row_cids = [c.get("client_id") for c in rows] + [e["cid"] for e in offline]
         self.tbl_browsers.setRowCount(len(rows) + len(offline))
         for i, c in enumerate(rows):
             cid = c.get("client_id")
@@ -381,29 +482,46 @@ class HostedModeWidget(QWidget):
                 mark, color = mark + " | ⚠️插件后台未更新", YELLOW
             elif "bg_ok" not in c:
                 mark = mark + " | ❔后台版本未知"
+            if c.get("secondary_tab"):
+                mark, color = "🟡 同一浏览器的第2个Flow标签页（不分配任务）", YELLOW
+            if not c.get("instance_id"):
+                mark = mark + " | ⚠️旧版插件"
+            iid = self._iid(c)
+            alias = self._alias(c)
+            saved = self.aliases.get(iid) if iid else ""
+            if saved and (c.get("instance_name") or "") != saved and not c.get("_name_pushed"):
+                c["_name_pushed"] = True
+                self.plugin_server.set_instance_name(cid, saved)
+            id_txt = (iid or "(旧版插件无ID)") + (f"（{alias}）" if alias else "")
+            email_txt = email or "(未识别账号)"
+            if email and email_count.get(email, 0) > 1:
+                email_txt += "  ⚠️同邮箱多个浏览器"
+            tip = f"client_id: {cid}\n浏览器进程 PID: {c.get('browser_pid') or '-'}\n用户数据目录: {c.get('user_data_dir') or '-'}"
             self._put(self.tbl_browsers, i, 0, mark, color)
-            self._put(self.tbl_browsers, i, 1, email or "(未识别账号)", color, tip=cid)
-            self._put(self.tbl_browsers, i, 2, self._alias(email), color)
-            self._put(self.tbl_browsers, i, 3, "-" if pts is None else str(pts), color, center=True)
+            self._put(self.tbl_browsers, i, 1, id_txt, color, tip=tip)
+            self._put(self.tbl_browsers, i, 2, c.get("profile") or "识别中...", color, tip=c.get("user_data_dir") or None)
+            self._put(self.tbl_browsers, i, 3, email_txt, color)
+            self._put(self.tbl_browsers, i, 4, "-" if pts is None else str(pts), color, center=True)
             if entry:
                 bl = [b for b in self.batches if b["id"] in entry["batch_ids"]]
-                self._put(self.tbl_browsers, i, 4, "、".join(b["short"] for b in bl), color)
+                self._put(self.tbl_browsers, i, 5, "、".join(b["short"] for b in bl), color)
                 planned = sum(b["points"] for b in bl)
-                self._put(self.tbl_browsers, i, 5, f"{planned} / {(pts or 0) - planned}", color, center=True)
-                self._put(self.tbl_browsers, i, 6, self._browser_progress(bl), color)
+                self._put(self.tbl_browsers, i, 6, f"{planned} / {(pts or 0) - planned}", color, center=True)
+                self._put(self.tbl_browsers, i, 7, self._browser_progress(bl), color)
             else:
-                for col in (4, 5, 6):
+                for col in (5, 6, 7):
                     self._put(self.tbl_browsers, i, col, "", color)
         for j, e in enumerate(offline):
             i = len(rows) + j
             self._put(self.tbl_browsers, i, 0, "⚫ 已断开", GRAY)
-            self._put(self.tbl_browsers, i, 1, e["email"], GRAY)
-            self._put(self.tbl_browsers, i, 2, self._alias(e["email"]), GRAY)
-            self._put(self.tbl_browsers, i, 3, str(e.get("points", "-")), GRAY, center=True)
+            self._put(self.tbl_browsers, i, 1, e.get("who") or e.get("iid") or e["email"], GRAY)
+            self._put(self.tbl_browsers, i, 2, "", GRAY)
+            self._put(self.tbl_browsers, i, 3, e.get("email", ""), GRAY)
+            self._put(self.tbl_browsers, i, 4, str(e.get("points", "-")), GRAY, center=True)
             bl = [b for b in self.batches if b["id"] in e["batch_ids"]]
-            self._put(self.tbl_browsers, i, 4, "、".join(b["short"] for b in bl), GRAY)
-            self._put(self.tbl_browsers, i, 5, "", GRAY)
-            self._put(self.tbl_browsers, i, 6, self._browser_progress(bl), GRAY)
+            self._put(self.tbl_browsers, i, 5, "、".join(b["short"] for b in bl), GRAY)
+            self._put(self.tbl_browsers, i, 6, "", GRAY)
+            self._put(self.tbl_browsers, i, 7, self._browser_progress(bl), GRAY)
 
     @staticmethod
     def _browser_progress(bl):
@@ -428,7 +546,7 @@ class HostedModeWidget(QWidget):
             small = b["points"] < self.small_threshold
             self._put(self.tbl_batches, i, 3, f"{b['points']}" + (" (小)" if small else ""), center=True)
             if b.get("cid"):
-                self._put(self.tbl_batches, i, 4, self._label(b["email"]) + ("  [低积分号]" if b.get("to_low") else ""))
+                self._put(self.tbl_batches, i, 4, self._label(b) + ("  [低积分号]" if b.get("to_low") else ""))
             else:
                 self._put(self.tbl_batches, i, 4, "⚠️ 未分配（没有积分足够的浏览器）", YELLOW)
 
@@ -471,6 +589,113 @@ class HostedModeWidget(QWidget):
             it.setToolTip(str(tip))
         table.setItem(row, col, it)
 
+    # ──────────────────────────────── 定位浏览器 / 备注
+    def _locate_cid(self, cid, fallback_entry=None):
+        if not cid and not fallback_entry:
+            return
+        c = None
+        if fallback_entry:
+            c = self._resolve_client(fallback_entry)
+        if not c and cid:
+            c = next((x for x in self._clients() if x.get("client_id") == cid), None)
+        if not c:
+            QMessageBox.information(self, "提示", "该浏览器当前未连接（可能已关闭或页面不在 Flow 项目）。")
+            return
+        ok, msg = self.plugin_server.locate_client(c["client_id"])
+        self._log(f"📍 定位浏览器：{self._label(c)} — {msg}")
+
+    def _selected_browser_cid(self):
+        row = self.tbl_browsers.currentRow()
+        cids = getattr(self, "_browser_row_cids", [])
+        if 0 <= row < len(cids):
+            return cids[row]
+        return None
+
+    def _on_browser_double_clicked(self, row, col):
+        cids = getattr(self, "_browser_row_cids", [])
+        if not (0 <= row < len(cids)):
+            return
+        if col == 1:
+            self._rename_cid(cids[row])
+        else:
+            entry = self.plan.get(cids[row])
+            self._locate_cid(cids[row], entry)
+
+    def _on_batch_double_clicked(self, row, col):
+        if not (0 <= row < len(self.batches)):
+            return
+        b = self.batches[row]
+        if not b.get("cid"):
+            return
+        entry = self.plan.get(b["cid"]) or {"cid": b["cid"], "email": b.get("email", ""), "iid": b.get("iid", "")}
+        self._locate_cid(b["cid"], entry)
+
+    def on_locate_selected(self):
+        cid = self._selected_browser_cid()
+        if not cid:
+            QMessageBox.information(self, "提示", "请先在上方浏览器列表中选中一行（或直接双击该行）。")
+            return
+        self._locate_cid(cid, self.plan.get(cid))
+
+    def on_locate_next_failed(self):
+        failed_cids = []
+        for b in self.batches:
+            if b.get("cid") and b.get("upload_state") == "失败" and b["cid"] not in failed_cids:
+                failed_cids.append(b["cid"])
+        if not failed_cids:
+            QMessageBox.information(self, "提示", "当前没有上传失败的浏览器。")
+            return
+        idx = getattr(self, "_locate_failed_idx", -1) + 1
+        if idx >= len(failed_cids):
+            idx = 0
+        self._locate_failed_idx = idx
+        cid = failed_cids[idx]
+        names = []
+        for b in self.batches:
+            if b.get("cid") == cid and b.get("upload_state") == "失败":
+                names += [Path(p).name for p in b["upload_failed"]]
+        self._log(f"📍 [{idx + 1}/{len(failed_cids)}] 上传失败的浏览器，失败图片：{'、'.join(names[:10])}")
+        self._locate_cid(cid, self.plan.get(cid))
+
+    def on_rename_selected(self):
+        cid = self._selected_browser_cid()
+        if not cid:
+            QMessageBox.information(self, "提示", "请先在上方浏览器列表中选中一行。")
+            return
+        self._rename_cid(cid)
+
+    def _rename_cid(self, cid):
+        from PyQt6.QtWidgets import QInputDialog
+        c = next((x for x in self._clients() if x.get("client_id") == cid), None)
+        if not c:
+            QMessageBox.information(self, "提示", "该浏览器当前未连接，无法设置备注。")
+            return
+        iid = self._iid(c)
+        key = iid or self._email(c)
+        if not key:
+            return
+        old = self._alias(c)
+        name, ok = QInputDialog.getText(self, "设置浏览器备注",
+                                        f"浏览器：{iid or '(旧版插件)'}\n配置：{c.get('profile') or '-'}\n账号：{self._email(c) or '-'}\n\n"
+                                        "备注名（如 Brave-037，会显示在该浏览器的窗口标题上）：", text=old)
+        if not ok:
+            return
+        name = name.strip()
+        try:
+            self._load_aliases()
+            if name:
+                self.aliases[key] = name
+            else:
+                self.aliases.pop(key, None)
+            self.aliases_file.write_text(json.dumps(self.aliases, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+            return
+        if iid:
+            self.plugin_server.set_instance_name(cid, name)
+        self._log(f"✏️ 已设置备注：{key} → {name or '(清空)'}")
+        self.refresh_all()
+
     # ──────────────────────────────── 步骤 1
     def on_refresh_points(self):
         if not self._clients():
@@ -486,7 +711,7 @@ class HostedModeWidget(QWidget):
         unk = [c for c in self._clients() if not c.get("points_known")]
         if low:
             self._log(f"🔴 已标记 {len(low)} 个低于 {self.threshold} 积分的浏览器（分配时只会分给它们小批次）："
-                      + "、".join(f"{self._label(self._email(c))}={c.get('remaining_points')}" for c in low))
+                      + "、".join(f"{self._label(c)}={c.get('remaining_points')}" for c in low))
         if unk:
             self._log(f"⚪ {len(unk)} 个浏览器未读取到积分，分配时会被跳过")
 
@@ -503,7 +728,7 @@ class HostedModeWidget(QWidget):
             items.append({
                 "client": c,
                 "client_id": cid,
-                "label": self._label(email),
+                "label": self._label(c),
                 "points": c.get("remaining_points", 0),
                 "is_busy": cid in busy_cids,
             })
@@ -525,7 +750,7 @@ class HostedModeWidget(QWidget):
 
         for c in selected:
             email = self._email(c)
-            self._request_close(c["client_id"], f"{self._label(email)}（{c.get('remaining_points')} 积分）", email)
+            self._request_close(c["client_id"], f"{self._label(c)}（{c.get('remaining_points')} 积分）", email)
         self._log(f"已发送关闭指令给 {len(selected)} 个低积分浏览器")
 
     def _busy(self):
@@ -545,7 +770,7 @@ class HostedModeWidget(QWidget):
     def _label_for_client_id(self, client_id):
         for c in self._clients():
             if c.get("client_id") == client_id:
-                return self._label(self._email(c))
+                return self._label(c)
         return client_id.split(" (W#")[0]
 
     def _broadcast(self, action, what):
@@ -722,7 +947,7 @@ class HostedModeWidget(QWidget):
         if not clients:
             QMessageBox.information(self, "提示", "当前没有已连接的浏览器。")
             return
-        known = [c for c in clients if c.get("points_known")]
+        known = [c for c in clients if c.get("points_known") and not c.get("secondary_tab")]
         if not known:
             QMessageBox.information(self, "提示", "还没有读取到任何浏览器的积分，请先点击「刷新积分」。")
             return
@@ -747,7 +972,9 @@ class HostedModeWidget(QWidget):
             count[cid] += 1
             c = by_id[cid]
             b["cid"], b["email"], b["to_low"] = cid, self._email(c), to_low
-            e = self.plan.setdefault(cid, {"cid": cid, "email": self._email(c), "points": int(c.get("remaining_points", 0)),
+            b["iid"], b["who"] = self._iid(c), self._who(c)
+            e = self.plan.setdefault(cid, {"cid": cid, "email": self._email(c), "iid": self._iid(c), "who": self._who(c),
+                                           "points": int(c.get("remaining_points", 0)),
                                            "low": to_low, "batch_ids": []})
             e["batch_ids"].append(b["id"])
 
@@ -773,7 +1000,7 @@ class HostedModeWidget(QWidget):
                   f"涉及 {len(self.plan)} 个浏览器" + (f"；⚠️ {len(un)} 批因积分不足未分配" if un else ""))
         for b in batches:
             if b["cid"]:
-                self._log(f"   {b['short']}（{b['points']} 积分）→ {self._label(b['email'])}" + (" [低积分号]" if b["to_low"] else ""))
+                self._log(f"   {b['short']}（{b['points']} 积分）→ {self._label(b)}" + (" [低积分号]" if b["to_low"] else ""))
         self.refresh_all()
 
     # ──────────────────────────────── 步骤 2：分组上传
@@ -852,7 +1079,7 @@ class HostedModeWidget(QWidget):
             if req:
                 self.upload_pending[req] = {"entry": entry, "paths": paths}
                 max_imgs = max(max_imgs, len(paths))
-                self._log(f"   → {self._label(entry['email'])}：上传 {len(paths)} 张")
+                self._log(f"   → {self._label(entry)}：上传 {len(paths)} 张")
             else:
                 self._mark_upload_result(entry, [], paths, {p: "发送上传指令失败" for p in paths})
         self.upload_group_active = True
@@ -870,7 +1097,7 @@ class HostedModeWidget(QWidget):
             return
         if time.time() > self.upload_group_deadline:
             for req, job in list(self.upload_pending.items()):
-                self._log(f"⏱️ {self._label(job['entry']['email'])} 上传超时，强制进入下一组")
+                self._log(f"⏱️ {self._label(job['entry'])} 上传超时，强制进入下一组")
                 self._mark_upload_result(job["entry"], [], job["paths"], {p: "上传超时（浏览器无响应）" for p in job["paths"]})
             self.upload_pending = {}
             self._start_next_group()
@@ -1010,11 +1237,27 @@ class HostedModeWidget(QWidget):
                 if not entry:
                     return
             self._mark_upload_result(entry, ok_paths, failed, errors)
-            label = self._label(entry["email"])
+            label = self._label(entry)
+            verify = data.get("verify") or {}
+            vc = {"name": 0, "count": 0, "registry": 0}
+            for p in ok_paths:
+                k = verify.get(p)
+                if k in vc:
+                    vc[k] += 1
+            how = []
+            if vc["name"]:
+                how.append(f"按文件名确认 {vc['name']}")
+            if vc["count"]:
+                how.append(f"按新增图块数确认 {vc['count']}")
+            if vc["registry"]:
+                how.append(f"之前已确认上传 {vc['registry']}")
+            if "page_images_before" in data:
+                how.append(f"Flow 图片数 {data.get('page_images_before')}→{data.get('page_images_after', data.get('page_images_before'))}")
+            how_txt = f"（{'；'.join(how)}）" if how else ""
             if failed:
-                self._log(f"   ❌ {label}：成功 {len(ok_paths)} 张，失败 {len(failed)} 张：" + "、".join(Path(p).name for p in failed))
+                self._log(f"   ❌ {label}：成功 {len(ok_paths)} 张，失败 {len(failed)} 张：" + "、".join(Path(p).name for p in failed) + how_txt)
             else:
-                self._log(f"   ✅ {label}：{len(ok_paths)} 张全部上传成功" + (f"（其中 {len(data.get('skipped') or [])} 张已存在）" if data.get("skipped") else ""))
+                self._log(f"   ✅ {label}：{len(ok_paths)} 张全部上传成功{how_txt}")
         elif action == "run_tasks_response":
             data = msg.get("data") or {}
             b = self._batch(data.get("batch_id"))
@@ -1022,7 +1265,7 @@ class HostedModeWidget(QWidget):
                 return
             if msg.get("success"):
                 b["run_state"] = "生成中"
-                self._log(f"🚀 {b['short']} 已被 {self._label(b['email'])} 接收（{data.get('count')} 个任务），开始生成")
+                self._log(f"🚀 {b['short']} 已被 {self._label(b)} 接收（{data.get('count')} 个任务），开始生成")
             else:
                 b["run_state"] = "发送失败"
                 self._log(f"❌ {b['short']} 发送失败：{msg.get('error')}")
@@ -1323,7 +1566,7 @@ class HostedModeWidget(QWidget):
         c = self._resolve_client(entry)
         if not c:
             nxt["run_state"] = "连接断开"
-            self._log(f"❌ {self._label(entry['email'])} 未连接，{nxt['short']} 无法发送")
+            self._log(f"❌ {self._label(entry)} 未连接，{nxt['short']} 无法发送")
             self.refresh_all()
             return
         nxt["run_state"] = "已发送"
@@ -1333,7 +1576,7 @@ class HostedModeWidget(QWidget):
         if not req:
             nxt["run_state"] = "发送失败"
         else:
-            self._log(f"📨 已发送 {nxt['short']}（{len(clean_tasks)} 个任务）→ {self._label(entry['email'])}")
+            self._log(f"📨 已发送 {nxt['short']}（{len(clean_tasks)} 个任务）→ {self._label(entry)}")
         self.refresh_all()
 
     def _on_hosted_event(self, payload):
@@ -1430,6 +1673,6 @@ class HostedModeWidget(QWidget):
         for b in self.batches:
             if b.get("cid") == client_id and b["run_state"] in ("已发送", "生成中"):
                 b["run_state"] = "连接断开"
-                self._log(f"⚠️ {self._label(b['email'])} 断开连接，{b['short']} 中断（重新连接后可再次点击步骤3继续）")
+                self._log(f"⚠️ {self._label(b)} 断开连接，{b['short']} 中断（重新连接后可再次点击步骤3继续）")
         self._schedule_refresh()
         QTimer.singleShot(200, self._check_all_done)

@@ -4,8 +4,47 @@
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 后台版本握手：用于检测「网页脚本已更新但插件后台仍是旧版本」的情况
   if (message.action === "getBgVersion") {
-    sendResponse({ version: "1.3.1-hosted", nativeDrag: !!(chrome.debugger && chrome.debugger.attach) });
+    sendResponse({ version: "1.3.2-hosted", nativeDrag: !!(chrome.debugger && chrome.debugger.attach) });
     return;
+  }
+
+  // ===== 浏览器唯一 ID（每个浏览器配置独立，一旦生成永久保存，用于桌面软件精确识别/定位浏览器）=====
+  if (message.action === "getInstanceInfo") {
+    getInstanceInfo().then(sendResponse).catch(err => sendResponse({ error: String(err?.message || err) }));
+    return true;
+  }
+  if (message.action === "resetInstanceId") {
+    chrome.storage.local.remove(["flowcue_instance_id"], () => {
+      getInstanceInfo().then(sendResponse).catch(err => sendResponse({ error: String(err?.message || err) }));
+    });
+    return true;
+  }
+  if (message.action === "setInstanceName") {
+    const name = String(message.name || "").trim().slice(0, 40);
+    chrome.storage.local.set({ flowcue_instance_name: name }, () => {
+      getInstanceInfo().then(sendResponse).catch(err => sendResponse({ error: String(err?.message || err) }));
+    });
+    return true;
+  }
+  // 把本标签页所在窗口切到最前面并激活该标签页（桌面软件「定位浏览器」）
+  if (message.action === "focusMyTab") {
+    const tabId = sender.tab?.id;
+    const windowId = sender.tab?.windowId;
+    (async () => {
+      try {
+        if (windowId != null) {
+          const w = await chrome.windows.get(windowId);
+          const upd = { focused: true, drawAttention: true };
+          if (w && w.state === "minimized") upd.state = "normal";
+          await chrome.windows.update(windowId, upd);
+        }
+        if (tabId != null) await chrome.tabs.update(tabId, { active: true });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
+      }
+    })();
+    return true;
   }
   // 兼容旧桥接消息；不再用全局当前任务重命名任何下载。
   if (["setActiveTask", "clearActiveTask"].includes(message.action)) {
@@ -116,6 +155,52 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 });
+
+// ===== 浏览器唯一 ID =====
+// instance_id   : 存在 chrome.storage.local，每个浏览器配置（多开的每个浏览器）独立且永久不变，如 FC-7K3QX
+// browser_session: 存在 chrome.storage.session，浏览器每次启动都会变化；
+//                  用于区分「同一浏览器的两个标签页」与「被复制出来的浏览器配置（ID 重复）」
+const ID_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+function randomCode(len) {
+  const buf = new Uint32Array(len);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, n => ID_ALPHABET[n % ID_ALPHABET.length]).join("");
+}
+let memSessionId = "";
+async function getBrowserSessionId() {
+  try {
+    if (chrome.storage.session) {
+      const r = await chrome.storage.session.get(["flowcue_browser_session"]);
+      if (r && r.flowcue_browser_session) return r.flowcue_browser_session;
+      const sid = "S" + randomCode(8);
+      await chrome.storage.session.set({ flowcue_browser_session: sid });
+      return sid;
+    }
+  } catch (_) {}
+  if (!memSessionId) memSessionId = "S" + randomCode(8);
+  return memSessionId;
+}
+let instanceLock = Promise.resolve();
+function getInstanceInfo() {
+  const p = instanceLock.then(getInstanceInfoUnsafe);
+  instanceLock = p.catch(() => {});
+  return p;
+}
+async function getInstanceInfoUnsafe() {
+  const r = await chrome.storage.local.get(["flowcue_instance_id", "flowcue_instance_name"]);
+  let id = r.flowcue_instance_id;
+  if (!id || !/^FC-[0-9A-Z]{4,8}$/.test(id)) {
+    id = "FC-" + randomCode(5);
+    await chrome.storage.local.set({ flowcue_instance_id: id });
+  }
+  return {
+    instance_id: id,
+    instance_name: r.flowcue_instance_name || "",
+    browser_session: await getBrowserSessionId(),
+    extension_id: chrome.runtime.id,
+    user_agent: navigator.userAgent
+  };
+}
 
 // 2.0 原生文件拖放（移植自 FlowStudio 插件的已验证方案）
 // 原理：普通网页脚本 new File()/DataTransfer 伪造的拖放事件 isTrusted=false，Flow 会忽略；

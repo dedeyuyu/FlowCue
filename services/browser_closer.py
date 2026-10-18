@@ -34,6 +34,11 @@ user32.IsWindowVisible.argtypes = [wt.HWND]
 user32.IsWindow.argtypes = [wt.HWND]
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32.IsIconic.argtypes = [wt.HWND]
+user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.BringWindowToTop.argtypes = [wt.HWND]
+user32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t]
 
 _PROFILE_TITLE_RE = re.compile(r"^Chrome_(.+?)_([A-Za-z]:\|.*)$")
 _local_state_cache = {}   # user_data_dir -> (loaded_at, {profile_dir: email})
@@ -222,38 +227,85 @@ def _find_main_browser_pid(start_pid, tree):
 
 def get_browser_profile_by_port(port):
     """Returns the profile name/dir for the browser connected on the given port."""
+    return get_browser_info_by_port(port).get("profile") or "未知端口"
+
+
+def _extract_arg(cmdline, name):
+    for pat in (rf'"--{name}=([^"]+)"', rf'--{name}="([^"]+)"', rf'--{name}=([^\s"]+)'):
+        m = re.search(pat, cmdline or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+def get_browser_info_by_port(port):
+    """
+    通过 WebSocket 对端端口 → 所属进程 → 浏览器主进程，返回：
+    {main_pid, exe, profile, profile_dir, user_data_dir}
+    多开浏览器（Brave / Chrome / 指纹浏览器）每个实例是独立的主进程 + 独立的 user-data-dir，
+    因此 main_pid 可以精确定位到「这一个」浏览器的窗口。
+    """
+    info = {"main_pid": None, "exe": "", "profile": "", "profile_dir": "", "user_data_dir": ""}
     pid = _get_pid_from_port(port)
     if not pid:
-        return "未知端口"
+        info["profile"] = "未知端口"
+        return info
     tree = _get_process_tree_ctypes()
     main_pid, cmdline = _find_main_browser_pid(pid, tree)
-    
-    import re
-    # Try to extract "--profile-directory=Profile 1" or --profile-directory="Profile 1"
-    
-    # 1. Matches: "--profile-directory=Profile 1" (Brave style)
-    m_profile = re.search(r'"--profile-directory=([^"]+)"', cmdline)
-    if not m_profile:
-        # 2. Matches: --profile-directory="Profile 1" (Chrome style)
-        m_profile = re.search(r'--profile-directory="([^"]+)"', cmdline)
-    if not m_profile:
-        # 3. Matches: --profile-directory=Profile1 (No spaces, no quotes)
-        m_profile = re.search(r"--profile-directory=([^\s\"]+)", cmdline)
-        
-    if m_profile:
-        return m_profile.group(1)
-        
-    # Try to extract --user-data-dir="C:\..."
-    m_user = re.search(r'"--user-data-dir=([^"]+)"', cmdline)
-    if not m_user:
-        m_user = re.search(r'--user-data-dir="([^"]+)"', cmdline)
-    if not m_user:
-        m_user = re.search(r"--user-data-dir=([^\s\"]+)", cmdline)
-    if m_user:
-        path = m_user.group(1)
-        return path.split('\\')[-1].split('/')[-1] # return just the last folder name
-        
-    return f"PID:{main_pid}"
+    info["main_pid"] = main_pid
+    info["exe"] = tree.get(main_pid, {}).get("name", "")
+    profile_dir = _extract_arg(cmdline, "profile-directory")
+    user_data_dir = _extract_arg(cmdline, "user-data-dir")
+    info["profile_dir"] = profile_dir
+    info["user_data_dir"] = user_data_dir
+    if user_data_dir:
+        folder = user_data_dir.rstrip("\\/").split("\\")[-1].split("/")[-1]
+        info["profile"] = f"{folder}/{profile_dir}" if profile_dir and profile_dir != "Default" else folder
+    elif profile_dir:
+        info["profile"] = profile_dir
+    else:
+        info["profile"] = f"PID:{main_pid}"
+    return info
+
+
+def find_windows_by_pid(pid):
+    """Visible top-level browser windows (Chrome_WidgetWin_*) owned by the given process."""
+    if not pid:
+        return []
+    out = []
+    for hwnd, wpid, title in _enum_windows():
+        if wpid != pid or not user32.IsWindowVisible(hwnd):
+            continue
+        if not _class_name(hwnd).startswith("Chrome_WidgetWin"):
+            continue
+        if not title:
+            continue
+        out.append(hwnd)
+    return out
+
+
+def bring_window_to_front(hwnd):
+    """Restore + bring a window to the foreground (works around Windows focus-stealing protection)."""
+    try:
+        SW_RESTORE = 9
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        # 按一下 Alt 键可解除前台锁定，使 SetForegroundWindow 生效
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x12, 0, 2, 0)
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wt.UINT), ("hwnd", wt.HWND), ("dwFlags", wt.DWORD),
+                        ("uCount", wt.UINT), ("dwTimeout", wt.DWORD)]
+        fi = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 3 | 0x0C, 6, 0)  # FLASHW_ALL | FLASHW_TIMERNOFG
+        user32.FlashWindowEx(ctypes.byref(fi))
+        return True
+    except Exception as e:
+        logger.warning(f"置顶窗口失败: {e}")
+        return False
+
 
 def kill_browser_by_port(port):
     """
