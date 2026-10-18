@@ -32,6 +32,12 @@ function sendMessageToBackground(payload, maxRetries = 5, initialDelay = 500) {
               return;
             }
 
+            // 对于原生拖放等非幂等操作，若后台已收到消息但连接通道关闭（message port closed），绝不重试，避免重复拖放上传
+            if (payload?.action === "nativeFileDrag" && errorMsg.includes("message port closed")) {
+              resolve({ ok: true, warning: errorMsg });
+              return;
+            }
+
             // 如果还没达到最大重试次数，进行延迟重试
             if (attempt < maxRetries) {
               const nextDelay = initialDelay * Math.pow(2, attempt - 1); // 指数退避: 500ms, 1000ms, 2000ms, 4000ms...
@@ -68,6 +74,9 @@ function sendMessageToBackground(payload, maxRetries = 5, initialDelay = 500) {
   });
 }
 
+// 已处理的 callbackId 集合，防止主世界重发握手机制导致同一请求（如 nativeFileDrag）被执行两次
+const handledCallbackIds = new Set();
+
 // 1. 监听来自 MAIN 网页环境的 window.postMessage 消息
 window.addEventListener("message", (event) => {
   // 安全校验：只处理当前 window 发送、且指定 sender 为 "flow-main" 的消息
@@ -76,6 +85,16 @@ window.addEventListener("message", (event) => {
   }
 
   const { callbackId, payload } = event.data;
+  if (callbackId) {
+    // 立即通知主世界：桥接脚本已收到，取消 800ms / 2500ms 重发定时器
+    window.postMessage({ sender: "flow-isolated-ack", callbackId }, "*");
+    if (handledCallbackIds.has(callbackId)) {
+      console.warn(`[FlowIsolated] 忽略重复重发的请求: action=${payload?.action}, callbackId=${callbackId}`);
+      return;
+    }
+    handledCallbackIds.add(callbackId);
+    setTimeout(() => handledCallbackIds.delete(callbackId), 120000);
+  }
   console.log(`[FlowIsolated] 收到主页面 postMessage: action=${payload?.action}`);
 
   // 2. 将消息使用重试机制透传给插件后台 Service Worker

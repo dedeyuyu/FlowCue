@@ -207,6 +207,9 @@ async function getInstanceInfoUnsafe() {
 // 而 Chrome DevTools 协议 Input.dispatchDragEvent 由浏览器内核发出「真实」拖放，
 // 并且 data.files 直接接收本地绝对路径，浏览器自己读取文件，效果等同于用户从资源管理器拖入。
 const dragLanes = new Map();
+const recentTabDrags = new Map();
+const DRAG_DEDUP_WINDOW_MS = 15000;
+
 function serialByTab(tabId, fn) {
   const prev = dragLanes.get(tabId) || Promise.resolve();
   const p = prev.catch(() => {}).then(fn);
@@ -227,7 +230,15 @@ async function dispatchNativeFileDrag(tabId, paths, x, y) {
     throw new Error("安全拦截：原生拖放仅允许上传本地图片文件 (.jpg, .jpeg, .png, .webp, .bmp)");
   }
 
+  const dedupKey = `${tabId}::${validFiles.map(f => f.toLowerCase()).sort().join("|")}`;
+
   return serialByTab(tabId, async () => {
+    const lastDragAt = recentTabDrags.get(dedupKey) || 0;
+    if (Date.now() - lastDragAt < DRAG_DEDUP_WINDOW_MS) {
+      console.warn(`[Background] 🛡️ 拦截到 ${DRAG_DEDUP_WINDOW_MS / 1000}s 内重复的原生拖放请求，已忽略 (tabId=${tabId}, files=${validFiles.length})`);
+      return { ok: true, count: clean.length, method: "chrome_debugger_native_drag_dedup" };
+    }
+
     const target = { tabId };
     let attachedHere = false;
     try {
@@ -251,6 +262,12 @@ async function dispatchNativeFileDrag(tabId, paths, x, y) {
         await chrome.debugger.sendCommand(target, "Input.dispatchDragEvent", { type, x: px, y: py, data: dragData });
         if (type !== "drop") await new Promise(r => setTimeout(r, 120));
       }
+      recentTabDrags.set(dedupKey, Date.now());
+      setTimeout(() => {
+        if ((recentTabDrags.get(dedupKey) || 0) <= Date.now() - DRAG_DEDUP_WINDOW_MS) {
+          recentTabDrags.delete(dedupKey);
+        }
+      }, DRAG_DEDUP_WINDOW_MS + 1000);
       console.log(`[Background] ✅ 原生拖放已发送 ${clean.length} 个文件 @(${px},${py})`);
       return { ok: true, count: clean.length, method: "chrome_debugger_native_drag" };
     } finally {

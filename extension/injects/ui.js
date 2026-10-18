@@ -63,10 +63,15 @@
   // 1. 消息中间件（使用 window.postMessage 桥接后台）
   // ----------------------------------------------------
   const extensionCallbacks = new Map();
+  const ackedCallbacks = new Set();
+  let isolatedBridgeReady = false;
+  const NON_RETRYABLE_ACTIONS = new Set([
+    "nativeFileDrag", "nativeClick", "nativeHover", "download", "closeBrowser", "focusMyTab"
+  ]);
 
   function sendToExtension(action, data) {
     return new Promise((resolve) => {
-      const callbackId = Math.random().toString(36).substring(2, 9);
+      const callbackId = Math.random().toString(36).substring(2, 9) + "_" + Date.now().toString(36);
       extensionCallbacks.set(callbackId, resolve);
 
       const postPayload = () => {
@@ -78,18 +83,26 @@
         }, "*");
       };
 
-      // 若 document_start 阶段 content-isolated.js 尚未完成挂载，800ms / 2500ms 自动重发握手机制
-      setTimeout(postPayload, 800);
-      setTimeout(postPayload, 2500);
-      
-      // 15秒超时保底，防止扩展桥接未就绪导致初始化永久阻塞
+      // 仅在页面刚启动、content-isolated.js 尚未就绪且为只读初始化请求时才做握手机制重发；
+      // 严禁对 nativeFileDrag 等有副作用的耗时操作在 800ms/2500ms 重发，否则一旦拖放耗时超过 800ms 就会触发二次/三次重复上传！
+      if (!isolatedBridgeReady && !NON_RETRYABLE_ACTIONS.has(action)) {
+        setTimeout(() => {
+          if (!isolatedBridgeReady && !ackedCallbacks.has(callbackId)) postPayload();
+        }, 800);
+        setTimeout(() => {
+          if (!isolatedBridgeReady && !ackedCallbacks.has(callbackId)) postPayload();
+        }, 2500);
+      }
+
+      const timeoutMs = action === "nativeFileDrag" ? 45000 : 15000;
       setTimeout(() => {
+        ackedCallbacks.delete(callbackId);
         if (extensionCallbacks.has(callbackId)) {
           extensionCallbacks.delete(callbackId);
-          console.warn(`[FlowUI] sendToExtension(${action}) 15秒无响应，自动跳过`);
+          console.warn(`[FlowUI] sendToExtension(${action}) ${timeoutMs / 1000}秒无响应，自动跳过`);
           resolve({ error: "timeout" });
         }
-      }, 15000);
+      }, timeoutMs);
 
       postPayload();
     });
@@ -98,13 +111,21 @@
   // 监听来自 content-isolated.js 的响应与广播事件
   window.addEventListener("message", (event) => {
     if (event.source !== window || !event.data) return;
-    
+
+    if (event.data.sender === "flow-isolated-ack") {
+      isolatedBridgeReady = true;
+      if (event.data.callbackId) ackedCallbacks.add(event.data.callbackId);
+      return;
+    }
+
     if (event.data.sender === "flow-isolated-open-panel") {
+      isolatedBridgeReady = true;
       openPanel();
       return;
     }
 
     if (event.data.sender === "flow-isolated-event") {
+      isolatedBridgeReady = true;
       if (["downloadCompleted", "downloadFailed"].includes(event.data.event)) {
         const taskInfo = event.data.data?.task;
         console.log("[FlowUI] 收到后台下载完成广播通知:", taskInfo);
@@ -141,7 +162,9 @@
     if (event.data.sender !== "flow-isolated") {
       return;
     }
+    isolatedBridgeReady = true;
     const { callbackId, response } = event.data;
+    ackedCallbacks.delete(callbackId);
     if (extensionCallbacks.has(callbackId)) {
       extensionCallbacks.get(callbackId)(response);
       extensionCallbacks.delete(callbackId);
@@ -1084,12 +1107,19 @@
       "[data-tile-id]"
     );
 
+    const isIgnoredImg = (img, src) => {
+      if (!src || src.startsWith("data:image/svg") || src.includes(".svg") || src.includes("googlelogo") || src.includes("avatar") || src.includes("favicon") || src.includes("gb_")) return true;
+      if (/googleusercontent\.com\/a[-/]/i.test(src) || /lh\d+\.google\.com\/u\//i.test(src)) return true;
+      if (img.closest("header, nav, flow-header, flow-header-user-icon, .header-user-button, .gb_X, .gbii, .cdk-overlay-container, #flow-batch-overlay, #flow-import-dialog")) return true;
+      return false;
+    };
+
     candidateContainers.forEach((container, idx) => {
       if (container.tagName === "FLOW-VIDEO-TILE" || container.querySelector?.("flow-video-tile") || container.closest?.("flow-video-tile")) return;
       const img = container.querySelector("img");
       if (!img || img.classList.contains("thumbnail")) return;
       const src = img.src || img.getAttribute("src") || "";
-      if (!src || src.includes("avatar") || src.includes("favicon") || src.includes("googlelogo") || src.startsWith("data:image/svg") || img.closest(".gb_X, .gbii")) return;
+      if (isIgnoredImg(img, src)) return;
 
       const displayName = extractTileDisplayName(container, img) || `素材图片_${idx + 1}`;
       const mediaId = img.getAttribute("data-media-id") || container.dataset?.tileId || container.closest("[data-tile-id]")?.dataset?.tileId;
@@ -1107,14 +1137,18 @@
       }
     });
 
-    // 2. 降级兜底：扫描全局 img 元素
+    // 2. 降级兜底：扫描素材视口内的 img 元素（排除顶栏头像与小图标）
     if (!images.length) {
-      document.querySelectorAll("flow-project-page img, cdk-virtual-scroll-viewport img, .tiles-container img, .virtual-scroll-container img").forEach((img, idx) => {
+      document.querySelectorAll("cdk-virtual-scroll-viewport img, .tiles-container img, .virtual-scroll-container img").forEach((img, idx) => {
+        if (img.classList.contains("thumbnail") || img.closest("flow-video-tile")) return;
         const src = img.src || "";
-        if (!src || src.startsWith("data:image/svg") || src.includes(".svg") || src.includes("googlelogo") || src.includes("avatar") || src.includes("favicon") || src.includes("gb_")) return;
+        if (isIgnoredImg(img, src)) return;
+        const r = img.getBoundingClientRect();
+        if (r.width <= 60 || r.height <= 60) return;
         const card = img.closest("flow-grid-tile-container, [data-tile-id], mat-card, div") || img.parentElement;
         const displayName = extractTileDisplayName(card, img) || `页面素材_${idx + 1}`;
-        const uniqueId = `img_fallback_${idx}`;
+        const nameMatch = src.match(/name=([0-9a-zA-Z_-]+)/) || src.match(/\/([0-9a-fA-F-]{36})/) || src.match(/key=([^&]+)/);
+        const uniqueId = nameMatch ? nameMatch[1] : `img_fallback_${idx}_${src.substring(src.length - 16)}`;
         if (!seenIds.has(uniqueId)) {
           seenIds.add(uniqueId);
           images.push({
