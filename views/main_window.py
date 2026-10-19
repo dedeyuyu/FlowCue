@@ -119,9 +119,9 @@ class MainWindow(QMainWindow):
         self.config_manager = ConfigManager(self.workspace_dir)
         
         # Initialize PluginServer
+        # 默认不启动：只有在「全局托管」页点击「🔌 开始识别浏览器」或「🔄 刷新积分」时才开启监听。
+        # 未开启时浏览器插件处于休眠状态，手动模式（复制 JSON + 闪电一键）完全不受影响。
         self.plugin_server = PluginServer(port=self.config_manager.plugin_server_port, parent=self)
-        if self.config_manager.enable_plugin_server:
-            self.plugin_server.start()
         
         self.init_ui()
         # Bind template, config manager & plugin server to detail panel
@@ -780,11 +780,17 @@ class MainWindow(QMainWindow):
                 self.lbl_plugin_status.setStyleSheet("color: #64748B; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #CBD5E1; border-radius: 4px; background-color: #F8FAFC;")
                 return
                 
+            if not self.plugin_server.is_running():
+                self.lbl_plugin_status.setText("⚪ 未开启识别（手动模式）")
+                self.lbl_plugin_status.setToolTip("需要全局托管时，到「🤖 全局托管」页点击「🔌 开始识别浏览器」")
+                self.lbl_plugin_status.setStyleSheet("color: #64748B; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #CBD5E1; border-radius: 4px; background-color: #F8FAFC;")
+                return
+
             clients = self.plugin_server.get_online_clients()
             count = len(clients)
             if count == 0:
-                self.lbl_plugin_status.setText("🔴 插件未连接 (ws://127.0.0.1:18188)")
-                self.lbl_plugin_status.setStyleSheet("color: #DC2626; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #FCA5A5; border-radius: 4px; background-color: #FEF2F2;")
+                self.lbl_plugin_status.setText("🟡 识别中，等待浏览器连接...")
+                self.lbl_plugin_status.setStyleSheet("color: #D97706; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #FCD34D; border-radius: 4px; background-color: #FEF3C7;")
             else:
                 pts_summary = ", ".join(f"{(c.get('email') or c.get('client_id', '')).split('@')[0]}:{c.get('remaining_points', 0)}分" for c in clients[:3])
                 if len(clients) > 3:
@@ -797,6 +803,11 @@ class MainWindow(QMainWindow):
         """Broadcasts get_points RPC request to all connected browsers to probe points."""
         if not hasattr(self, "plugin_server") or not self.plugin_server:
             QMessageBox.warning(self, "提示", "插件服务未启动。")
+            return
+
+        # 与「全局托管 → 刷新积分」走同一套逻辑：未开启识别时先开启，等待浏览器连上后再读积分
+        if hasattr(self, "hosted_mode"):
+            self.hosted_mode.on_refresh_points()
             return
 
         clients = self.plugin_server.get_online_clients()

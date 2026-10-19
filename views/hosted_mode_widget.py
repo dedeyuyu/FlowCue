@@ -154,6 +154,11 @@ class HostedModeWidget(QWidget):
         g1 = QGroupBox("步骤 1：刷新积分 · 标记低积分浏览器 · 按批次分配任务")
         l1 = QVBoxLayout(g1)
         r = QHBoxLayout()
+        self.btn_recognize = self._btn("🔌 开始识别浏览器", "#0EA5E9", "#0284C7")
+        self.btn_recognize.setToolTip("开启后，已打开 Flow 页面的浏览器插件会在几秒内自动连接到软件。\n"
+                                      "不使用全局托管时请保持关闭，插件处于休眠状态，手动模式更流畅。")
+        self.btn_recognize.clicked.connect(self.on_toggle_recognition)
+        r.addWidget(self.btn_recognize)
         self.btn_refresh = self._btn("🔄 刷新积分", "#059669", "#047857")
         self.btn_refresh.clicked.connect(self.on_refresh_points)
         r.addWidget(self.btn_refresh)
@@ -450,8 +455,12 @@ class HostedModeWidget(QWidget):
         clients = self._clients()
         low = sum(1 for c in clients if self._is_low(c))
         no_id = sum(1 for c in clients if not c.get("instance_id"))
-        self.lbl_conn.setText(f"在线浏览器 {len(clients)} 个 | 已标记低积分 {low} 个"
-                              + (f" | ⚠️ {no_id} 个插件为旧版（无浏览器ID）" if no_id else ""))
+        self._update_recognize_btn()
+        if not self._is_recognizing():
+            self.lbl_conn.setText("⚪ 未开启识别（插件休眠中，手动模式不受影响）")
+        else:
+            self.lbl_conn.setText(f"🟢 识别中 | 在线浏览器 {len(clients)} 个 | 已标记低积分 {low} 个"
+                                  + (f" | ⚠️ {no_id} 个插件为旧版（无浏览器ID）" if no_id else ""))
 
         # 同一邮箱出现在多个不同浏览器（邮箱读取不准或真的同号多开）→ 提示
         email_count = {}
@@ -703,10 +712,77 @@ class HostedModeWidget(QWidget):
         self._log(f"✏️ 已设置备注：{key} → {name or '(清空)'}")
         self.refresh_all()
 
+    # ──────────────────────────────── 识别开关（全局托管与手动模式分离）
+    def _is_recognizing(self):
+        return bool(self.plugin_server and self.plugin_server.is_running())
+
+    def _update_recognize_btn(self):
+        if not hasattr(self, "btn_recognize"):
+            return
+        on = self._is_recognizing()
+        self.btn_recognize.setText("⏹ 停止识别" if on else "🔌 开始识别浏览器")
+        color, hover = ("#DC2626", "#B91C1C") if on else ("#0EA5E9", "#0284C7")
+        self.btn_recognize.setStyleSheet(
+            f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; padding: 7px 14px; border-radius: 4px; }}"
+            f"QPushButton:hover {{ background-color: {hover}; }} QPushButton:disabled {{ background-color: #9CA3AF; }}")
+
+    def start_recognition(self):
+        if not self.plugin_server:
+            return False
+        if self._is_recognizing():
+            return True
+        ok = self.plugin_server.start()
+        if ok:
+            self._log("🔌 已开启识别：已打开 Flow 页面的浏览器插件会在约 5~10 秒内自动连接。")
+        else:
+            QMessageBox.warning(self, "开启失败", "无法开启识别：端口 18188 / 8000 / 8765 均被占用。\n请关闭占用端口的程序或重启 FlowCue 后重试。")
+        self._update_recognize_btn()
+        self.refresh_all()
+        try:
+            self.mw.update_plugin_status_ui()
+        except Exception:
+            pass
+        return ok
+
+    def stop_recognition(self):
+        if not self._is_recognizing():
+            return
+        if self.running or self.upload_timer.isActive():
+            r = QMessageBox.question(self, "确认停止识别",
+                                     "全局托管任务正在进行中，停止识别后软件将无法继续接收各浏览器的进度。\n\n"
+                                     "（浏览器里已开始的任务会继续执行）\n\n确定要停止识别吗？")
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self.plugin_server.stop()
+        self._log("⏹ 已停止识别：所有浏览器插件已断开并回到休眠状态（手动模式不受影响）。")
+        self._update_recognize_btn()
+        self.refresh_all()
+        try:
+            self.mw.update_plugin_status_ui()
+        except Exception:
+            pass
+
+    def on_toggle_recognition(self):
+        if self._is_recognizing():
+            self.stop_recognition()
+        else:
+            self.start_recognition()
+
     # ──────────────────────────────── 步骤 1
     def on_refresh_points(self):
+        if not self._is_recognizing():
+            if not self.start_recognition():
+                return
+            self.btn_refresh.setEnabled(False)
+            self._log("⏳ 正在等待浏览器插件连接（约 10 秒），连接后自动读取积分...")
+            QTimer.singleShot(10000, self._refresh_points_after_connect)
+            return
+        self._refresh_points_after_connect()
+
+    def _refresh_points_after_connect(self):
+        self.btn_refresh.setEnabled(True)
         if not self._clients():
-            QMessageBox.information(self, "提示", "当前没有已连接的浏览器。请打开 Google Flow 项目页面。")
+            QMessageBox.information(self, "提示", "当前没有已连接的浏览器。\n请确认浏览器已打开 Google Flow 项目页面，并已安装最新插件。")
             return
         n = self.plugin_server.query_all_clients_points()
         self._log(f"已向 {n} 个浏览器发送读取积分指令...")

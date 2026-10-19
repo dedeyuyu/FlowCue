@@ -61,6 +61,10 @@ class PluginServer(QObject):
 
         return started_any
 
+    def is_running(self):
+        """True when the WebSocket servers are listening (i.e. 「开始识别」 is on)."""
+        return bool(self.servers)
+
     def stop(self):
         """Stops all WebSocket servers."""
         for socket in list(self.clients.keys()):
@@ -72,7 +76,13 @@ class PluginServer(QObject):
                 socket.close()
             except Exception:
                 pass
+        dropped = [info.get("client_id", "") for info in self.clients.values()]
         self.clients.clear()
+        for cid in dropped:
+            try:
+                self.client_disconnected_signal.emit(cid)
+            except Exception:
+                pass
 
         for s in self.servers:
             try:
