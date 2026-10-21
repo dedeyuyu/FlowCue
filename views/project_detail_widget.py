@@ -20,6 +20,12 @@ from services.text_processor import TextProcessor
 from services.downloader import DownloadThread
 
 
+class NoWheelComboBox(QComboBox):
+    """禁用鼠标滚轮切换选项的下拉框，防止鼠标停留滚动时误改片段配置"""
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 def flip_image_horizontally_replace(file_path) -> Path:
     """
     将指定图片进行左右水平翻转（镜像），用翻转后的新图片替换原图：
@@ -1843,7 +1849,7 @@ class ProjectDetailWidget(QWidget):
         
         # Segment-specific template selector
         panel_layout.addWidget(QLabel("📐 片段专属模板:"))
-        self.combo_prop_template = QComboBox()
+        self.combo_prop_template = NoWheelComboBox()
         self.combo_prop_template.setMaxVisibleItems(15)
         self.combo_prop_template.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_prop_template.setStyleSheet("""
@@ -1866,7 +1872,7 @@ class ProjectDetailWidget(QWidget):
         
         # Segment-specific motion selector
         panel_layout.addWidget(QLabel("🎥 片段专属运镜:"))
-        self.combo_prop_motion = QComboBox()
+        self.combo_prop_motion = NoWheelComboBox()
         self.combo_prop_motion.setMaxVisibleItems(15)
         self.combo_prop_motion.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_prop_motion.setStyleSheet("""
@@ -1889,7 +1895,7 @@ class ProjectDetailWidget(QWidget):
 
         # Mode selector
         panel_layout.addWidget(QLabel("⚙️ 生成模式:"))
-        self.combo_prop_mode = QComboBox()
+        self.combo_prop_mode = NoWheelComboBox()
         self.combo_prop_mode.addItem("-- 遵循规则设置 --", "")
         self.combo_prop_mode.addItem("帧模式 (First Frame)", "VIDEO_FRAMES")
         self.combo_prop_mode.addItem("素材模式 (Reference)", "VIDEO_REFERENCES")
