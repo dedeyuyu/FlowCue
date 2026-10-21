@@ -2507,6 +2507,8 @@ class ProjectDetailWidget(QWidget):
 
     def export_batch_json(self):
         """Generates task list JSON and opens batch copy dialog partitioned by points budget <= 50."""
+        if self.config_manager:
+            self.config_manager.load()
         res = self.build_batches()
         if res.get("error"):
             level = res.get("level", "warning")
@@ -2515,6 +2517,22 @@ class ProjectDetailWidget(QWidget):
             else:
                 QMessageBox.warning(self, "提示", res["error"])
             return
+
+        default_aspect = getattr(self.config_manager, "default_aspect_ratio", "9:16") if self.config_manager else "9:16"
+        if default_aspect == "16:9":
+            reply = QMessageBox.question(
+                self,
+                "🚨 画幅尺寸确认提醒 (16:9 横屏)",
+                "⚠️ 当前【规则设置】中的默认画面尺寸为 16:9（横屏）！\n\n"
+                "请确认本次导出的批量生成 JSON 是否确实需要 16:9 横屏尺寸？\n\n"
+                "• 点击「Yes / 是」：确认尺寸正确，继续导出批量生成 JSON\n"
+                "• 点击「No / 否」：取消导出（可前往「⚙️ 规则设置」修改为 9:16 竖屏）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         dialog = BatchExportDialog(self, res["batches"], self.config_manager, skipped_count=res["skipped"])
         dialog.exec()
 
@@ -3371,6 +3389,24 @@ class BatchExportDialog(QDialog):
         
         skipped_text = f" <span style='color: #10B981;'>(已自动排除 {self.skipped_count} 个已生成的变绿片段)</span>" if self.skipped_count > 0 else ""
         end_stat_text = f" | 🎬 包含 <b>{total_end_frames}</b> 个配置尾帧的分句" if total_end_frames > 0 else ""
+
+        if default_aspect == "16:9":
+            lbl_aspect_warn = QLabel(
+                "🚨 【横屏尺寸提醒】当前默认画面尺寸为 16:9（横屏）！请确认本次导出任务确实需要生成 16:9 横屏视频。"
+            )
+            lbl_aspect_warn.setWordWrap(True)
+            lbl_aspect_warn.setStyleSheet("""
+                QLabel {
+                    background-color: #FEE2E2;
+                    color: #DC2626;
+                    border: 2px solid #DC2626;
+                    border-radius: 6px;
+                    padding: 8px 12px;
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+            """)
+            layout.addWidget(lbl_aspect_warn)
         
         lbl_summary = QLabel(
             f"📊 <b>统计信息</b>：共 <b>{total_segments}</b> 个待生成视频片段{skipped_text}{end_stat_text}，"

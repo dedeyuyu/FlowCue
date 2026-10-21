@@ -63,6 +63,32 @@ class ConfigManager:
         ("veo_3_1_lite_low_priority", "Veo 3.1 - Lite [Lower Priority]"),
     ]
     
+    # New Import column mapping defaults & supported types
+    DEFAULT_IMPORT_COLUMNS = [
+        "name",      # 第 1 列：名字
+        "empty",     # 第 2 列：空列
+        "empty",     # 第 3 列：空列
+        "chinese",   # 第 4 列：中文文案
+        "original",  # 第 5 列：原文文案
+        "link",      # 第 6 列：链接
+        "name",      # 第 7 列：名字（补充）
+    ]
+    
+    SUPPORTED_IMPORT_COLUMN_TYPES = [
+        ("name", "🏷️ 名字 (任务名称)"),
+        ("chinese", "🇨🇳 中文 (中文文案)"),
+        ("original", "📝 原文 (外语文案)"),
+        ("link", "🔗 链接 (云盘链接)"),
+        ("empty", "⬜ 空列 (忽略不读取)"),
+    ]
+    
+    REQUIRED_IMPORT_COLUMN_TYPES = [
+        ("name", "名字"),
+        ("chinese", "中文"),
+        ("original", "原文"),
+        ("link", "链接"),
+    ]
+    
     def __init__(self, workspace_dir):
         self.workspace_dir = Path(workspace_dir)
         self.config_path = self.workspace_dir / self.CONFIG_FILE_NAME
@@ -94,6 +120,9 @@ class ConfigManager:
         self.default_generation_mode = self.DEFAULT_GENERATION_MODE
         self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
         self.default_video_model = self.DEFAULT_VIDEO_MODEL
+        
+        # Import columns mapping
+        self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
         
         self._load_dotenv()
         self.load()
@@ -183,6 +212,19 @@ class ConfigManager:
                     model_val = data.get("default_video_model", self.DEFAULT_VIDEO_MODEL)
                     valid_models = {m[0] for m in self.SUPPORTED_VIDEO_MODELS}
                     self.default_video_model = model_val if model_val in valid_models else self.DEFAULT_VIDEO_MODEL
+
+                    raw_cols = data.get("import_columns")
+                    valid_col_types = {c[0] for c in self.SUPPORTED_IMPORT_COLUMN_TYPES}
+                    required_col_types = {c[0] for c in self.REQUIRED_IMPORT_COLUMN_TYPES}
+                    if (
+                        isinstance(raw_cols, list)
+                        and len(raw_cols) >= 4
+                        and all(c in valid_col_types for c in raw_cols)
+                        and required_col_types.issubset(set(raw_cols))
+                    ):
+                        self.import_columns = list(raw_cols)
+                    else:
+                        self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
             except Exception as e:
                 print(f"Error loading config: {e}")
 
@@ -216,7 +258,8 @@ class ConfigManager:
             "task_interval": self.task_interval,
             "default_generation_mode": self.default_generation_mode,
             "default_aspect_ratio": self.default_aspect_ratio,
-            "default_video_model": self.default_video_model
+            "default_video_model": self.default_video_model,
+            "import_columns": list(self.import_columns) if getattr(self, "import_columns", None) else list(self.DEFAULT_IMPORT_COLUMNS),
         })
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
@@ -236,6 +279,7 @@ class ConfigManager:
         self.default_generation_mode = self.DEFAULT_GENERATION_MODE
         self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
         self.default_video_model = self.DEFAULT_VIDEO_MODEL
+        self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
         self.save()
 
     def get_duration_for_length(self, length):

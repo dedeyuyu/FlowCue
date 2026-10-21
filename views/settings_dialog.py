@@ -3,8 +3,29 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QSpinBox, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QMessageBox, QGroupBox, QAbstractItemView, 
                              QLineEdit, QComboBox, QTextEdit, QScrollArea, QWidget,
-                             QCheckBox)
+                             QCheckBox, QGridLayout)
 from PyQt6.QtCore import Qt
+
+
+class NoWheelSpinBox(QSpinBox):
+    """QSpinBox that ignores mouse wheel events so scrolling the dialog never accidentally modifies values."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    """QComboBox that ignores mouse wheel events so scrolling the dialog never accidentally modifies options."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
 
 class SettingsDialog(QDialog):
     """Dialog for configuring app-wide rules (batch points, duration rules, points rules)."""
@@ -105,7 +126,7 @@ class SettingsDialog(QDialog):
         pts_layout.setContentsMargins(12, 12, 12, 12)
         
         pts_layout.addWidget(QLabel("每批次导出上限:"))
-        self.spin_max_points = QSpinBox()
+        self.spin_max_points = NoWheelSpinBox()
         self.spin_max_points.setRange(1, 1000)
         self.spin_max_points.setSuffix(" 积分")
         pts_layout.addWidget(self.spin_max_points)
@@ -130,7 +151,7 @@ class SettingsDialog(QDialog):
         min_chars_layout.setContentsMargins(12, 12, 12, 12)
         
         min_chars_layout.addWidget(QLabel("分段最小字符数:"))
-        self.spin_min_segment_chars = QSpinBox()
+        self.spin_min_segment_chars = NoWheelSpinBox()
         self.spin_min_segment_chars.setRange(0, 500)
         self.spin_min_segment_chars.setSuffix(" 字符")
         self.spin_min_segment_chars.setToolTip("最高优先级规则（仅次于 /// 强制分段）。分段时任何片段的字符数都不会低于此值，过短片段会自动与上下相邻段合并或均分重组。")
@@ -199,7 +220,7 @@ class SettingsDialog(QDialog):
         # Language selector
         lang_layout = QHBoxLayout()
         lang_layout.addWidget(QLabel("🌐 识别语言:"))
-        self.combo_language = QComboBox()
+        self.combo_language = NoWheelComboBox()
         from models.config_manager import ConfigManager
         for code, label in ConfigManager.SUPPORTED_LANGUAGES:
             self.combo_language.addItem(label, code)
@@ -289,7 +310,7 @@ class SettingsDialog(QDialog):
         # Row 1: Task Interval & Generation Mode
         row1_layout = QHBoxLayout()
         row1_layout.addWidget(QLabel("⏱️ 任务完成间隔时间:"))
-        self.spin_task_interval = QSpinBox()
+        self.spin_task_interval = NoWheelSpinBox()
         self.spin_task_interval.setRange(0, 300)
         self.spin_task_interval.setSuffix(" 秒")
         self.spin_task_interval.setFixedWidth(95)
@@ -299,7 +320,7 @@ class SettingsDialog(QDialog):
         row1_layout.addSpacing(20)
         
         row1_layout.addWidget(QLabel("🎬 默认生成模式:"))
-        self.combo_default_mode = QComboBox()
+        self.combo_default_mode = NoWheelComboBox()
         self.combo_default_mode.setStyleSheet(combo_style)
         for mode_code, mode_label in ConfigManager.SUPPORTED_GENERATION_MODES:
             self.combo_default_mode.addItem(mode_label, mode_code)
@@ -309,7 +330,7 @@ class SettingsDialog(QDialog):
         # Row 2: Aspect Ratio & Video Model
         row2_layout = QHBoxLayout()
         row2_layout.addWidget(QLabel("📐 默认画面尺寸:"))
-        self.combo_default_aspect = QComboBox()
+        self.combo_default_aspect = NoWheelComboBox()
         self.combo_default_aspect.setStyleSheet(combo_style)
         self.combo_default_aspect.setFixedWidth(135)
         for aspect_code, aspect_label in ConfigManager.SUPPORTED_ASPECT_RATIOS:
@@ -319,7 +340,7 @@ class SettingsDialog(QDialog):
         row2_layout.addSpacing(20)
         
         row2_layout.addWidget(QLabel("🤖 默认生成模型:"))
-        self.combo_default_model = QComboBox()
+        self.combo_default_model = NoWheelComboBox()
         self.combo_default_model.setStyleSheet(combo_style)
         for model_code, model_label in ConfigManager.SUPPORTED_VIDEO_MODELS:
             self.combo_default_model.addItem(model_label, model_code)
@@ -332,6 +353,60 @@ class SettingsDialog(QDialog):
         gen_rules_layout.addWidget(lbl_gen_rules_hint)
         
         main_layout.addWidget(group_gen_rules)
+        
+        # Section 7: New Import Columns Mapping
+        group_import_cols = QGroupBox("7. 新建导入表格列设置 (New Import Columns Mapping)")
+        import_cols_layout = QVBoxLayout(group_import_cols)
+        import_cols_layout.setContentsMargins(12, 12, 12, 12)
+        import_cols_layout.setSpacing(10)
+
+        top_col_bar = QHBoxLayout()
+        top_col_bar.addWidget(QLabel("📊 表格总列数:"))
+        self.spin_import_col_count = NoWheelSpinBox()
+        self.spin_import_col_count.setRange(4, 20)
+        self.spin_import_col_count.setSuffix(" 列")
+        self.spin_import_col_count.setFixedWidth(85)
+        self.spin_import_col_count.valueChanged.connect(self._on_import_col_count_changed)
+        top_col_bar.addWidget(self.spin_import_col_count)
+
+        btn_add_import_col = QPushButton("＋ 增加一列")
+        btn_add_import_col.setStyleSheet("padding: 4px 10px; font-size: 12px;")
+        btn_add_import_col.clicked.connect(lambda: self.spin_import_col_count.setValue(self.spin_import_col_count.value() + 1))
+        top_col_bar.addWidget(btn_add_import_col)
+
+        btn_del_import_col = QPushButton("－ 减少一列")
+        btn_del_import_col.setStyleSheet("padding: 4px 10px; font-size: 12px;")
+        btn_del_import_col.clicked.connect(lambda: self.spin_import_col_count.setValue(self.spin_import_col_count.value() - 1))
+        top_col_bar.addWidget(btn_del_import_col)
+
+        btn_reset_import_col = QPushButton("🔄 恢复默认7列")
+        btn_reset_import_col.setStyleSheet("background-color: #8D6E63; color: white; padding: 4px 10px; font-size: 12px;")
+        btn_reset_import_col.clicked.connect(self._reset_import_columns_to_default)
+        top_col_bar.addWidget(btn_reset_import_col)
+
+        top_col_bar.addStretch()
+        self.lbl_import_col_status = QLabel("")
+        top_col_bar.addWidget(self.lbl_import_col_status)
+        import_cols_layout.addLayout(top_col_bar)
+
+        self.import_cols_container = QWidget()
+        self.grid_import_cols = QGridLayout(self.import_cols_container)
+        self.grid_import_cols.setContentsMargins(0, 4, 0, 4)
+        self.grid_import_cols.setHorizontalSpacing(14)
+        self.grid_import_cols.setVerticalSpacing(8)
+        import_cols_layout.addWidget(self.import_cols_container)
+        self.import_col_combos = []
+
+        lbl_import_cols_hint = QLabel(
+            "💡 规则说明：无论设置多少列，必须包含【名字、中文、原文、链接】这 4 项必填列。\n"
+            "• 多列设为「名字」时会自动合并作为任务名称（例如第1列名字+第7列名字补充，或第1、2列都设为名字）。\n"
+            "• 设为「空列」的列在复制表格导入时会自动跳过不读取，方便匹配您自己的表格列习惯。"
+        )
+        lbl_import_cols_hint.setWordWrap(True)
+        lbl_import_cols_hint.setStyleSheet("color: #0284C7; font-style: italic; font-size: 11px;")
+        import_cols_layout.addWidget(lbl_import_cols_hint)
+
+        main_layout.addWidget(group_import_cols)
         
         # Bottom Buttons
         bottom_layout = QHBoxLayout()
@@ -360,6 +435,77 @@ class SettingsDialog(QDialog):
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.addWidget(scroll_area)
+
+    def _rebuild_import_col_combos(self, col_types):
+        """Rebuilds the grid of NoWheelComboBox widgets for import columns."""
+        from models.config_manager import ConfigManager
+
+        while self.grid_import_cols.count():
+            item = self.grid_import_cols.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self.import_col_combos = []
+
+        combo_style = """
+            QComboBox {
+                background-color: white;
+                border: 1px solid #D7CCC8;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                color: #5D4037;
+            }
+        """
+        for idx, c_type in enumerate(col_types):
+            row = idx // 3
+            col_group = (idx % 3) * 2
+            lbl = QLabel(f"第 {idx + 1} 列:")
+            lbl.setStyleSheet("font-weight: bold; font-size: 12px; color: #5D4037;")
+            cb = NoWheelComboBox()
+            cb.setStyleSheet(combo_style)
+            for code, label in ConfigManager.SUPPORTED_IMPORT_COLUMN_TYPES:
+                cb.addItem(label, code)
+            found_idx = cb.findData(c_type)
+            cb.setCurrentIndex(found_idx if found_idx >= 0 else cb.findData("empty"))
+            cb.currentIndexChanged.connect(self._update_import_cols_status)
+            self.grid_import_cols.addWidget(lbl, row, col_group)
+            self.grid_import_cols.addWidget(cb, row, col_group + 1)
+            self.grid_import_cols.setColumnStretch(col_group + 1, 1)
+            self.import_col_combos.append(cb)
+
+        self._update_import_cols_status()
+
+    def _on_import_col_count_changed(self, new_count):
+        cur_types = [cb.currentData() for cb in self.import_col_combos]
+        if new_count > len(cur_types):
+            cur_types.extend(["empty"] * (new_count - len(cur_types)))
+        else:
+            cur_types = cur_types[:new_count]
+        self._rebuild_import_col_combos(cur_types)
+
+    def _reset_import_columns_to_default(self):
+        from models.config_manager import ConfigManager
+        default_cols = list(ConfigManager.DEFAULT_IMPORT_COLUMNS)
+        self.spin_import_col_count.blockSignals(True)
+        self.spin_import_col_count.setValue(len(default_cols))
+        self.spin_import_col_count.blockSignals(False)
+        self._rebuild_import_col_combos(default_cols)
+
+    def _get_missing_import_column_names(self):
+        from models.config_manager import ConfigManager
+        selected = {cb.currentData() for cb in self.import_col_combos}
+        missing = [label for code, label in ConfigManager.REQUIRED_IMPORT_COLUMN_TYPES if code not in selected]
+        return missing
+
+    def _update_import_cols_status(self):
+        missing = self._get_missing_import_column_names()
+        if not missing:
+            self.lbl_import_col_status.setText("✅ 已包含全部 4 项必填列（名字、中文、原文、链接）")
+            self.lbl_import_col_status.setStyleSheet("color: #059669; font-weight: bold; font-size: 12px;")
+        else:
+            self.lbl_import_col_status.setText(f"⚠️ 缺少必填列：{'、'.join(missing)}")
+            self.lbl_import_col_status.setStyleSheet("color: #DC2626; font-weight: bold; font-size: 12px;")
 
     def load_data(self):
         self.spin_max_points.setValue(self.cm.max_batch_points)
@@ -412,6 +558,14 @@ class SettingsDialog(QDialog):
         idx_model = self.combo_default_model.findData(model_code)
         self.combo_default_model.setCurrentIndex(idx_model if idx_model >= 0 else 0)
 
+        # Load import columns mapping
+        from models.config_manager import ConfigManager
+        import_cols = list(getattr(self.cm, "import_columns", None) or ConfigManager.DEFAULT_IMPORT_COLUMNS)
+        self.spin_import_col_count.blockSignals(True)
+        self.spin_import_col_count.setValue(len(import_cols))
+        self.spin_import_col_count.blockSignals(False)
+        self._rebuild_import_col_combos(import_cols)
+
     def add_char_row(self):
         row = self.table_char_dur.rowCount()
         self.table_char_dur.insertRow(row)
@@ -447,6 +601,18 @@ class SettingsDialog(QDialog):
         self.table_dur_pts.clearFocus()
         self.setFocus()
         
+        # Validate import columns first
+        missing_import_cols = self._get_missing_import_column_names()
+        if missing_import_cols:
+            QMessageBox.warning(
+                self,
+                "新建导入列设置不完整",
+                f"新建导入表格列必须包含【名字、中文、原文、链接】这 4 项必填列！\n\n"
+                f"当前缺少：{'、'.join(missing_import_cols)}\n"
+                f"请在「7. 新建导入表格列设置」中补充后再保存。"
+            )
+            return
+
         # Read max batch points & forced split marker
         self.cm.max_batch_points = self.spin_max_points.value()
         self.cm.forced_split_marker = self.txt_marker.text().strip() or "///"
@@ -509,6 +675,7 @@ class SettingsDialog(QDialog):
         self.cm.default_generation_mode = self.combo_default_mode.currentData() or "VIDEO_FRAMES"
         self.cm.default_aspect_ratio = self.combo_default_aspect.currentData() or "9:16"
         self.cm.default_video_model = self.combo_default_model.currentData() or "omni_1_1_flash"
+        self.cm.import_columns = [cb.currentData() for cb in self.import_col_combos]
         
         if self.cm.save():
             QMessageBox.information(self, "成功", "设置保存成功！已按新规则生效。")
