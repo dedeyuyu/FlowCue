@@ -88,10 +88,14 @@ class BatchGenerateTabWidget(QWidget):
         
         config_frame = QFrame()
         config_frame.setStyleSheet("QFrame { background-color: white; border: 1px solid #D7CCC8; border-radius: 6px; }")
-        config_layout = QHBoxLayout(config_frame)
+        config_vbox = QVBoxLayout(config_frame)
+        config_vbox.setContentsMargins(10, 8, 10, 8)
+        config_vbox.setSpacing(6)
+
+        config_layout = QHBoxLayout()
         
         config_layout.addWidget(QLabel("整体预设:"))
-        self.cb_template = QComboBox()
+        self.cb_template = NoWheelComboBox()
         self.cb_template.setMinimumWidth(160)
         self.cb_template.setToolTip("设置当前任务的整体默认描述词预设（未单独指定预设的单条任务将自动跟随此预设）")
         self.cb_template.currentIndexChanged.connect(self.on_template_changed)
@@ -104,14 +108,14 @@ class BatchGenerateTabWidget(QWidget):
         config_layout.addWidget(self.btn_reset_row_presets)
         
         config_layout.addWidget(QLabel("单个任务块时长:"))
-        self.cb_duration = QComboBox()
+        self.cb_duration = NoWheelComboBox()
         self.cb_duration.addItems(["4秒", "6秒", "8秒", "10秒"])
         self.cb_duration.setCurrentText("8秒")
         self.cb_duration.currentIndexChanged.connect(self.save_current_project)
         config_layout.addWidget(self.cb_duration)
         
         config_layout.addWidget(QLabel("尺寸比例:"))
-        self.cb_aspect = QComboBox()
+        self.cb_aspect = NoWheelComboBox()
         self.cb_aspect.addItems(["16:9", "9:16"])
         self.cb_aspect.setCurrentText("16:9")
         self.cb_aspect.currentIndexChanged.connect(self.save_current_project)
@@ -124,6 +128,34 @@ class BatchGenerateTabWidget(QWidget):
         self.sb_points.setToolTip("每个导出的JSON任务块最高消耗积分")
         self.sb_points.valueChanged.connect(self.save_current_project)
         config_layout.addWidget(self.sb_points)
+        config_vbox.addLayout(config_layout)
+
+        # Row 2: Category selection & sequential/cycle distribution ("随机发放")
+        cat_distribute_layout = QHBoxLayout()
+        cat_distribute_layout.addWidget(QLabel("📂 预设分类:"))
+        self.cb_category = NoWheelComboBox()
+        self.cb_category.setMinimumWidth(220)
+        self.cb_category.setToolTip("选择在「模板配置 -> 批量模板」中设置好的预设分类")
+        cat_distribute_layout.addWidget(self.cb_category)
+
+        self.btn_distribute_category = QPushButton("🎲 随机发放")
+        self.btn_distribute_category.setToolTip(
+            "将所选分类下的预设按顺序（1、2、3...）依次分配给下方每一条任务的「单独预设」，\n"
+            "尽量不重复；当任务数多于该分类的预设数时自动从头循环铺满全部任务。"
+        )
+        self.btn_distribute_category.setStyleSheet(
+            "QPushButton { background-color: #7E57C2; color: white; padding: 5px 14px; font-size: 13px; font-weight: bold; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #673AB7; }"
+            "QPushButton:pressed { background-color: #512DA8; }"
+        )
+        self.btn_distribute_category.clicked.connect(self.distribute_category_presets_to_rows)
+        cat_distribute_layout.addWidget(self.btn_distribute_category)
+
+        lbl_cat_hint = QLabel("💡 选择分类后点击「随机发放」，将按分类内预设顺序依次循环铺满所有单条任务")
+        lbl_cat_hint.setStyleSheet("color: #8D6E63; font-size: 12px; font-weight: normal;")
+        cat_distribute_layout.addWidget(lbl_cat_hint)
+        cat_distribute_layout.addStretch()
+        config_vbox.addLayout(cat_distribute_layout)
         
         right_layout.addWidget(config_frame)
         
@@ -192,16 +224,36 @@ class BatchGenerateTabWidget(QWidget):
         prev_tpl_id = self.cb_template.currentData()
         if not prev_tpl_id and self.current_project:
             prev_tpl_id = self.current_project.get("template_id", "")
+        batch_templates = self._get_batch_templates_list()
         self.cb_template.blockSignals(True)
         self.cb_template.clear()
         self.cb_template.addItem("未选择", "")
-        for t in self._get_batch_templates_list():
-            self.cb_template.addItem(t.get("name", "未命名"), t.get("id"))
+        for t in batch_templates:
+            cat = (t.get("category") or "").strip()
+            label = f"【{cat}】{t.get('name', '未命名')}" if cat else t.get("name", "未命名")
+            self.cb_template.addItem(label, t.get("id"))
         if prev_tpl_id:
             idx = self.cb_template.findData(prev_tpl_id)
             if idx >= 0:
                 self.cb_template.setCurrentIndex(idx)
         self.cb_template.blockSignals(False)
+
+        if hasattr(self, "cb_category"):
+            prev_cat = self.cb_category.currentData()
+            self.cb_category.blockSignals(True)
+            self.cb_category.clear()
+            tm = getattr(self.main_window, "template_manager", None) if self.main_window else None
+            categories = tm.get_batch_categories() if (tm and hasattr(tm, "get_batch_categories")) else []
+            for c in categories:
+                cnt = sum(1 for t in batch_templates if (t.get("category") or "").strip() == c)
+                self.cb_category.addItem(f"📂 {c} ({cnt}个预设)", c)
+            self.cb_category.addItem(f"📋 全部批量预设 ({len(batch_templates)}个)", "__ALL__")
+            if prev_cat:
+                c_idx = self.cb_category.findData(prev_cat)
+                if c_idx >= 0:
+                    self.cb_category.setCurrentIndex(c_idx)
+            self.cb_category.blockSignals(False)
+
         if self.current_project and not self._is_rendering_table:
             self.render_table()
 
@@ -348,6 +400,53 @@ class BatchGenerateTabWidget(QWidget):
         self.model.save_project(self.current_project)
         self.render_table()
         QMessageBox.information(self, "已恢复跟随整体预设", "所有单条任务的单独预设已清除，现已统一跟随上方的「整体预设」！")
+
+    def distribute_category_presets_to_rows(self):
+        """
+        将所选分类下的预设按顺序（1, 2, 3, ..., K）依次循环发放给所有单条任务的「单独预设」，
+        若任务数大于预设数（如 20 个任务、10 个预设），则发完一轮 1~10 后继续从 1~10 循环铺满。
+        """
+        if not self.current_project:
+            QMessageBox.warning(self, "提示", "请先在左侧选择或导入一个批量任务！")
+            return
+
+        images = self.current_project.get("images", [])
+        if not images:
+            QMessageBox.warning(self, "提示", "当前批量任务中没有图片条目。")
+            return
+
+        selected_cat = self.cb_category.currentData() if hasattr(self, "cb_category") else "__ALL__"
+        all_templates = self._get_batch_templates_list()
+        if selected_cat in ("__ALL__", None, ""):
+            pool = list(all_templates)
+            cat_display = "全部批量预设"
+        else:
+            pool = [t for t in all_templates if (t.get("category") or "").strip() == selected_cat]
+            cat_display = selected_cat
+
+        if not pool:
+            QMessageBox.warning(
+                self,
+                "该分类下无预设",
+                f"分类【{cat_display}】下还没有任何预设！\n\n"
+                "请先点击顶部「⚙️ 模板配置」->「🚀 批量模板」，将预设设置到该分类后再点击随机发放。"
+            )
+            return
+
+        pool_len = len(pool)
+        for i, img in enumerate(images):
+            chosen_tpl = pool[i % pool_len]
+            img["template_id"] = chosen_tpl.get("id", "")
+            img["prompt"] = chosen_tpl.get("content", "")
+
+        self.model.save_project(self.current_project)
+        self.render_table()
+        QMessageBox.information(
+            self,
+            "发放完成",
+            f"🎲 已按分类【{cat_display}】（共 {pool_len} 个预设）依次循环发放，\n"
+            f"已将全部 {len(images)} 条任务的「单独预设」与「提示词」自动铺满并保存！"
+        )
 
     def on_row_template_changed(self, row: int, combo: QComboBox):
         """Handle changing a single row's individual template preset."""
@@ -752,7 +851,9 @@ class BatchGenerateTabWidget(QWidget):
                 cb_row_tpl.setToolTip("为该单条任务指定独立的描述词预设（默认跟随整体预设）")
                 cb_row_tpl.addItem("🔗 跟随整体预设", "")
                 for t in batch_templates:
-                    cb_row_tpl.addItem(f"📌 {t.get('name', '未命名')}", t.get("id", ""))
+                    cat = (t.get("category") or "").strip()
+                    t_label = f"📌 [{cat}] {t.get('name', '未命名')}" if cat else f"📌 {t.get('name', '未命名')}"
+                    cb_row_tpl.addItem(t_label, t.get("id", ""))
 
                 found_idx = cb_row_tpl.findData(row_tpl_id) if row_tpl_id else 0
                 if found_idx >= 0:

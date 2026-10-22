@@ -9,16 +9,19 @@ class TemplateManager:
     TEMPLATES_FILE = "prompt_templates.json"
     MOTIONS_FILE = "camera_motions.json"
     BATCH_TEMPLATES_FILE = "batch_templates.json"
+    BATCH_CATEGORIES_FILE = "batch_categories.json"
     
     def __init__(self, workspace_dir):
         self.workspace_dir = Path(workspace_dir)
         self.templates_path = self.workspace_dir / self.TEMPLATES_FILE
         self.motions_path = self.workspace_dir / self.MOTIONS_FILE
         self.batch_templates_path = self.workspace_dir / self.BATCH_TEMPLATES_FILE
+        self.batch_categories_path = self.workspace_dir / self.BATCH_CATEGORIES_FILE
         
         self.templates = []
         self.motions = []
         self.batch_templates = []
+        self.batch_categories = []
         
         self.load_all()
 
@@ -26,6 +29,7 @@ class TemplateManager:
         self.load_templates()
         self.load_motions()
         self.load_batch_templates()
+        self.load_batch_categories()
 
     def load_templates(self):
         """Loads prompt templates from file. Initializes defaults if missing."""
@@ -236,6 +240,7 @@ class TemplateManager:
                 "templates": self.templates,
                 "motions": self.motions,
                 "batch_templates": self.batch_templates,
+                "batch_categories": self.get_batch_categories(),
             }
             with open(export_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
@@ -255,7 +260,15 @@ class TemplateManager:
                 self.motions = data["motions"]
             if "batch_templates" in data and isinstance(data["batch_templates"], list):
                 self.batch_templates = data["batch_templates"]
+                for t in self.batch_templates:
+                    if "category" not in t:
+                        t["category"] = ""
                 self.save_batch_templates()
+            if "batch_categories" in data and isinstance(data["batch_categories"], list):
+                self.batch_categories = [str(c).strip() for c in data["batch_categories"] if str(c).strip()]
+                self.save_batch_categories()
+            else:
+                self._sync_categories_from_templates()
                 
             self.save_templates()
             self.save_motions()
@@ -266,11 +279,13 @@ class TemplateManager:
     def load_batch_templates(self):
         if self.batch_templates_path.exists():
             try:
-                import json
                 with open(self.batch_templates_path, 'r', encoding='utf-8') as f:
                     self.batch_templates = json.load(f)
                 if not self.batch_templates:
                     self.init_default_batch_templates()
+                for t in self.batch_templates:
+                    if "category" not in t:
+                        t["category"] = ""
             except Exception as e:
                 print(f'Error loading batch templates: {e}')
                 self.init_default_batch_templates()
@@ -279,9 +294,9 @@ class TemplateManager:
 
     def save_batch_templates(self):
         try:
-            import json
             with open(self.batch_templates_path, 'w', encoding='utf-8') as f:
                 json.dump(self.batch_templates, f, ensure_ascii=False, indent=2)
+            self._sync_categories_from_templates()
             return True
         except Exception as e:
             print(f'Error saving batch templates: {e}')
@@ -292,7 +307,65 @@ class TemplateManager:
             {
                 'id': 'bt-01',
                 'name': '默认批量模板',
-                'content': 'A high quality image.'
+                'content': 'A high quality image.',
+                'category': ''
             }
         ]
         self.save_batch_templates()
+
+    def load_batch_categories(self):
+        if self.batch_categories_path.exists():
+            try:
+                with open(self.batch_categories_path, 'r', encoding='utf-8') as f:
+                    cats = json.load(f)
+                if isinstance(cats, list):
+                    self.batch_categories = [str(c).strip() for c in cats if str(c).strip()]
+            except Exception as e:
+                print(f'Error loading batch categories: {e}')
+                self.batch_categories = []
+        self._sync_categories_from_templates()
+
+    def _sync_categories_from_templates(self):
+        changed = False
+        for t in self.batch_templates:
+            cat = str(t.get("category", "") or "").strip()
+            if cat and cat not in self.batch_categories:
+                self.batch_categories.append(cat)
+                changed = True
+        if changed:
+            self.save_batch_categories()
+
+    def save_batch_categories(self):
+        try:
+            with open(self.batch_categories_path, 'w', encoding='utf-8') as f:
+                json.dump(self.batch_categories, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            print(f'Error saving batch categories: {e}')
+            return False
+
+    def get_batch_categories(self):
+        self._sync_categories_from_templates()
+        return list(self.batch_categories)
+
+    def add_batch_category(self, category_name: str):
+        cat = (category_name or "").strip()
+        if not cat:
+            return False
+        if cat not in self.batch_categories:
+            self.batch_categories.append(cat)
+            self.save_batch_categories()
+        return True
+
+    def delete_batch_category(self, category_name: str):
+        cat = (category_name or "").strip()
+        if not cat:
+            return False
+        if cat in self.batch_categories:
+            self.batch_categories.remove(cat)
+        for t in self.batch_templates:
+            if (t.get("category") or "").strip() == cat:
+                t["category"] = ""
+        self.save_batch_templates()
+        self.save_batch_categories()
+        return True

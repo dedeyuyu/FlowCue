@@ -2,9 +2,111 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QLabel, QLineEdit, 
                              QTextEdit, QTabWidget, QWidget, QMessageBox, QSplitter,
-                             QFileDialog, QAbstractItemView)
+                             QFileDialog, QAbstractItemView, QComboBox, QInputDialog)
 from PyQt6.QtCore import Qt
 import uuid
+
+
+class BatchCategoryAssignDialog(QDialog):
+    """弹窗：支持一次性勾选 10~20 个批量预设并统一归入某个分类"""
+    def __init__(self, template_manager, default_category="", parent=None):
+        super().__init__(parent)
+        self.tm = template_manager
+        self.setWindowTitle("📂 批量设置预设分类")
+        self.resize(520, 560)
+        self.setStyleSheet("""
+            QDialog { background-color: #FAF6F0; color: #5D4037; }
+            QLabel { font-size: 13px; color: #5D4037; font-weight: bold; }
+            QComboBox, QLineEdit, QListWidget {
+                background-color: white; border: 1px solid #D7CCC8; border-radius: 4px;
+                padding: 5px; color: #3E2723; font-size: 13px;
+            }
+            QPushButton {
+                background-color: #E0A96D; color: white; border: none; border-radius: 4px;
+                padding: 6px 12px; font-size: 13px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #D2904C; }
+        """)
+        layout = QVBoxLayout(self)
+
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("目标分类名称:"))
+        self.cb_target_cat = QComboBox()
+        self.cb_target_cat.setEditable(True)
+        self.cb_target_cat.setMinimumWidth(240)
+        self.cb_target_cat.lineEdit().setPlaceholderText("选择已有分类或直接输入新分类名称（留空设为未分类）")
+        self.cb_target_cat.addItem("", "")
+        for c in self.tm.get_batch_categories():
+            self.cb_target_cat.addItem(c, c)
+        if default_category and default_category not in ("__ALL__", "__UNCATEGORIZED__"):
+            self.cb_target_cat.setCurrentText(default_category)
+        else:
+            self.cb_target_cat.setCurrentIndex(0)
+        cat_row.addWidget(self.cb_target_cat, stretch=1)
+        layout.addLayout(cat_row)
+
+        sel_hdr = QHBoxLayout()
+        sel_hdr.addWidget(QLabel("请勾选要归入该分类的批量模板预设:"))
+        sel_hdr.addStretch()
+        btn_all = QPushButton("全选")
+        btn_all.setStyleSheet("background-color: #8D6E63; padding: 3px 8px; font-size: 12px;")
+        btn_all.clicked.connect(lambda: self._set_all_checked(Qt.CheckState.Checked))
+        btn_none = QPushButton("清空勾选")
+        btn_none.setStyleSheet("background-color: #B0BEC5; color: #37474F; padding: 3px 8px; font-size: 12px;")
+        btn_none.clicked.connect(lambda: self._set_all_checked(Qt.CheckState.Unchecked))
+        sel_hdr.addWidget(btn_all)
+        sel_hdr.addWidget(btn_none)
+        layout.addLayout(sel_hdr)
+
+        self.list_items = QListWidget()
+        target_cat_Now = self.cb_target_cat.currentText().strip()
+        for t in self.tm.batch_templates:
+            cur_cat = (t.get("category") or "").strip()
+            prefix = f"【{cur_cat}】" if cur_cat else "【未分类】"
+            item = QListWidgetItem(f"{prefix} {t.get('name', '未命名')}")
+            item.setData(Qt.ItemDataRole.UserRole, t.get("id"))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            if target_cat_Now and cur_cat == target_cat_Now:
+                item.setCheckState(Qt.CheckState.Checked)
+            else:
+                item.setCheckState(Qt.CheckState.Unchecked)
+            self.list_items.addItem(item)
+        layout.addWidget(self.list_items, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setStyleSheet("background-color: #B0BEC5; color: #37474F;")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("✅ 确认归入该分类")
+        btn_ok.setStyleSheet("background-color: #4CAF50; color: white;")
+        btn_ok.clicked.connect(self.on_confirm)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        layout.addLayout(btn_row)
+
+    def _set_all_checked(self, state: Qt.CheckState):
+        for i in range(self.list_items.count()):
+            self.list_items.item(i).setCheckState(state)
+
+    def on_confirm(self):
+        checked_ids = set()
+        for i in range(self.list_items.count()):
+            it = self.list_items.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                checked_ids.add(it.data(Qt.ItemDataRole.UserRole))
+        if not checked_ids:
+            QMessageBox.warning(self, "未勾选预设", "请至少勾选一个要归类的批量模板预设！")
+            return
+        target_cat = self.cb_target_cat.currentText().strip()
+        if target_cat:
+            self.tm.add_batch_category(target_cat)
+        for t in self.tm.batch_templates:
+            if t.get("id") in checked_ids:
+                t["category"] = target_cat
+        self.tm.save_batch_templates()
+        self.accept()
+
 
 class TemplateConfigDialog(QDialog):
     """Dialog for managing prompt templates and camera motion presets."""
@@ -34,7 +136,7 @@ class TemplateConfigDialog(QDialog):
 
     def init_ui(self):
         self.setWindowTitle("模板与运镜配置 (Templates & Motions Config)")
-        self.resize(850, 550)
+        self.resize(900, 580)
         
         # Apply stylesheet matching the warm theme
         self.setStyleSheet("""
@@ -48,7 +150,7 @@ class TemplateConfigDialog(QDialog):
                 color: #5D4037;
                 font-weight: bold;
             }
-            QLineEdit, QTextEdit {
+            QLineEdit, QTextEdit, QComboBox {
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
@@ -240,7 +342,7 @@ class TemplateConfigDialog(QDialog):
         right_widget.setLayout(right_layout)
         splitter.addWidget(right_widget)
         
-        splitter.setSizes([320, 530])
+        splitter.setSizes([350, 550])
         layout.addWidget(splitter)
         self.tabs.addTab(tab, "📝 提示词模板")
 
@@ -318,7 +420,7 @@ class TemplateConfigDialog(QDialog):
         right_widget.setLayout(right_layout)
         splitter.addWidget(right_widget)
         
-        splitter.setSizes([320, 530])
+        splitter.setSizes([350, 550])
         layout.addWidget(splitter)
         self.tabs.addTab(tab, "🎥 运镜预设")
 
@@ -364,29 +466,94 @@ class TemplateConfigDialog(QDialog):
         self.on_motion_selected(self.list_motions.currentRow())
 
     def _sync_batch_order(self):
-        """Sync self.tm.batch_templates order with self.list_batch and save to disk."""
+        """Sync self.tm.batch_templates order with self.list_batch (supports filtered view) and save to disk."""
         id_map = {t["id"]: t for t in self.tm.batch_templates if "id" in t}
+        visible_ids = [self.list_batch.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list_batch.count())]
+        visible_set = set(visible_ids)
+        visible_iter = iter([id_map[bid] for bid in visible_ids if bid in id_map])
+
         new_order = []
-        for i in range(self.list_batch.count()):
-            bt_id = self.list_batch.item(i).data(Qt.ItemDataRole.UserRole)
-            if bt_id in id_map:
-                new_order.append(id_map[bt_id])
+        for t in self.tm.batch_templates:
+            if t.get("id") in visible_set:
+                nxt = next(visible_iter, None)
+                if nxt is not None:
+                    new_order.append(nxt)
+            else:
+                new_order.append(t)
+
         if len(new_order) == len(self.tm.batch_templates):
             self.tm.batch_templates = new_order
             self.tm.save_batch_templates()
         self.on_batch_selected(self.list_batch.currentRow())
 
+    def _format_batch_item_label(self, tpl: dict) -> str:
+        name = tpl.get("name", "未命名批量模板")
+        cat = (tpl.get("category") or "").strip()
+        return f"【{cat}】{name}" if cat else name
+
+    def _refresh_batch_category_widgets(self, keep_filter_data=None, keep_edit_cat=None):
+        """Refresh both the filter dropdown on the left and the editable category dropdown on the right."""
+        if not hasattr(self, "cb_batch_filter_cat"):
+            return
+        cur_filter = keep_filter_data if keep_filter_data is not None else self.cb_batch_filter_cat.currentData()
+        cur_edit = keep_edit_cat if keep_edit_cat is not None else self.cb_batch_category.currentText().strip()
+
+        categories = self.tm.get_batch_categories()
+        total_cnt = len(self.tm.batch_templates)
+        uncat_cnt = sum(1 for t in self.tm.batch_templates if not (t.get("category") or "").strip())
+
+        self.cb_batch_filter_cat.blockSignals(True)
+        self.cb_batch_filter_cat.clear()
+        self.cb_batch_filter_cat.addItem(f"📋 全部批量模板 ({total_cnt})", "__ALL__")
+        self.cb_batch_filter_cat.addItem(f"⚪ 未分类 ({uncat_cnt})", "__UNCATEGORIZED__")
+        for c in categories:
+            cnt = sum(1 for t in self.tm.batch_templates if (t.get("category") or "").strip() == c)
+            self.cb_batch_filter_cat.addItem(f"📂 {c} ({cnt})", c)
+
+        idx = self.cb_batch_filter_cat.findData(cur_filter)
+        self.cb_batch_filter_cat.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cb_batch_filter_cat.blockSignals(False)
+
+        self.cb_batch_category.blockSignals(True)
+        self.cb_batch_category.clear()
+        self.cb_batch_category.addItem("", "")
+        for c in categories:
+            self.cb_batch_category.addItem(c, c)
+        self.cb_batch_category.setCurrentText(cur_edit)
+        self.cb_batch_category.blockSignals(False)
+
+    def _populate_batch_list(self, select_id=None):
+        """Populate self.list_batch according to the selected category filter."""
+        if not hasattr(self, "list_batch"):
+            return
+        filter_val = self.cb_batch_filter_cat.currentData() if hasattr(self, "cb_batch_filter_cat") else "__ALL__"
+        self.list_batch.blockSignals(True)
+        self.list_batch.clear()
+        selected_row = 0
+        for t in self.tm.batch_templates:
+            if "id" not in t:
+                t["id"] = "bt-" + uuid.uuid4().hex[:8]
+            cat = (t.get("category") or "").strip()
+            if filter_val == "__UNCATEGORIZED__" and cat != "":
+                continue
+            elif filter_val not in ("__ALL__", "__UNCATEGORIZED__", None) and cat != filter_val:
+                continue
+            item = self._create_draggable_item(self._format_batch_item_label(t), t["id"])
+            self.list_batch.addItem(item)
+            if select_id and t["id"] == select_id:
+                selected_row = self.list_batch.count() - 1
+        self.list_batch.blockSignals(False)
+
+        if self.list_batch.count() > 0:
+            self.list_batch.setCurrentRow(selected_row)
+        else:
+            self.on_batch_selected(-1)
+
     def load_data(self):
         """Loads items from template manager into widgets."""
         if hasattr(self, "list_batch"):
-            self.list_batch.clear()
-            for t in self.tm.batch_templates:
-                if "id" not in t:
-                    t["id"] = "bt-" + uuid.uuid4().hex[:8]
-                item = self._create_draggable_item(t.get("name", "未命名批量模板"), t["id"])
-                self.list_batch.addItem(item)
-            if self.list_batch.count() > 0:
-                self.list_batch.setCurrentRow(0)
+            self._refresh_batch_category_widgets()
+            self._populate_batch_list()
 
         # Load templates
         self.list_templates.clear()
@@ -623,6 +790,33 @@ class TemplateConfigDialog(QDialog):
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Category Filter & Management Row
+        cat_filter_row = QHBoxLayout()
+        cat_filter_row.addWidget(QLabel("分类筛选:"))
+        self.cb_batch_filter_cat = QComboBox()
+        self.cb_batch_filter_cat.setToolTip("按分类筛选查看批量模板预设")
+        self.cb_batch_filter_cat.currentIndexChanged.connect(lambda _: self._populate_batch_list())
+        cat_filter_row.addWidget(self.cb_batch_filter_cat, stretch=1)
+
+        self.btn_add_cat = QPushButton("＋分类")
+        self.btn_add_cat.setObjectName("btn_move")
+        self.btn_add_cat.setToolTip("新建一个批量模板分类")
+        self.btn_add_cat.clicked.connect(self.add_new_batch_category)
+        cat_filter_row.addWidget(self.btn_add_cat)
+
+        self.btn_batch_assign_cat = QPushButton("📂 批量归类")
+        self.btn_batch_assign_cat.setObjectName("btn_move")
+        self.btn_batch_assign_cat.setToolTip("一次性勾选多个预设归入指定分类")
+        self.btn_batch_assign_cat.clicked.connect(self.open_batch_assign_category_dialog)
+        cat_filter_row.addWidget(self.btn_batch_assign_cat)
+
+        self.btn_del_cat = QPushButton("🗑️")
+        self.btn_del_cat.setObjectName("btn_move")
+        self.btn_del_cat.setToolTip("删除当前选中的分类（仅移除分类标签，不删除模板本身）")
+        self.btn_del_cat.clicked.connect(self.delete_current_batch_category)
+        cat_filter_row.addWidget(self.btn_del_cat)
+        left_layout.addLayout(cat_filter_row)
+
         hdr_batch_layout = QHBoxLayout()
         hdr_batch_layout.addWidget(QLabel("已保存批量模板 (支持拖动排序):"))
         hdr_batch_layout.addStretch()
@@ -661,6 +855,17 @@ class TemplateConfigDialog(QDialog):
         right_layout.addWidget(QLabel("批量模板名称:"))
         self.txt_batch_name = QLineEdit()
         right_layout.addWidget(self.txt_batch_name)
+
+        cat_edit_row = QHBoxLayout()
+        cat_edit_row.addWidget(QLabel("所属分类 (可直接输入新分类或下拉选择):"))
+        cat_edit_row.addStretch()
+        right_layout.addLayout(cat_edit_row)
+
+        self.cb_batch_category = QComboBox()
+        self.cb_batch_category.setEditable(True)
+        self.cb_batch_category.lineEdit().setPlaceholderText("未分类（可下拉选择已有分类，或直接输入新分类名后点击保存）")
+        right_layout.addWidget(self.cb_batch_category)
+
         right_layout.addWidget(QLabel("模板内容:"))
         self.txt_batch_content = QTextEdit()
         right_layout.addWidget(self.txt_batch_content)
@@ -673,36 +878,75 @@ class TemplateConfigDialog(QDialog):
         right_layout.addLayout(save_layout)
         
         splitter.addWidget(right_widget)
-        splitter.setSizes([320, 530])
+        splitter.setSizes([380, 520])
         layout.addWidget(splitter)
         self.tabs.addTab(tab, "🚀 批量模板")
+
+    def add_new_batch_category(self):
+        cat_name, ok = QInputDialog.getText(self, "新建批量模板分类", "请输入新分类名称（如：女声动作类、男声沉思类）：")
+        if ok and cat_name.strip():
+            cat = cat_name.strip()
+            self.tm.add_batch_category(cat)
+            self._refresh_batch_category_widgets(keep_filter_data=cat, keep_edit_cat=cat)
+            self._populate_batch_list()
+
+    def open_batch_assign_category_dialog(self):
+        cur_filter = self.cb_batch_filter_cat.currentData()
+        default_cat = cur_filter if cur_filter not in ("__ALL__", "__UNCATEGORIZED__") else ""
+        dlg = BatchCategoryAssignDialog(self.tm, default_category=default_cat, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            target_cat = dlg.cb_target_cat.currentText().strip()
+            keep_filter = target_cat if target_cat else "__ALL__"
+            self._refresh_batch_category_widgets(keep_filter_data=keep_filter)
+            self._populate_batch_list()
+            QMessageBox.information(self, "归类完成", f"已将所选预设归入分类：【{target_cat or '未分类'}】！")
+
+    def delete_current_batch_category(self):
+        cur_filter = self.cb_batch_filter_cat.currentData()
+        if cur_filter in ("__ALL__", "__UNCATEGORIZED__", None):
+            QMessageBox.information(self, "提示", "请先在左上角「分类筛选」中选择一个具体分类，再点击删除分类按钮。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认删除分类",
+            f"确定要删除分类【{cur_filter}】吗？\n\n注：该分类下的模板不会被删除，仅恢复为「未分类」状态。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tm.delete_batch_category(cur_filter)
+            self._refresh_batch_category_widgets(keep_filter_data="__ALL__", keep_edit_cat="")
+            self._populate_batch_list()
 
     def on_batch_selected(self, row):
         if row < 0 or row >= self.list_batch.count():
             self.txt_batch_name.clear()
             self.txt_batch_content.clear()
+            if hasattr(self, "cb_batch_category"):
+                self.cb_batch_category.setCurrentText("")
             return
         item = self.list_batch.item(row)
         bt_id = item.data(Qt.ItemDataRole.UserRole)
         tpl = next((t for t in self.tm.batch_templates if t.get("id") == bt_id), None)
-        if not tpl and row < len(self.tm.batch_templates):
-            tpl = self.tm.batch_templates[row]
         if tpl:
             self.txt_batch_name.setText(tpl.get("name", ""))
             self.txt_batch_content.setPlainText(tpl.get("content", ""))
+            if hasattr(self, "cb_batch_category"):
+                self.cb_batch_category.setCurrentText((tpl.get("category") or "").strip())
 
     def new_batch_template(self):
         new_id = "bt-" + uuid.uuid4().hex[:8]
+        cur_filter = self.cb_batch_filter_cat.currentData() if hasattr(self, "cb_batch_filter_cat") else "__ALL__"
+        default_cat = cur_filter if cur_filter not in ("__ALL__", "__UNCATEGORIZED__", None) else ""
         new_tpl = {
             "id": new_id,
             "name": "新建批量模板",
-            "content": "在此输入批量生成提示词..."
+            "content": "在此输入批量生成提示词...",
+            "category": default_cat
         }
         self.tm.batch_templates.append(new_tpl)
         self.tm.save_batch_templates()
-        item = self._create_draggable_item(new_tpl["name"], new_id)
-        self.list_batch.addItem(item)
-        self.list_batch.setCurrentItem(item)
+        self._refresh_batch_category_widgets(keep_filter_data=cur_filter, keep_edit_cat=default_cat)
+        self._populate_batch_list(select_id=new_id)
         self.txt_batch_name.setFocus()
 
     def delete_batch_template(self):
@@ -713,9 +957,11 @@ class TemplateConfigDialog(QDialog):
         bt_id = item.data(Qt.ItemDataRole.UserRole)
         reply = QMessageBox.question(self, "确认删除", "是否确定删除该批量模板？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
+            cur_filter = self.cb_batch_filter_cat.currentData()
             self.tm.batch_templates = [t for t in self.tm.batch_templates if t.get("id") != bt_id]
             self.tm.save_batch_templates()
-            self.list_batch.takeItem(row)
+            self._refresh_batch_category_widgets(keep_filter_data=cur_filter)
+            self._populate_batch_list()
 
     def save_batch_template(self):
         row = self.list_batch.currentRow()
@@ -727,21 +973,27 @@ class TemplateConfigDialog(QDialog):
         if not name:
             QMessageBox.warning(self, "名称为空", "批量模板名称不能为空。")
             return
-            
+
+        category = self.cb_batch_category.currentText().strip() if hasattr(self, "cb_batch_category") else ""
+        if category:
+            self.tm.add_batch_category(category)
+
         item = self.list_batch.item(row)
         bt_id = item.data(Qt.ItemDataRole.UserRole)
-        matched = False
         for t in self.tm.batch_templates:
             if t.get("id") == bt_id:
                 t["name"] = name
+                t["category"] = category
                 t["content"] = self.txt_batch_content.toPlainText()
-                matched = True
                 break
-        if not matched and row < len(self.tm.batch_templates):
-            self.tm.batch_templates[row]["name"] = name
-            self.tm.batch_templates[row]["content"] = self.txt_batch_content.toPlainText()
+
         if self.tm.save_batch_templates():
-            item.setText(name)
+            cur_filter = self.cb_batch_filter_cat.currentData()
+            # If user changed category while filtering by another specific category, switch filter to the new category so item stays visible
+            if cur_filter not in ("__ALL__", None) and cur_filter != category:
+                cur_filter = category if category else "__ALL__"
+            self._refresh_batch_category_widgets(keep_filter_data=cur_filter, keep_edit_cat=category)
+            self._populate_batch_list(select_id=bt_id)
             QMessageBox.information(self, "成功", "批量模板已保存！")
         else:
             QMessageBox.critical(self, "错误", "批量模板保存失败。")

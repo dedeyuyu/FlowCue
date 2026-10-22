@@ -2737,8 +2737,8 @@
                    document.querySelector("div.ProseMirror[contenteditable='true']");
     const promptRoot = editor?.closest("flow-prompt-box, .prompt-box-container, .prompt-box, form") ||
                        document.querySelector("flow-prompt-box, .prompt-box-container, .prompt-box") ||
-                       document.querySelector("flow-ingredient-bar, .prompt-ingredient-bar")?.parentElement ||
-                       document;
+                       document.querySelector("flow-ingredient-bar, .prompt-ingredient-bar")?.parentElement;
+    if (!promptRoot) return null;
 
     const getTooltipAndLabelText = (btn) => {
       const parts = [
@@ -4683,17 +4683,20 @@
       const isEndSlot = (el) => /(结束|結束|\bend\b)/i.test(((el?.textContent || "") + " " + (el?.getAttribute?.("aria-label") || "")).trim());
       const startTrigger = allTriggers.find(t => !isEndSlot(t)) || null;
       if (startTrigger) {
-        // 如果首帧已有内容且匹配当前图片，无需重复添加
-        const triggerImg = startTrigger.querySelector("img");
+        // 如果首帧槽位或 ingredientBar 中已挂载了图片（存在缩略图或不再是空的 empty-chip 按钮），直接返回，严禁误点已挂载图片导致卸载/删除！
+        const emptyChipBtn = startTrigger.querySelector("button.empty-chip");
+        const triggerImg = startTrigger.querySelector("img, flow-tile, flow-media-tile, [role='img'], [style*='background-image']") ||
+                           ingredientBar.querySelector("img, flow-tile, flow-media-tile, flow-ingredient-chip, .ingredient-chip, mat-chip");
+        const hasNonEmptyBtn = !!startTrigger.querySelector("button:not(.empty-chip)");
         const triggerTitle = extractTileDisplayName(startTrigger, triggerImg);
         const triggerText = startTrigger.textContent || "";
-        if (imgName && (isImageNameMatch(imgName, triggerTitle) || isImageNameMatch(imgName, triggerText))) {
-          console.log("[FlowUI] 首帧槽位中已存在匹配图片，无需重复注入:", imgName);
+        if (triggerImg || (!emptyChipBtn && hasNonEmptyBtn) || (imgName && (isImageNameMatch(imgName, triggerTitle) || isImageNameMatch(imgName, triggerText)))) {
+          console.log("[FlowUI] 首帧槽位中已挂载图片，无需重复点击首帧按钮:", imgName);
           return;
         }
 
-        // 点击“开始”按钮（button.empty-chip 或 button）打开媒体选择面板（严禁误点“结束”帧按钮）
-        const startBtn = startTrigger.querySelector("button.empty-chip") || startTrigger.querySelector("button");
+        // 仅在首帧槽位为空时点击“开始”槽位按钮打开媒体选择面板（严禁在已有图片时点击内部按钮，严禁误点“结束”帧按钮）
+        const startBtn = emptyChipBtn || startTrigger.querySelector("button");
         if (startBtn && !isEndSlot(startBtn)) {
           console.log("[FlowUI] 点击首帧触发器按钮 [开始] 弹出媒体选择面板...");
           simulateClick(startBtn);
@@ -4903,38 +4906,33 @@
     // 2. 检查 DOM: flow-ingredient-bar / .prompt-ingredient-bar
     const ingredientBar = document.querySelector("flow-ingredient-bar.prompt-ingredient-bar, .prompt-ingredient-bar, flow-ingredient-bar");
     if (ingredientBar) {
-      // 帧模式下优先检查首帧槽位 (.frame-trigger，严格排除“结束/End”帧槽位，兼容简中/繁中/英文)
+      // 优先检查 ingredientBar 内是否已存在任何已挂载的图片缩略图或素材胶囊（注意排除空的“结束”槽位干扰）
+      const hasChipOrImg = !!ingredientBar.querySelector(
+        "img, flow-tile, flow-media-tile, flow-ingredient-chip, .ingredient-chip, mat-chip, .chip-container, button[aria-label*='移除'], button[aria-label*='删除'], button[aria-label*='刪除'], button[aria-label*='Remove' i], button[aria-label*='Clear' i], .clear-button"
+      );
+      if (hasChipOrImg) return true;
+
+      // 帧模式下检查首帧槽位 (.frame-trigger，严格排除“结束/End”帧槽位，兼容简中/繁中/英文)
       if (isFrameMode) {
         const allTriggers = Array.from(ingredientBar.querySelectorAll(".frame-trigger"));
         const isEndSlot = (el) => /(结束|結束|结尾|結尾|尾帧|尾幀|\bend\b|\blast\b)/i.test(((el?.textContent || "") + " " + (el?.getAttribute?.("aria-label") || "")).trim());
         const startTrigger = allTriggers.find(t => !isEndSlot(t)) || null;
         if (startTrigger) {
           const emptyBtn = startTrigger.querySelector("button.empty-chip");
-          const hasImg = !!startTrigger.querySelector("img, flow-tile, flow-media-tile, [role='img']");
+          const hasImg = !!startTrigger.querySelector("img, flow-tile, flow-media-tile, [role='img'], [style*='background-image']");
           const hasNonEmptyButton = !!startTrigger.querySelector("button:not(.empty-chip)");
           const triggerTitle = extractTileDisplayName(startTrigger, startTrigger.querySelector("img"));
           const triggerText = startTrigger.textContent || "";
           const matchesName = image.displayName && (isImageNameMatch(image.displayName, triggerTitle) || isImageNameMatch(image.displayName, triggerText));
 
-          // 若首帧槽位仍是空的“开始/開始/Start”按钮且无图片节点，直接判定为未挂载
-          if (emptyBtn && !hasImg) {
-            return false;
-          }
-          // 若指定了图片名且槽位内能提取出明确的不同图片名，判定为旧图未替换成功
-          if (image.displayName && triggerTitle && !matchesName) {
-            return false;
-          }
           if (hasImg || hasNonEmptyButton || (!emptyBtn && triggerText.trim() !== "" && !/(开始|開始|起始|开头|開頭|start|first)/i.test(triggerText)) || matchesName) {
             return true;
           }
+          if (emptyBtn) {
+            return false;
+          }
         }
       }
-
-      // 检查 ingredientBar 内是否已存在任何已挂载的图片缩略图或素材胶囊（注意绝不把右上角 .clear-button 误判为已挂载图片）
-      const hasChipOrImg = !!ingredientBar.querySelector(
-        "img, flow-tile, flow-media-tile, flow-ingredient-chip, .ingredient-chip, mat-chip, .chip-container, button[aria-label*='移除'], button[aria-label*='删除'], button[aria-label*='刪除'], button[aria-label*='Remove' i]"
-      );
-      if (hasChipOrImg) return true;
 
       const barTitle = extractTileDisplayName(ingredientBar, ingredientBar.querySelector("img"));
       const barText = ingredientBar.textContent || "";
