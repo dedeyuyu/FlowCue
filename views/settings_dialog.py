@@ -119,6 +119,23 @@ class SettingsDialog(QDialog):
         main_layout = QVBoxLayout(scroll_content)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(12)
+
+        # Section 0: UI Theme Mode (Light / Dark)
+        group_theme = QGroupBox("0. 界面显示主题 (UI Theme Mode)")
+        theme_layout = QHBoxLayout(group_theme)
+        theme_layout.setContentsMargins(12, 12, 12, 12)
+        theme_layout.addWidget(QLabel("🎨 界面外观模式:"))
+        self.combo_theme_mode = NoWheelComboBox()
+        from models.config_manager import ConfigManager as _CM
+        for t_code, t_label in _CM.SUPPORTED_THEME_MODES:
+            self.combo_theme_mode.addItem(t_label, t_code)
+        self.combo_theme_mode.setFixedWidth(210)
+        self.combo_theme_mode.currentIndexChanged.connect(self._on_theme_combo_changed)
+        theme_layout.addWidget(self.combo_theme_mode)
+        lbl_theme_hint = QLabel("(* 支持一键切换亮色模式与暗色模式，也可直接在主窗口右上角快捷切换)")
+        lbl_theme_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
+        theme_layout.addWidget(lbl_theme_hint, stretch=1)
+        main_layout.addWidget(group_theme)
         
         # Section 1: Batch Points Budget & Forced Split Marker
         group_points = QGroupBox("1. 单批次最高积分上限与强制断句标记 (Batch Settings)")
@@ -475,6 +492,29 @@ class SettingsDialog(QDialog):
             self.import_col_combos.append(cb)
 
         self._update_import_cols_status()
+        try:
+            from services.theme_manager import ThemeManager
+            ThemeManager.refresh_widget_style(self.import_cols_container, recursive=True)
+        except Exception:
+            pass
+
+    def _on_theme_combo_changed(self):
+        try:
+            from services.theme_manager import ThemeManager
+            mode = self.combo_theme_mode.currentData() or "light"
+            ThemeManager.apply_theme(mode)
+        except Exception:
+            pass
+
+    def reject(self):
+        try:
+            from services.theme_manager import ThemeManager
+            orig_mode = getattr(self.cm, "theme_mode", "light") if self.cm else "light"
+            if ThemeManager.get_mode() != orig_mode:
+                ThemeManager.apply_theme(orig_mode)
+        except Exception:
+            pass
+        super().reject()
 
     def _on_import_col_count_changed(self, new_count):
         cur_types = [cb.currentData() for cb in self.import_col_combos]
@@ -508,6 +548,13 @@ class SettingsDialog(QDialog):
             self.lbl_import_col_status.setStyleSheet("color: #DC2626; font-weight: bold; font-size: 12px;")
 
     def load_data(self):
+        if hasattr(self, "combo_theme_mode"):
+            theme_val = getattr(self.cm, "theme_mode", "light")
+            t_idx = self.combo_theme_mode.findData(theme_val)
+            self.combo_theme_mode.blockSignals(True)
+            self.combo_theme_mode.setCurrentIndex(t_idx if t_idx >= 0 else 0)
+            self.combo_theme_mode.blockSignals(False)
+
         self.spin_max_points.setValue(self.cm.max_batch_points)
         self.txt_marker.setText(getattr(self.cm, "forced_split_marker", "///"))
         self.spin_min_segment_chars.setValue(getattr(self.cm, "min_segment_chars", 0))
@@ -676,6 +723,8 @@ class SettingsDialog(QDialog):
         self.cm.default_aspect_ratio = self.combo_default_aspect.currentData() or "9:16"
         self.cm.default_video_model = self.combo_default_model.currentData() or "omni_1_1_flash"
         self.cm.import_columns = [cb.currentData() for cb in self.import_col_combos]
+        if hasattr(self, "combo_theme_mode"):
+            self.cm.theme_mode = self.combo_theme_mode.currentData() or "light"
         
         if self.cm.save():
             QMessageBox.information(self, "成功", "设置保存成功！已按新规则生效。")

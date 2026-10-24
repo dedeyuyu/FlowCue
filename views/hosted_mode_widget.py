@@ -1375,6 +1375,99 @@ class HostedModeWidget(QWidget):
         return next((b for b in self.batches if b["id"] == bid), None)
 
     # ──────────────────────────────── 步骤 3：发送任务并监控
+    def _sync_latest_project_presets(self, batches):
+        """
+        在步骤 3 发送任务前，实时从各项目的最新配置（统一提示词模板、统一运镜预设、
+        片段专属模板/运镜/生成模式、修改后的分句文案）重新计算并同步每个任务的 prompt 与参数，
+        同时完全保留步骤 2 已上传成功的图片状态。
+        """
+        import re
+        from models.project_model import ProjectModel
+        from services.text_processor import TextProcessor
+
+        cm = getattr(self.mw, "config_manager", None)
+        if cm:
+            cm.load()
+        tm = getattr(self.mw, "template_manager", None)
+        detail = getattr(self.mw, "detail_widget", None)
+        if detail and getattr(detail, "project_model", None):
+            try:
+                detail.project_model.save()
+            except Exception:
+                pass
+
+        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
+        default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
+        task_interval = getattr(cm, "task_interval", 5) if cm else 5
+
+        proj_cache = {}
+        updated_prompts_count = 0
+
+        for b in batches:
+            proj_path_str = b.get("project_path", "")
+            proj_model = None
+            if proj_path_str:
+                if proj_path_str not in proj_cache:
+                    try:
+                        p_obj = Path(proj_path_str)
+                        if p_obj.exists():
+                            proj_cache[proj_path_str] = ProjectModel(p_obj)
+                        else:
+                            proj_cache[proj_path_str] = None
+                    except Exception:
+                        proj_cache[proj_path_str] = None
+                proj_model = proj_cache.get(proj_path_str)
+
+            for t in b.get("tasks") or []:
+                t["aspect_ratio"] = default_aspect
+                t["model"] = default_model
+                t["interval"] = task_interval
+
+                seg_idx = int(t.get("segment_index", 1)) - 1
+                if proj_model and 0 <= seg_idx < len(proj_model.spanish_segments):
+                    seg = proj_model.spanish_segments[seg_idx]
+                    raw_text = seg.get("text", "")
+                    text = TextProcessor.remove_punctuation(raw_text)
+
+                    # 解析最新模板（优先片段专属模板，否则使用项目统一模板）
+                    tpl_id = seg.get("template_id", "") or getattr(proj_model, "selected_template_id", "")
+                    tpl = tm.get_template(tpl_id) if (tm and tpl_id) else None
+
+                    # 解析最新运镜（优先片段专属运镜，否则使用项目统一运镜）
+                    motion_id = seg.get("motion_id", "") or getattr(proj_model, "selected_motion_id", "")
+                    motion = tm.get_motion(motion_id) if (tm and motion_id) else None
+
+                    template_content = tpl["content"] if tpl else "{spanish_text}"
+                    motion_content = motion["content"] if motion else ""
+                    new_prompt = template_content.replace("{spanish_text}", text)
+                    new_prompt = new_prompt.replace("{camera_motion}", motion_content)
+                    new_prompt = re.sub(r" +", " ", new_prompt).strip()
+
+                    if new_prompt and t.get("prompt") != new_prompt:
+                        t["prompt"] = new_prompt
+                        updated_prompts_count += 1
+
+                    # 同步片段专属生成模式或全局默认生成模式
+                    if seg.get("mode_overridden") and seg.get("mode") in ("VIDEO_FRAMES", "VIDEO_REFERENCES"):
+                        t["mode"] = seg.get("mode")
+                        t["_mode_overridden"] = True
+                    else:
+                        t["mode"] = default_mode
+                        t["_mode_overridden"] = False
+
+                    if seg.get("duration"):
+                        t["duration"] = seg.get("duration")
+                else:
+                    if not t.get("_mode_overridden"):
+                        t["mode"] = default_mode
+
+            b["points"] = sum(self._points_of(t) for t in (b.get("tasks") or []))
+
+        if updated_prompts_count > 0:
+            self._log(f"🔄 已自动同步「项目管理」中最新修改的预设提示词（共更新 {updated_prompts_count} 条任务）")
+        return updated_prompts_count
+
     def _confirm_step3_dialog(self, ready, active_entries, g_size, wait_sec):
         """弹出步骤 3 启动前确认框：展示尺寸（16:9 爆红提醒）、模型、模式、账号数、总消耗积分及分批策略。"""
         from PyQt6.QtWidgets import QDialog, QFrame
@@ -1389,15 +1482,12 @@ class HostedModeWidget(QWidget):
         default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
         task_interval = getattr(cm, "task_interval", 5) if cm else 5
 
-        # 同步最新规则到即将发送的批次任务中
+        # 实时同步各项目最新预设提示词、生成模式及全局规则到即将发送的批次任务中
+        self._sync_latest_project_presets(ready)
+
         modes_used = set()
         for b in ready:
             for t in b.get("tasks") or []:
-                t["aspect_ratio"] = default_aspect
-                t["model"] = default_model
-                t["interval"] = task_interval
-                if not t.get("_mode_overridden"):
-                    t["mode"] = default_mode
                 modes_used.add(t.get("mode", default_mode))
 
         aspect_map = dict(getattr(ConfigManager, "SUPPORTED_ASPECT_RATIOS", [("9:16", "9:16 (竖屏)"), ("16:9", "16:9 (横屏)")]))
@@ -1653,6 +1743,7 @@ class HostedModeWidget(QWidget):
             self.refresh_all()
             return
         nxt["run_state"] = "已发送"
+        self._sync_latest_project_presets([nxt])
         clean_tasks = [{k: v for k, v in t.items() if not k.startswith("_")} for t in nxt["tasks"]]
         req = self.plugin_server.send_rpc_action(c["client_id"], "run_tasks",
                                                  {"batch_id": nxt["id"], "tasks": clean_tasks, "clear_existing": True})

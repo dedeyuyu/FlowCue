@@ -100,10 +100,19 @@ def main():
         from PyQt6.QtWidgets import QApplication
         from PyQt6.QtCore import qInstallMessageHandler
         from PyQt6.QtGui import QIcon
+        from models.config_manager import ConfigManager
+        from services.theme_manager import ThemeManager
         from views.main_window import MainWindow
 
         qInstallMessageHandler(qt_message_handler)
         app = QApplication(sys.argv)
+
+        data_dir = get_data_dir()
+        try:
+            init_cm = ConfigManager(data_dir)
+            ThemeManager.apply_theme(getattr(init_cm, "theme_mode", "light"), app)
+        except Exception:
+            ThemeManager.apply_theme("light", app)
         
         # Set application icon from logo.ico
         workspace_dir = get_workspace_dir()
@@ -123,7 +132,8 @@ def main():
             app_icon = QIcon(icon_path)
             app.setWindowIcon(app_icon)
         
-        window = MainWindow(get_data_dir())
+        window = MainWindow(data_dir)
+        ThemeManager.refresh_widget_style(window, recursive=True)
         window.show()
         
         sys.exit(app.exec())

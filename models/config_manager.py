@@ -44,6 +44,12 @@ class ConfigManager:
     DEFAULT_GENERATION_MODE = "VIDEO_FRAMES"
     DEFAULT_ASPECT_RATIO = "9:16"
     DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
+    DEFAULT_THEME_MODE = "light"
+
+    SUPPORTED_THEME_MODES = [
+        ("light", "☀️ 亮色模式 (Light)"),
+        ("dark", "🌙 暗色模式 (Dark)"),
+    ]
     
     SUPPORTED_GENERATION_MODES = [
         ("VIDEO_FRAMES", "帧模式 (First Frame / 影格)"),
@@ -123,6 +129,9 @@ class ConfigManager:
         
         # Import columns mapping
         self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
+
+        # UI Theme mode ("light" or "dark")
+        self.theme_mode = self.DEFAULT_THEME_MODE
         
         self._load_dotenv()
         self.load()
@@ -225,6 +234,9 @@ class ConfigManager:
                         self.import_columns = list(raw_cols)
                     else:
                         self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
+
+                    raw_theme = str(data.get("theme_mode", self.DEFAULT_THEME_MODE)).lower()
+                    self.theme_mode = "dark" if raw_theme == "dark" else "light"
             except Exception as e:
                 print(f"Error loading config: {e}")
 
@@ -260,6 +272,7 @@ class ConfigManager:
             "default_aspect_ratio": self.default_aspect_ratio,
             "default_video_model": self.default_video_model,
             "import_columns": list(self.import_columns) if getattr(self, "import_columns", None) else list(self.DEFAULT_IMPORT_COLUMNS),
+            "theme_mode": getattr(self, "theme_mode", self.DEFAULT_THEME_MODE),
         })
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:

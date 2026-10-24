@@ -317,10 +317,11 @@ class ProjectDetailWidget(QWidget):
         
         selectors_layout.addWidget(QLabel("选择统一提示词模板:"))
         self.combo_templates = QComboBox()
-        self.combo_templates.setMaxVisibleItems(15)
+        self.combo_templates.setMaxVisibleItems(12)
         self.combo_templates.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_templates.setStyleSheet("""
             QComboBox {
+                combobox-popup: 0;
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
@@ -343,10 +344,11 @@ class ProjectDetailWidget(QWidget):
         
         selectors_layout.addWidget(QLabel("选择统一运镜预设:"))
         self.combo_motions = QComboBox()
-        self.combo_motions.setMaxVisibleItems(15)
+        self.combo_motions.setMaxVisibleItems(12)
         self.combo_motions.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_motions.setStyleSheet("""
             QComboBox {
+                combobox-popup: 0;
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
@@ -933,11 +935,12 @@ class ProjectDetailWidget(QWidget):
         
         self.table_segments.blockSignals(False)
         
-        # 4. Update in-memory model
+        # 4. Update in-memory model and persist immediately
         if self.project_model and row < len(self.project_model.spanish_segments):
             self.project_model.spanish_segments[row]["text"] = new_text
             self.project_model.spanish_segments[row]["length"] = length
             self.project_model.spanish_segments[row]["duration"] = duration_val
+            self.project_model.save()
 
     def add_segment_row(self):
         """Adds a blank row to the segments table."""
@@ -1067,12 +1070,12 @@ class ProjectDetailWidget(QWidget):
     def change_row_color(self, row, copied=True):
         """Change the background color of a specific row to indicate status."""
         from PyQt6.QtGui import QColor
+        from services.theme_manager import ThemeManager
         if not hasattr(self, 'copied_rows'):
             self.copied_rows = set()
             
         if copied:
-            bg_color = QColor("#D4EDDA") # Light green
-            text_color = QColor("#155724") # Dark green
+            bg_color, text_color = ThemeManager.get_copied_row_colors()
             self.copied_rows.add(row)
         else:
             bg_color = QColor()
@@ -1761,10 +1764,11 @@ class ProjectDetailWidget(QWidget):
         self.lbl_prop_first_image = QLabel("📸 首帧图片素材:")
         panel_layout.addWidget(self.lbl_prop_first_image)
         self.combo_prop_image = QComboBox()
-        self.combo_prop_image.setMaxVisibleItems(15)
+        self.combo_prop_image.setMaxVisibleItems(12)
         self.combo_prop_image.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_prop_image.setStyleSheet("""
             QComboBox {
+                combobox-popup: 0;
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
@@ -1808,10 +1812,11 @@ class ProjectDetailWidget(QWidget):
         end_img_layout.addWidget(self.lbl_prop_end_image)
         
         self.combo_prop_end_image = QComboBox()
-        self.combo_prop_end_image.setMaxVisibleItems(15)
+        self.combo_prop_end_image.setMaxVisibleItems(12)
         self.combo_prop_end_image.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_prop_end_image.setStyleSheet("""
             QComboBox {
+                combobox-popup: 0;
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
@@ -1850,10 +1855,11 @@ class ProjectDetailWidget(QWidget):
         # Segment-specific template selector
         panel_layout.addWidget(QLabel("📐 片段专属模板:"))
         self.combo_prop_template = NoWheelComboBox()
-        self.combo_prop_template.setMaxVisibleItems(15)
+        self.combo_prop_template.setMaxVisibleItems(12)
         self.combo_prop_template.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_prop_template.setStyleSheet("""
             QComboBox {
+                combobox-popup: 0;
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
@@ -1873,10 +1879,11 @@ class ProjectDetailWidget(QWidget):
         # Segment-specific motion selector
         panel_layout.addWidget(QLabel("🎥 片段专属运镜:"))
         self.combo_prop_motion = NoWheelComboBox()
-        self.combo_prop_motion.setMaxVisibleItems(15)
+        self.combo_prop_motion.setMaxVisibleItems(12)
         self.combo_prop_motion.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.combo_prop_motion.setStyleSheet("""
             QComboBox {
+                combobox-popup: 0;
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;

@@ -314,6 +314,15 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.btn_check_update)
         QTimer.singleShot(6000, self._silent_update_check)
 
+        top_layout.addSpacing(4)
+
+        self.btn_theme_toggle = QPushButton("🌙 暗色模式")
+        self.btn_theme_toggle.setObjectName("btn_theme_toggle")
+        self.btn_theme_toggle.setToolTip("一键切换【☀️ 亮色模式】与【🌙 暗色模式】")
+        self.btn_theme_toggle.clicked.connect(self.toggle_theme_mode)
+        top_layout.addWidget(self.btn_theme_toggle)
+        self._update_theme_toggle_btn()
+
         main_layout.addLayout(top_layout)
         
         # 2. Main Area (Splitter: Sidebar and Details)
@@ -437,6 +446,9 @@ class MainWindow(QMainWindow):
         base_path = self.storage_manager.get_base_path()
         from models.project_model import ProjectModel
         from services.video_checker import VideoChecker
+        from services.theme_manager import ThemeManager
+        default_fg = ThemeManager.get_default_item_fg()
+        is_dark = ThemeManager.is_dark()
         
         for p in projects:
             # Format list item label: {index} {col1} - {col7}
@@ -464,21 +476,90 @@ class MainWindow(QMainWindow):
                 # 2. 成功归位并且没有缺少视频就显示黄色
                 # 3. 没有归位就显示默认颜色
                 if missing > 0:
-                    item.setForeground(QColor("#DC2626"))  # 红色
+                    item.setForeground(QColor("#F87171" if is_dark else "#DC2626"))  # 红色
                     item.setToolTip(f"❌ 缺失 {missing} 个视频片段")
                 elif rate >= 100.0 and pending == 0 and already > 0:
-                    item.setForeground(QColor("#D97706"))  # 黄色
+                    item.setForeground(QColor("#FBBF24" if is_dark else "#D97706"))  # 黄色
                     item.setToolTip("✅ 视频已全部归位且无缺失")
                 elif pending > 0:
-                    item.setForeground(QColor("#5D4037"))  # 默认褐色
+                    item.setForeground(default_fg)  # 默认色
                     item.setToolTip(f"⚠️ 包含 {pending} 个未归位视频")
                 else:
-                    item.setForeground(QColor("#5D4037"))  # 默认褐色
+                    item.setForeground(default_fg)  # 默认色
             except Exception as e:
                 print(f"Error checking project status for item {p['id']}: {e}")
-                item.setForeground(QColor("#5D4037"))
+                item.setForeground(default_fg)
                 
             self.list_projects.addItem(item)
+
+    def _update_theme_toggle_btn(self):
+        """Updates the top bar theme toggle button appearance."""
+        if not hasattr(self, "btn_theme_toggle"):
+            return
+        from services.theme_manager import ThemeManager
+        if ThemeManager.is_dark():
+            self.btn_theme_toggle.setText("☀️ 亮色模式")
+            self.btn_theme_toggle.setStyleSheet("""
+                QPushButton#btn_theme_toggle {
+                    background-color: #F59E0B;
+                    color: #18181B;
+                    font-size: 12px;
+                    font-weight: bold;
+                    padding: 4px 10px;
+                    border-radius: 4px;
+                }
+                QPushButton#btn_theme_toggle:hover {
+                    background-color: #D97706;
+                    color: white;
+                }
+            """)
+        else:
+            self.btn_theme_toggle.setText("🌙 暗色模式")
+            self.btn_theme_toggle.setStyleSheet("""
+                QPushButton#btn_theme_toggle {
+                    background-color: #334155;
+                    color: white;
+                    font-size: 12px;
+                    font-weight: bold;
+                    padding: 4px 10px;
+                    border-radius: 4px;
+                }
+                QPushButton#btn_theme_toggle:hover {
+                    background-color: #1E293B;
+                }
+            """)
+
+    def toggle_theme_mode(self):
+        """Toggles between Light Mode and Dark Mode and persists the setting."""
+        from services.theme_manager import ThemeManager
+        new_mode = ThemeManager.LIGHT if ThemeManager.is_dark() else ThemeManager.DARK
+        self.apply_theme_mode(new_mode, save_config=True)
+
+    def apply_theme_mode(self, mode: str, save_config: bool = False):
+        """Applies the given theme mode across the entire application and refreshes item colors."""
+        from services.theme_manager import ThemeManager
+        mode = ThemeManager.DARK if str(mode).lower() == ThemeManager.DARK else ThemeManager.LIGHT
+        if self.config_manager:
+            self.config_manager.theme_mode = mode
+            if save_config:
+                self.config_manager.save()
+        ThemeManager.apply_theme(mode)
+        self._update_theme_toggle_btn()
+
+        # Refresh project list item colors while preserving current selection
+        cur_row = self.list_projects.currentRow()
+        if self.storage_manager.get_base_path():
+            self.reload_projects_list()
+            if 0 <= cur_row < self.list_projects.count():
+                self.list_projects.setCurrentRow(cur_row)
+
+        # Refresh table row colors in ProjectDetailWidget and BatchGenerateTabWidget
+        if hasattr(self, "detail_widget") and self.detail_widget and self.detail_widget.project_model:
+            for r in list(getattr(self.detail_widget, "copied_rows", [])):
+                self.detail_widget.change_row_color(r, copied=True)
+        if hasattr(self, "batch_generate_tab") and self.batch_generate_tab and self.batch_generate_tab.current_project:
+            for r in list(getattr(self.batch_generate_tab, "copied_rows", [])):
+                self.batch_generate_tab.change_row_color(r, copied=True)
 
     def open_import_dialog(self):
         """Opens the clipboard import dialog."""
@@ -495,6 +576,7 @@ class MainWindow(QMainWindow):
         from views.settings_dialog import SettingsDialog
         dialog = SettingsDialog(self.config_manager, self)
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
+            self.apply_theme_mode(getattr(self.config_manager, "theme_mode", "light"), save_config=False)
             if hasattr(self, "detail_widget"):
                 self.detail_widget.set_config_manager(self.config_manager)
                 self.detail_widget.populate_segments_table()

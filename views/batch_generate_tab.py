@@ -16,6 +16,12 @@ from views.project_detail_widget import BatchExportDialog
 
 class NoWheelComboBox(QComboBox):
     """QComboBox that ignores mouse wheel events unless its popup view is open, preventing accidental changes while scrolling the table."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMaxVisibleItems(12)
+        if self.view():
+            self.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
     def wheelEvent(self, event):
         if self.view() and self.view().isVisible():
             super().wheelEvent(event)
@@ -482,11 +488,11 @@ class BatchGenerateTabWidget(QWidget):
         """Visually highlight rows that have a custom individual preset."""
         if has_custom:
             combo.setStyleSheet(
-                "QComboBox { background-color: #FFF3E0; color: #E65100; border: 1.5px solid #FFB74D; border-radius: 4px; padding: 3px 6px; font-weight: bold; font-size: 12px; }"
+                "QComboBox { combobox-popup: 0; background-color: #FFF3E0; color: #E65100; border: 1.5px solid #FFB74D; border-radius: 4px; padding: 3px 6px; font-weight: bold; font-size: 12px; }"
             )
         else:
             combo.setStyleSheet(
-                "QComboBox { background-color: #FAFAFA; color: #5D4037; border: 1px solid #D7CCC8; border-radius: 4px; padding: 3px 6px; font-size: 12px; }"
+                "QComboBox { combobox-popup: 0; background-color: #FAFAFA; color: #5D4037; border: 1px solid #D7CCC8; border-radius: 4px; padding: 3px 6px; font-size: 12px; }"
             )
 
     def on_table_item_changed(self, item: QTableWidgetItem):
@@ -654,10 +660,9 @@ class BatchGenerateTabWidget(QWidget):
         dialog.exec()
 
     def change_row_color(self, row, copied=True):
-        from PyQt6.QtGui import QColor
+        from services.theme_manager import ThemeManager
         if copied:
-            bg_color = QColor("#D4EDDA") # Light green
-            text_color = QColor("#155724") # Dark green
+            bg_color, text_color = ThemeManager.get_copied_row_colors()
         
         for col in range(self.table.columnCount()):
             item = self.table.item(row, col)

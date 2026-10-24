@@ -70,6 +70,7 @@ a = Analysis(
         'services.plugin_server',
         'services.speech_extractor',
         'services.text_processor',
+        'services.theme_manager',
         'services.video_checker',
         'views',
         'views.main_window',
