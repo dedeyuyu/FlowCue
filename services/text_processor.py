@@ -1,20 +1,28 @@
 # -*- coding: utf-8 -*-
 import re
+import unicodedata
 
 class TextProcessor:
-    """Handles text cleaning and smart segmentation for Spanish content."""
+    """Handles text cleaning and smart segmentation for Spanish / Nepali / multilingual content."""
     
     @staticmethod
     def remove_punctuation(text):
-        """Removes all punctuation marks (both English/Spanish and Chinese) from text."""
+        """Removes all punctuation marks (English/Spanish, Chinese, and Nepali । / ॥) from text,
+        while preserving Unicode combining marks (e.g. Devanagari vowel signs / matras)."""
         if not text:
             return ""
-        cleaned = re.sub(r'[^\w\s]', ' ', text)
-        cleaned = cleaned.replace('_', ' ')
-        return re.sub(r'\s+', ' ', cleaned).strip()
+        out = []
+        for c in text:
+            if c == '_' or c.isspace():
+                out.append(' ')
+            elif re.match(r'\w', c) or unicodedata.category(c) in ('Mn', 'Mc', 'Me'):
+                out.append(c)
+            else:
+                out.append(' ')
+        return re.sub(r'\s+', ' ', "".join(out)).strip()
 
     @staticmethod
-    def clean_text(text):
+    def clean_text(text, language=None):
         """Cleans input text according to user rules:
         - Replaces newlines/CR with spaces (does not split on newlines)
         - Removes all emojis and symbols (like '👉', '📖', '✨')
@@ -50,7 +58,11 @@ class TextProcessor:
             text = text.replace(char, ' ')
             
         # 5. Remove spaces before punctuation (e.g. "13 ." -> "13.")
-        text = re.sub(r' +([.,?!;])', r'\1', text)
+        if language == "ne":
+            text = re.sub(r' +([।॥,?!;])', r'\1', text)
+            text = re.sub(r'([।॥]+)(?=[^\s।॥])', r'\1 ', text)
+        else:
+            text = re.sub(r' +([.,?!;])', r'\1', text)
             
         # 6. Clean up spacing
         text = re.sub(r' +', ' ', text)
@@ -58,19 +70,21 @@ class TextProcessor:
         return text.strip()
 
     @staticmethod
-    def _extract_words_and_breaks(text):
+    def _extract_words_and_breaks(text, language=None):
         """Extracts clean words and natural punctuation break indicators from text.
         
         Returns:
             tuple: (words, break_types)
                 - words: list of clean, punctuation-free word strings
                 - break_types: list of int (same length as words), where:
-                    2 = sentence break (., !, ?, ;, …) right after this word
+                    2 = sentence break (., !, ?, ;, … or Nepali ।, ॥) right after this word
                     1 = clause/comma break (,, :, —, -) right after this word
                     0 = normal word boundary
         """
         if not text:
             return [], []
+        is_nepali = (language == "ne")
+        sent_endings = ('।', '॥', '!', '?', ';', '…') if is_nepali else ('.', '!', '?', ';', '…')
         raw_tokens = text.split()
         words = []
         break_types = []
@@ -78,9 +92,9 @@ class TextProcessor:
             # Determine trailing punctuation type before stripping punctuation
             stripped_quotes = token.rstrip('\'"”’»)]}')
             b_type = 0
-            if stripped_quotes.endswith(('.', '!', '?', ';', '…')):
+            if stripped_quotes.endswith(sent_endings):
                 b_type = 2
-            elif stripped_quotes.endswith((',', ':', '—', '-')):
+            elif stripped_quotes.endswith((',', '，', ':', '—', '-')):
                 b_type = 1
 
             clean_token = TextProcessor.remove_punctuation(token)
@@ -247,6 +261,7 @@ class TextProcessor:
             
         max_limit = config_manager.get_max_chars() if config_manager else 170
         custom_marker = getattr(config_manager, "forced_split_marker", "///") if config_manager else "///"
+        language = getattr(config_manager, "speech_language", "es") if config_manager else "es"
         
         # Build forced split markers pattern
         markers = [custom_marker, "///", "|||", "$$", "###", "[split]", "[断句]"]
@@ -258,7 +273,7 @@ class TextProcessor:
         
         results = []
         for block in forced_blocks:
-            cleaned_block = TextProcessor.clean_text(block)
+            cleaned_block = TextProcessor.clean_text(block, language=language)
             if not cleaned_block:
                 continue
             # Process each forced block independently so no merging occurs across forced markers
@@ -272,12 +287,19 @@ class TextProcessor:
         """Segments a single forced block, giving min_segment_chars the highest priority."""
         import math
         min_chars = getattr(config_manager, "min_segment_chars", 0) if config_manager else 0
+        language = getattr(config_manager, "speech_language", "es") if config_manager else "es"
+        is_nepali = (language == "ne")
+        sent_joiner = "। " if is_nepali else ". "
         # If user set min_chars higher than max_limit, min_chars takes precedence
         effective_max_limit = max(max_limit, min_chars) if min_chars > 0 else max_limit
 
         initial_chunks = []
-        # Split by sentence-ending punctuation (., ?, !, ;)
-        pattern = re.compile(r'([^.!?;]+[.!?;\s]*)')
+        if is_nepali:
+            # Split by Nepali sentence-ending punctuation (।, ॥, ?, !, ;)
+            pattern = re.compile(r'([^।॥!?;]+[।॥!?;\s]*)')
+        else:
+            # Split by sentence-ending punctuation (., ?, !, ;)
+            pattern = re.compile(r'([^.!?;]+[.!?;\s]*)')
         matches = pattern.findall(cleaned_text)
         
         for m in matches:
@@ -294,7 +316,7 @@ class TextProcessor:
                 raw_chunks.append(chunk)
 
         # Stage 2: Greedy Merging up to effective_max_limit characters
-        # Keep ". " between merged sentence chunks so Stage 3 knows natural sentence boundaries
+        # Keep sent_joiner between merged sentence chunks so Stage 3 knows natural sentence boundaries
         segments = []
         current_segment = ""
         current_clean_len = 0
@@ -305,7 +327,7 @@ class TextProcessor:
                 continue
             test_clean_len = (current_clean_len + 1 + len(chunk_clean)) if current_segment else len(chunk_clean)
             if test_clean_len <= effective_max_limit:
-                current_segment = (current_segment + ". " + chunk_clean) if current_segment else chunk_clean
+                current_segment = (current_segment + sent_joiner + chunk_clean) if current_segment else chunk_clean
                 current_clean_len = test_clean_len
             else:
                 if current_segment:
@@ -331,12 +353,12 @@ class TextProcessor:
                     # If both neighbors fit, merge with the shorter neighbor to keep lengths balanced.
                     merge_candidates = []
                     if i > 0:
-                        comb_prev_raw = segments[i - 1] + ". " + segments[i]
+                        comb_prev_raw = segments[i - 1] + sent_joiner + segments[i]
                         comb_prev_clean = TextProcessor.remove_punctuation(comb_prev_raw)
                         if len(comb_prev_clean) <= effective_max_limit:
                             merge_candidates.append((len(comb_prev_clean), i - 1, i + 1, comb_prev_raw))
                     if i + 1 < len(segments):
-                        comb_next_raw = segments[i] + ". " + segments[i + 1]
+                        comb_next_raw = segments[i] + sent_joiner + segments[i + 1]
                         comb_next_clean = TextProcessor.remove_punctuation(comb_next_raw)
                         if len(comb_next_clean) <= effective_max_limit:
                             merge_candidates.append((len(comb_next_clean), i, i + 2, comb_next_raw))
@@ -357,13 +379,13 @@ class TextProcessor:
                         win_start_max = min(i, n - window_size)
                         for s_idx in range(win_start_min, win_start_max + 1):
                             e_idx = s_idx + window_size
-                            comb_raw = ". ".join(segments[s_idx:e_idx])
+                            comb_raw = sent_joiner.join(segments[s_idx:e_idx])
                             comb_clean = TextProcessor.remove_punctuation(comb_raw)
                             comb_len = len(comb_clean)
                             k_min = max(1, math.ceil(comb_len / effective_max_limit))
                             if k_min >= window_size:
                                 continue
-                            words, break_types = TextProcessor._extract_words_and_breaks(comb_raw)
+                            words, break_types = TextProcessor._extract_words_and_breaks(comb_raw, language=language)
                             for k in range(k_min, window_size):
                                 new_segs = TextProcessor._partition_words_balanced(
                                     words, k, min_chars=min_chars,
@@ -391,7 +413,7 @@ class TextProcessor:
                         candidate_windows = []
                         for s_idx in range(win_start_min, win_start_max + 1):
                             e_idx = s_idx + window_size
-                            comb_raw = ". ".join(segments[s_idx:e_idx])
+                            comb_raw = sent_joiner.join(segments[s_idx:e_idx])
                             comb_clean = TextProcessor.remove_punctuation(comb_raw)
                             candidate_windows.append((len(comb_clean), s_idx, e_idx, comb_raw))
 
@@ -399,7 +421,7 @@ class TextProcessor:
                         candidate_windows.sort(key=lambda x: -x[0])
 
                         for comb_len, s_idx, e_idx, comb_raw in candidate_windows:
-                            words, break_types = TextProcessor._extract_words_and_breaks(comb_raw)
+                            words, break_types = TextProcessor._extract_words_and_breaks(comb_raw, language=language)
                             if not words:
                                 continue
                             k_min = max(1, math.ceil(comb_len / effective_max_limit))
@@ -426,8 +448,8 @@ class TextProcessor:
                         break
 
                     # Strategy 3: Ultimate Priority Fallback — min_segment_chars has HIGHER priority than max_limit!
-                    full_raw = ". ".join(segments)
-                    full_words, full_breaks = TextProcessor._extract_words_and_breaks(full_raw)
+                    full_raw = sent_joiner.join(segments)
+                    full_words, full_breaks = TextProcessor._extract_words_and_breaks(full_raw, language=language)
                     full_len = len(" ".join(full_words))
                     k_feasible = max(1, (full_len + 1) // (min_chars + 1))
                     for k in range(k_feasible, 0, -1):
@@ -446,10 +468,10 @@ class TextProcessor:
 
                     # Final unconditional merge (when entire block has fewer than min_chars characters)
                     if i > 0 and (i + 1 >= len(segments) or len(segments[i - 1]) <= len(segments[i + 1])):
-                        segments[i - 1] = segments[i - 1] + ". " + segments[i]
+                        segments[i - 1] = segments[i - 1] + sent_joiner + segments[i]
                         segments.pop(i)
                     elif i + 1 < len(segments):
-                        segments[i] = segments[i] + ". " + segments[i + 1]
+                        segments[i] = segments[i] + sent_joiner + segments[i + 1]
                         segments.pop(i + 1)
                     changed = True
                     break

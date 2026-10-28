@@ -2,9 +2,392 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QLabel, QLineEdit, 
                              QTextEdit, QTabWidget, QWidget, QMessageBox, QSplitter,
-                             QFileDialog, QAbstractItemView, QComboBox, QInputDialog)
-from PyQt6.QtCore import Qt
+                             QFileDialog, QAbstractItemView, QComboBox, QInputDialog,
+                             QTableWidget, QTableWidgetItem, QHeaderView)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QGuiApplication
+from bs4 import BeautifulSoup
+import csv
+import io
+import re
 import uuid
+
+
+class TableTemplateImportDialog(QDialog):
+    """弹窗：支持直接从表格（Excel / WPS / 飞书 / 谷歌表格）复制两列（第1列：模板名称，第2列：模板内容）快速批量导入到提示词模板、运镜预设或批量模板。"""
+
+    HEADER_KEYWORDS_COL1 = {"模板名称", "预设名称", "运镜名称", "批量模板名称", "名称", "名字", "name", "title"}
+    HEADER_KEYWORDS_COL2 = {"模板内容", "预设内容", "运镜内容", "运镜描述内容", "描述词", "提示词", "内容", "content", "prompt"}
+
+    def __init__(self, target_type: str, template_manager, default_category: str = "", parent=None):
+        super().__init__(parent)
+        self.target_type = target_type  # "templates" | "motions" | "batch_templates"
+        self.tm = template_manager
+        self.default_category = default_category if default_category not in ("__ALL__", "__UNCATEGORIZED__", None) else ""
+        self.imported_count = 0
+
+        type_titles = {
+            "templates": "📝 提示词模板",
+            "motions": "🎥 运镜预设",
+            "batch_templates": "🚀 批量模板",
+        }
+        self.type_label = type_titles.get(target_type, "模板")
+        self.setWindowTitle(f"📋 从表格批量导入 - {self.type_label}")
+        self.resize(820, 560)
+        self.setStyleSheet("""
+            QDialog { background-color: #FAF6F0; color: #5D4037; font-family: "Segoe UI", sans-serif; }
+            QLabel { font-size: 13px; color: #5D4037; font-weight: bold; }
+            QComboBox, QLineEdit, QTableWidget {
+                background-color: white; border: 1px solid #D7CCC8; border-radius: 4px;
+                padding: 4px 6px; color: #3E2723; font-size: 13px;
+            }
+            QHeaderView::section {
+                background-color: #EFEBE9; color: #5D4037; padding: 6px;
+                font-weight: bold; border: 1px solid #D7CCC8;
+            }
+            QPushButton {
+                background-color: #E0A96D; color: white; border: none; border-radius: 4px;
+                padding: 6px 14px; font-size: 13px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #D2904C; }
+            QPushButton:pressed { background-color: #B87635; }
+        """)
+        self._init_ui()
+        QTimer.singleShot(0, lambda: self.read_from_clipboard(silent_if_empty=True))
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        extra_note = ""
+        if self.target_type == "templates":
+            extra_note = "\n💡 提示：提示词模板内容中建议包含 {spanish_text} 和 {camera_motion} 占位符。"
+
+        lbl_guide = QLabel(
+            f"📌 操作说明：请在表格（Excel / WPS / 飞书 / 谷歌表格）中直接复制 2 列数据：\n"
+            f"   • 【第 1 列】：{self.type_label}名称      • 【第 2 列】：{self.type_label}内容{extra_note}"
+        )
+        lbl_guide.setWordWrap(True)
+        lbl_guide.setStyleSheet(
+            "background-color: #FFF8E1; color: #5D4037; border: 1px solid #FFE082; "
+            "border-radius: 6px; padding: 8px 10px; font-size: 13px; font-weight: bold;"
+        )
+        layout.addWidget(lbl_guide)
+
+        # Top control bar
+        ctrl_row = QHBoxLayout()
+        self.btn_read_clip = QPushButton("📋 从剪贴板读取两列数据")
+        self.btn_read_clip.setStyleSheet("background-color: #1976D2; color: white; padding: 7px 16px; font-size: 13px;")
+        self.btn_read_clip.clicked.connect(lambda: self.read_from_clipboard(silent_if_empty=False))
+        ctrl_row.addWidget(self.btn_read_clip)
+
+        btn_add_row = QPushButton("＋ 手动加一行")
+        btn_add_row.setStyleSheet("background-color: #8D6E63; color: white; padding: 6px 10px; font-size: 12px;")
+        btn_add_row.clicked.connect(self._add_empty_row)
+        ctrl_row.addWidget(btn_add_row)
+
+        btn_del_row = QPushButton("🗑️ 删除选中行")
+        btn_del_row.setStyleSheet("background-color: #E57373; color: white; padding: 6px 10px; font-size: 12px;")
+        btn_del_row.clicked.connect(self._delete_selected_rows)
+        ctrl_row.addWidget(btn_del_row)
+
+        ctrl_row.addStretch()
+        ctrl_row.addWidget(QLabel("重名处理:"))
+        self.cb_dup_mode = QComboBox()
+        self.cb_dup_mode.addItem("🔄 同名更新覆盖，新名称追加 (推荐)", "upsert")
+        self.cb_dup_mode.addItem("➕ 全部作为新预设追加", "append")
+        ctrl_row.addWidget(self.cb_dup_mode)
+        layout.addLayout(ctrl_row)
+
+        # Optional category selector for batch_templates
+        if self.target_type == "batch_templates":
+            cat_row = QHBoxLayout()
+            cat_row.addWidget(QLabel("📂 导入后统一归入分类 (选填):"))
+            self.cb_target_cat = QComboBox()
+            self.cb_target_cat.setEditable(True)
+            self.cb_target_cat.setMinimumWidth(240)
+            self.cb_target_cat.lineEdit().setPlaceholderText("可选择已有分类或输入新分类名（留空则设为未分类）")
+            self.cb_target_cat.addItem("", "")
+            for c in self.tm.get_batch_categories():
+                self.cb_target_cat.addItem(c, c)
+            if self.default_category:
+                self.cb_target_cat.setCurrentText(self.default_category)
+            else:
+                self.cb_target_cat.setCurrentIndex(0)
+            cat_row.addWidget(self.cb_target_cat, stretch=1)
+            layout.addLayout(cat_row)
+
+        # Preview table
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["序号", "第 1 列：模板名称 (可双击修改)", "第 2 列：模板内容 (可双击修改)"])
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(1, 220)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(44)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table, stretch=1)
+
+        # Status & bottom buttons
+        bottom_row = QHBoxLayout()
+        self.lbl_status = QLabel("等待读取剪贴板表格数据...")
+        self.lbl_status.setStyleSheet("color: #8D6E63; font-size: 12px;")
+        bottom_row.addWidget(self.lbl_status)
+        bottom_row.addStretch()
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setStyleSheet("background-color: #B0BEC5; color: #37474F;")
+        btn_cancel.clicked.connect(self.reject)
+
+        self.btn_confirm = QPushButton(f"✅ 确认导入到{self.type_label}")
+        self.btn_confirm.setStyleSheet("background-color: #4CAF50; color: white; padding: 7px 18px;")
+        self.btn_confirm.clicked.connect(self.confirm_import)
+
+        bottom_row.addWidget(btn_cancel)
+        bottom_row.addWidget(self.btn_confirm)
+        layout.addLayout(bottom_row)
+
+    @classmethod
+    def _is_header_row(cls, name_val: str, content_val: str) -> bool:
+        n = name_val.strip().lower()
+        c = content_val.strip().lower()
+        return n in cls.HEADER_KEYWORDS_COL1 and c in cls.HEADER_KEYWORDS_COL2
+
+    @classmethod
+    def parse_html_two_columns(cls, html_content: str):
+        """Parse 2-column rows from HTML clipboard table (Excel / WPS / Feishu / Google Sheets)."""
+        if not html_content or "<tr" not in html_content.lower():
+            return []
+        soup = BeautifulSoup(html_content, "html.parser")
+        rows = []
+        for tr in soup.find_all("tr"):
+            tds = tr.find_all(["td", "th"])
+            if len(tds) < 2:
+                continue
+            cells = []
+            for td in tds[:2]:
+                for br in td.find_all("br"):
+                    br.replace_with("\n")
+                # Collapse internal HTML source line wraps while preserving explicit <br> or block breaks
+                block_tags = td.find_all(["p", "div"])
+                if block_tags:
+                    lines = [ re.sub(r"\s+", " ", b.get_text()).strip() for b in block_tags if b.get_text().strip() ]
+                    text = "\n".join(lines) if lines else td.get_text().strip()
+                else:
+                    raw = td.get_text()
+                    # Split by explicit newline from <br>, collapse whitespace inside each line
+                    parts = [re.sub(r"[ \t\r]+", " ", ln).strip() for ln in raw.split("\n")]
+                    text = "\n".join(p for p in parts if p) if len(parts) > 1 else re.sub(r"\s+", " ", raw).strip()
+                cells.append(text)
+            name_val, content_val = cells[0].strip(), cells[1].strip()
+            if not name_val and not content_val:
+                continue
+            if not rows and cls._is_header_row(name_val, content_val):
+                continue
+            rows.append((name_val, content_val))
+        return rows
+
+    @classmethod
+    def parse_tsv_two_columns(cls, text_content: str):
+        """Parse 2-column rows from tab-separated clipboard text (supports Excel multiline quoted cells)."""
+        if not text_content or not text_content.strip():
+            return []
+        cleaned = text_content.strip("\r\n")
+        rows = []
+        try:
+            reader = csv.reader(io.StringIO(cleaned), delimiter="\t")
+            for cols in reader:
+                if not cols or not any(c.strip() for c in cols):
+                    continue
+                if len(cols) >= 2:
+                    name_val = cols[0].strip()
+                    content_val = cols[1].strip()
+                    if not name_val and not content_val:
+                        continue
+                    if not rows and cls._is_header_row(name_val, content_val):
+                        continue
+                    rows.append((name_val, content_val))
+        except Exception:
+            pass
+        return rows
+
+    def read_from_clipboard(self, silent_if_empty: bool = False):
+        clipboard = QGuiApplication.clipboard()
+        mime_data = clipboard.mimeData()
+        if not mime_data:
+            if not silent_if_empty:
+                QMessageBox.warning(self, "提示", "剪贴板为空，请先在表格中复制两列数据（第一列：名称，第二列：内容）。")
+            return
+
+        tsv_rows = []
+        html_rows = []
+        if mime_data.hasText():
+            tsv_rows = self.parse_tsv_two_columns(mime_data.text())
+        if mime_data.hasHtml():
+            html_rows = self.parse_html_two_columns(mime_data.html())
+
+        # Prefer TSV when it parsed cleanly (preserves exact plain text in Excel/Google Sheets);
+        # Fallback to HTML if TSV failed or if unquoted multiline cells broke TSV row count
+        if tsv_rows and (not html_rows or len(tsv_rows) == len(html_rows)):
+            parsed_rows = tsv_rows
+        elif html_rows:
+            parsed_rows = html_rows
+        else:
+            parsed_rows = tsv_rows
+
+        if not parsed_rows:
+            if not silent_if_empty:
+                QMessageBox.warning(
+                    self,
+                    "未检测到两列表格数据",
+                    "未能从剪贴板识别出有效的两列表格数据！\n\n"
+                    "请确保在表格中同时选中并复制了 2 列：\n"
+                    "• 第 1 列：模板名称\n"
+                    "• 第 2 列：模板内容"
+                )
+            return
+
+        self._populate_preview_table(parsed_rows)
+        self.lbl_status.setText(f"✅ 已从剪贴板成功解析 {len(parsed_rows)} 条预设数据（双击单元格可直接微调）")
+        self.lbl_status.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 12px;")
+
+    def _populate_preview_table(self, rows):
+        self.table.setRowCount(len(rows))
+        for i, (name_val, content_val) in enumerate(rows):
+            idx_item = QTableWidgetItem(str(i + 1))
+            idx_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(i, 0, idx_item)
+            self.table.setItem(i, 1, QTableWidgetItem(name_val))
+            self.table.setItem(i, 2, QTableWidgetItem(content_val))
+
+    def _refresh_row_numbers(self):
+        for i in range(self.table.rowCount()):
+            idx_item = QTableWidgetItem(str(i + 1))
+            idx_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(i, 0, idx_item)
+
+    def _add_empty_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self._refresh_row_numbers()
+        self.table.setItem(r, 1, QTableWidgetItem(""))
+        self.table.setItem(r, 2, QTableWidgetItem(""))
+        self.table.setCurrentCell(r, 1)
+
+    def _delete_selected_rows(self):
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            cur = self.table.currentRow()
+            if cur >= 0:
+                rows = [cur]
+        for r in rows:
+            self.table.removeRow(r)
+        self._refresh_row_numbers()
+
+    def confirm_import(self):
+        self.table.clearFocus()
+        valid_rows = []
+        missing_placeholder_names = []
+        for r in range(self.table.rowCount()):
+            n_item = self.table.item(r, 1)
+            c_item = self.table.item(r, 2)
+            name = n_item.text().strip() if n_item else ""
+            content = c_item.text().strip() if c_item else ""
+            if not name and not content:
+                continue
+            if not name:
+                name = f"导入模板_{r + 1}"
+            if self.target_type == "templates" and "{spanish_text}" not in content:
+                missing_placeholder_names.append(name)
+            valid_rows.append((name, content))
+
+        if not valid_rows:
+            QMessageBox.warning(self, "无有效数据", "表格中没有可导入的数据，请先从剪贴板读取或输入模板名称与内容。")
+            return
+
+        if missing_placeholder_names:
+            preview_names = "、".join(missing_placeholder_names[:5])
+            if len(missing_placeholder_names) > 5:
+                preview_names += f" 等 {len(missing_placeholder_names)} 个"
+            reply = QMessageBox.question(
+                self,
+                "占位符提醒",
+                f"检测到以下提示词模板内容中未包含 {{spanish_text}} 占位符：\n【{preview_names}】\n\n"
+                f"是否仍然继续导入？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        dup_mode = self.cb_dup_mode.currentData() or "upsert"
+        added_cnt = 0
+        updated_cnt = 0
+
+        if self.target_type == "templates":
+            existing_by_name = {t.get("name", "").strip(): t for t in self.tm.templates}
+            for name, content in valid_rows:
+                if dup_mode == "upsert" and name in existing_by_name:
+                    existing_by_name[name]["content"] = content
+                    updated_cnt += 1
+                else:
+                    new_tpl = {
+                        "id": f"tpl_{uuid.uuid4().hex[:8]}",
+                        "name": name,
+                        "content": content,
+                    }
+                    self.tm.templates.append(new_tpl)
+                    existing_by_name[name] = new_tpl
+                    added_cnt += 1
+            self.tm.save_templates()
+
+        elif self.target_type == "motions":
+            existing_by_name = {m.get("name", "").strip(): m for m in self.tm.motions}
+            for name, content in valid_rows:
+                if dup_mode == "upsert" and name in existing_by_name:
+                    existing_by_name[name]["content"] = content
+                    updated_cnt += 1
+                else:
+                    new_mot = {
+                        "id": f"motion_{uuid.uuid4().hex[:8]}",
+                        "name": name,
+                        "content": content,
+                    }
+                    self.tm.motions.append(new_mot)
+                    existing_by_name[name] = new_mot
+                    added_cnt += 1
+            self.tm.save_motions()
+
+        elif self.target_type == "batch_templates":
+            target_cat = self.cb_target_cat.currentText().strip() if hasattr(self, "cb_target_cat") else ""
+            if target_cat:
+                self.tm.add_batch_category(target_cat)
+            existing_by_name = {t.get("name", "").strip(): t for t in self.tm.batch_templates}
+            for name, content in valid_rows:
+                if dup_mode == "upsert" and name in existing_by_name:
+                    existing_by_name[name]["content"] = content
+                    if target_cat:
+                        existing_by_name[name]["category"] = target_cat
+                    updated_cnt += 1
+                else:
+                    new_bt = {
+                        "id": f"bt-{uuid.uuid4().hex[:8]}",
+                        "name": name,
+                        "content": content,
+                        "category": target_cat,
+                    }
+                    self.tm.batch_templates.append(new_bt)
+                    existing_by_name[name] = new_bt
+                    added_cnt += 1
+            self.tm.save_batch_templates()
+
+        self.imported_count = added_cnt + updated_cnt
+        self.added_count = added_cnt
+        self.updated_count = updated_cnt
+        self.accept()
 
 
 class BatchCategoryAssignDialog(QDialog):
@@ -302,6 +685,11 @@ class TemplateConfigDialog(QDialog):
         btn_left_layout = QHBoxLayout()
         self.btn_new_tpl = QPushButton("＋ 新建")
         self.btn_new_tpl.clicked.connect(self.new_template)
+
+        self.btn_table_import_tpl = QPushButton("📋 表格导入")
+        self.btn_table_import_tpl.setToolTip("直接从表格复制两列（第1列：模板名称，第2列：模板内容）快速批量导入提示词模板")
+        self.btn_table_import_tpl.setStyleSheet("background-color: #1976D2; color: white;")
+        self.btn_table_import_tpl.clicked.connect(self.import_templates_from_table)
         
         self.btn_delete_tpl = QPushButton("🗑️ 删除")
         self.btn_delete_tpl.setObjectName("btn_delete")
@@ -312,6 +700,7 @@ class TemplateConfigDialog(QDialog):
         self.btn_reset_tpl.clicked.connect(self.reset_templates)
         
         btn_left_layout.addWidget(self.btn_new_tpl)
+        btn_left_layout.addWidget(self.btn_table_import_tpl)
         btn_left_layout.addWidget(self.btn_delete_tpl)
         btn_left_layout.addWidget(self.btn_reset_tpl)
         left_layout.addLayout(btn_left_layout)
@@ -380,6 +769,11 @@ class TemplateConfigDialog(QDialog):
         btn_left_layout = QHBoxLayout()
         self.btn_new_motion = QPushButton("＋ 新建")
         self.btn_new_motion.clicked.connect(self.new_motion)
+
+        self.btn_table_import_motion = QPushButton("📋 表格导入")
+        self.btn_table_import_motion.setToolTip("直接从表格复制两列（第1列：运镜名称，第2列：运镜内容）快速批量导入运镜预设")
+        self.btn_table_import_motion.setStyleSheet("background-color: #1976D2; color: white;")
+        self.btn_table_import_motion.clicked.connect(self.import_motions_from_table)
         
         self.btn_delete_motion = QPushButton("🗑️ 删除")
         self.btn_delete_motion.setObjectName("btn_delete")
@@ -390,6 +784,7 @@ class TemplateConfigDialog(QDialog):
         self.btn_reset_motion.clicked.connect(self.reset_motions)
         
         btn_left_layout.addWidget(self.btn_new_motion)
+        btn_left_layout.addWidget(self.btn_table_import_motion)
         btn_left_layout.addWidget(self.btn_delete_motion)
         btn_left_layout.addWidget(self.btn_reset_motion)
         left_layout.addLayout(btn_left_layout)
@@ -840,11 +1235,18 @@ class TemplateConfigDialog(QDialog):
         btn_left_layout = QHBoxLayout()
         self.btn_new_batch = QPushButton("＋ 新建")
         self.btn_new_batch.clicked.connect(self.new_batch_template)
+
+        self.btn_table_import_batch = QPushButton("📋 表格导入")
+        self.btn_table_import_batch.setToolTip("直接从表格复制两列（第1列：模板名称，第2列：模板内容）快速批量导入批量模板")
+        self.btn_table_import_batch.setStyleSheet("background-color: #1976D2; color: white;")
+        self.btn_table_import_batch.clicked.connect(self.import_batch_templates_from_table)
+
         self.btn_delete_batch = QPushButton("🗑️ 删除")
         self.btn_delete_batch.setObjectName("btn_delete")
         self.btn_delete_batch.clicked.connect(self.delete_batch_template)
         
         btn_left_layout.addWidget(self.btn_new_batch)
+        btn_left_layout.addWidget(self.btn_table_import_batch)
         btn_left_layout.addWidget(self.btn_delete_batch)
         left_layout.addLayout(btn_left_layout)
         splitter.addWidget(left_widget)
@@ -997,3 +1399,49 @@ class TemplateConfigDialog(QDialog):
             QMessageBox.information(self, "成功", "批量模板已保存！")
         else:
             QMessageBox.critical(self, "错误", "批量模板保存失败。")
+
+    # --- Spreadsheet Two-Column Import Handlers ---
+    def import_templates_from_table(self):
+        dlg = TableTemplateImportDialog("templates", self.tm, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.load_data()
+            if self.list_templates.count() > 0:
+                self.list_templates.setCurrentRow(self.list_templates.count() - 1)
+            QMessageBox.information(
+                self,
+                "表格导入完成",
+                f"✅ 已成功从表格导入 {dlg.imported_count} 条提示词模板！\n"
+                f"（新增 {getattr(dlg, 'added_count', 0)} 条，同名更新 {getattr(dlg, 'updated_count', 0)} 条）"
+            )
+
+    def import_motions_from_table(self):
+        dlg = TableTemplateImportDialog("motions", self.tm, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.load_data()
+            if self.list_motions.count() > 0:
+                self.list_motions.setCurrentRow(self.list_motions.count() - 1)
+            QMessageBox.information(
+                self,
+                "表格导入完成",
+                f"✅ 已成功从表格导入 {dlg.imported_count} 条运镜预设！\n"
+                f"（新增 {getattr(dlg, 'added_count', 0)} 条，同名更新 {getattr(dlg, 'updated_count', 0)} 条）"
+            )
+
+    def import_batch_templates_from_table(self):
+        cur_filter = self.cb_batch_filter_cat.currentData() if hasattr(self, "cb_batch_filter_cat") else "__ALL__"
+        default_cat = cur_filter if cur_filter not in ("__ALL__", "__UNCATEGORIZED__", None) else ""
+        dlg = TableTemplateImportDialog("batch_templates", self.tm, default_category=default_cat, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            target_cat = dlg.cb_target_cat.currentText().strip() if hasattr(dlg, "cb_target_cat") else ""
+            keep_filter = target_cat if target_cat else cur_filter
+            self._refresh_batch_category_widgets(keep_filter_data=keep_filter, keep_edit_cat=target_cat)
+            self._populate_batch_list()
+            if self.list_batch.count() > 0:
+                self.list_batch.setCurrentRow(self.list_batch.count() - 1)
+            cat_msg = f"\n📂 所属分类：【{target_cat}】" if target_cat else ""
+            QMessageBox.information(
+                self,
+                "表格导入完成",
+                f"✅ 已成功从表格导入 {dlg.imported_count} 条批量模板！\n"
+                f"（新增 {getattr(dlg, 'added_count', 0)} 条，同名更新 {getattr(dlg, 'updated_count', 0)} 条）{cat_msg}"
+            )

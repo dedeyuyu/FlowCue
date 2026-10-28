@@ -29,6 +29,16 @@ class NoWheelComboBox(QComboBox):
             event.ignore()
 
 
+class NoWheelSpinBox(QSpinBox):
+    """QSpinBox that ignores mouse wheel events to prevent accidental changes while scrolling."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class BatchGenerateTabWidget(QWidget):
     def __init__(self, plugin_server, parent=None):
         super().__init__(parent)
@@ -117,23 +127,18 @@ class BatchGenerateTabWidget(QWidget):
         self.cb_duration = NoWheelComboBox()
         self.cb_duration.addItems(["4秒", "6秒", "8秒", "10秒"])
         self.cb_duration.setCurrentText("8秒")
-        self.cb_duration.currentIndexChanged.connect(self.save_current_project)
+        self.cb_duration.currentIndexChanged.connect(self.on_duration_changed)
         config_layout.addWidget(self.cb_duration)
         
-        config_layout.addWidget(QLabel("尺寸比例:"))
-        self.cb_aspect = NoWheelComboBox()
-        self.cb_aspect.addItems(["16:9", "9:16"])
-        self.cb_aspect.setCurrentText("16:9")
-        self.cb_aspect.currentIndexChanged.connect(self.save_current_project)
-        config_layout.addWidget(self.cb_aspect)
-        
         config_layout.addWidget(QLabel("单批次生成积分上限:"))
-        self.sb_points = QSpinBox()
+        self.sb_points = NoWheelSpinBox()
         self.sb_points.setRange(1, 1000)
         self.sb_points.setValue(50)
-        self.sb_points.setToolTip("每个导出的JSON任务块最高消耗积分")
-        self.sb_points.valueChanged.connect(self.save_current_project)
+        self.sb_points.setToolTip("每个导出的JSON任务块最高消耗积分（修改此数值不会触发重算卡顿，仅在点击一键多开分配生成时按此上限计算）")
+        self.sb_points.valueChanged.connect(self.on_points_limit_changed)
+        self.sb_points.editingFinished.connect(self.on_points_editing_finished)
         config_layout.addWidget(self.sb_points)
+        config_layout.addStretch()
         config_vbox.addLayout(config_layout)
 
         # Row 2: Category selection & sequential/cycle distribution ("随机发放")
@@ -360,10 +365,8 @@ class BatchGenerateTabWidget(QWidget):
         self.cb_duration.blockSignals(True)
         self.sb_points.blockSignals(True)
         self.cb_template.blockSignals(True)
-        self.cb_aspect.blockSignals(True)
         
         self.cb_duration.setCurrentText(f"{self.current_project.get('duration', 8)}秒")
-        self.cb_aspect.setCurrentText(self.current_project.get('aspect_ratio', "16:9"))
         self.sb_points.setValue(self.current_project.get('points_cost', 50))
         
         tpl_id = self.current_project.get("template_id", "")
@@ -376,7 +379,6 @@ class BatchGenerateTabWidget(QWidget):
         self.cb_duration.blockSignals(False)
         self.sb_points.blockSignals(False)
         self.cb_template.blockSignals(False)
-        self.cb_aspect.blockSignals(False)
         
         self.render_table()
 
@@ -506,6 +508,42 @@ class BatchGenerateTabWidget(QWidget):
             images[row]["prompt"] = item.text()
             self.model.save_project(self.current_project)
 
+    def on_duration_changed(self):
+        """Update duration in-place without rebuilding the entire table or recalculating batches."""
+        if not self.current_project:
+            return
+        try:
+            new_dur = int(self.cb_duration.currentText().replace("秒", ""))
+        except ValueError:
+            new_dur = 8
+        self.current_project["duration"] = new_dur
+        dur_str = f"{new_dur}秒"
+        images = self.current_project.get("images", [])
+        self._is_rendering_table = True
+        try:
+            for i, img in enumerate(images):
+                img["duration"] = new_dur
+                if i < self.table.rowCount():
+                    item = self.table.item(i, 3)
+                    if item is not None:
+                        item.setText(dur_str)
+        finally:
+            self._is_rendering_table = False
+        self.model.save_project(self.current_project)
+
+    def on_points_limit_changed(self, value: int):
+        """Lightweight in-memory update when points spinbox value changes; zero table rebuild or disk I/O."""
+        if not self.current_project:
+            return
+        self.current_project["points_cost"] = int(value)
+
+    def on_points_editing_finished(self):
+        """Persist points_cost once user finishes editing the spinbox."""
+        if not self.current_project:
+            return
+        self.current_project["points_cost"] = self.sb_points.value()
+        self.model.save_project(self.current_project)
+
     def _sync_ui_to_current_project(self):
         """Sync all top-bar settings and table row presets/prompts into self.current_project."""
         if not self.current_project:
@@ -513,7 +551,6 @@ class BatchGenerateTabWidget(QWidget):
         new_dur = int(self.cb_duration.currentText().replace("秒", ""))
         self.current_project["duration"] = new_dur
         self.current_project["points_cost"] = self.sb_points.value()
-        self.current_project["aspect_ratio"] = self.cb_aspect.currentText()
         self.current_project["template_id"] = self.cb_template.currentData() or ""
 
         images = self.current_project.get("images", [])
@@ -568,9 +605,11 @@ class BatchGenerateTabWidget(QWidget):
         skipped_count = 0
         
         cm = getattr(self.main_window, "config_manager", None) if self.main_window else None
+        if cm:
+            cm.load()
         default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
         default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
-        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        batch_aspect = getattr(cm, "batch_default_aspect_ratio", getattr(cm, "default_aspect_ratio", "9:16")) if cm else "9:16"
         task_interval = getattr(cm, "task_interval", 5) if cm else 5
         
         for idx, img in enumerate(images):
@@ -603,7 +642,7 @@ class BatchGenerateTabWidget(QWidget):
                 "mode": default_mode,
                 "model": default_model,
                 "interval": task_interval,
-                "aspect_ratio": self.current_project.get("aspect_ratio", default_aspect),
+                "aspect_ratio": batch_aspect,
                 "download_path": str(download_path_obj.resolve())
             }
             all_tasks.append(task_dict)
@@ -620,17 +659,21 @@ class BatchGenerateTabWidget(QWidget):
         max_batch_points = self.sb_points.value()
         
         class MockCM:
-            def __init__(self, pts, real_cm=None):
+            def __init__(self, pts, real_cm=None, aspect_override="9:16"):
+                self._real_cm = real_cm
                 self.max_batch_points = pts
                 self.default_generation_mode = getattr(real_cm, "default_generation_mode", "VIDEO_FRAMES") if real_cm else "VIDEO_FRAMES"
-                self.default_aspect_ratio = getattr(real_cm, "default_aspect_ratio", "9:16") if real_cm else "9:16"
+                self.default_aspect_ratio = aspect_override
+                self.batch_default_aspect_ratio = aspect_override
                 self.default_video_model = getattr(real_cm, "default_video_model", "omni_1_1_flash") if real_cm else "omni_1_1_flash"
                 self.task_interval = getattr(real_cm, "task_interval", 5) if real_cm else 5
             def get_points_for_duration(self, dur):
+                if self._real_cm and hasattr(self._real_cm, "get_points_for_duration"):
+                    return self._real_cm.get_points_for_duration(dur)
                 points_map = {10: 15, 8: 12, 6: 10, 4: 7}
                 return points_map.get(dur, 10)
                 
-        cm_mock = MockCM(max_batch_points, cm)
+        cm_mock = MockCM(max_batch_points, cm, batch_aspect)
         
         def get_task_points(task):
             return cm_mock.get_points_for_duration(task.get("duration", 4))
@@ -924,9 +967,11 @@ class BatchGenerateTabWidget(QWidget):
         project_name = self.current_project.get("name", "批量任务")
         download_path = str((ws / project_name / f"{image_path.stem}.mp4").resolve())
         cm = getattr(self.main_window, "config_manager", None) if self.main_window else None
+        if cm:
+            cm.load()
         default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
         default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
-        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        batch_aspect = getattr(cm, "batch_default_aspect_ratio", getattr(cm, "default_aspect_ratio", "9:16")) if cm else "9:16"
         task_interval = getattr(cm, "task_interval", 5) if cm else 5
         data = [{
             "prompt": img.get("prompt", ""),
@@ -935,7 +980,7 @@ class BatchGenerateTabWidget(QWidget):
             "mode": default_mode,
             "model": default_model,
             "interval": task_interval,
-            "aspect_ratio": self.current_project.get("aspect_ratio", default_aspect),
+            "aspect_ratio": batch_aspect,
             "download_path": download_path
         }]
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
@@ -952,9 +997,11 @@ class BatchGenerateTabWidget(QWidget):
         ws = Path(self.main_window.workspace_dir) if hasattr(self.main_window, 'workspace_dir') else Path('.')
         project_name = self.current_project.get("name", "批量任务")
         cm = getattr(self.main_window, "config_manager", None) if self.main_window else None
+        if cm:
+            cm.load()
         default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
         default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
-        default_aspect = getattr(cm, "default_aspect_ratio", "9:16") if cm else "9:16"
+        batch_aspect = getattr(cm, "batch_default_aspect_ratio", getattr(cm, "default_aspect_ratio", "9:16")) if cm else "9:16"
         task_interval = getattr(cm, "task_interval", 5) if cm else 5
         out = []
         for i in images:
@@ -967,7 +1014,7 @@ class BatchGenerateTabWidget(QWidget):
                 "mode": default_mode,
                 "model": default_model,
                 "interval": task_interval,
-                "aspect_ratio": self.current_project.get("aspect_ratio", default_aspect),
+                "aspect_ratio": batch_aspect,
                 "download_path": download_path
             })
             

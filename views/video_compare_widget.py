@@ -913,22 +913,34 @@ class VideoCompareWidget(QWidget):
     @staticmethod
     def _clean_word_for_display(word):
         """Strips leading/trailing punctuation and converts to lowercase for clean comparison display.
-        Preserves Spanish accent characters (á, é, í, ó, ú, ü, ñ).
+        Preserves Spanish accent characters and Devanagari combining marks (Nepali).
         Does NOT modify underlying project model data.
         """
         import re
+        import unicodedata
         w = word.lower().strip()
-        w = re.sub(r'^[^\w]+|[^\w]+$', '', w, flags=re.UNICODE)
-        return w
+        def _is_word_char(c):
+            return c != '_' and (bool(re.match(r'\w', c)) or unicodedata.category(c) in ('Mn', 'Mc', 'Me'))
+        start = 0
+        end = len(w)
+        while start < end and not _is_word_char(w[start]):
+            start += 1
+        while end > start and not _is_word_char(w[end - 1]):
+            end -= 1
+        return w[start:end]
 
     @staticmethod
     def _normalize_word_for_compare(word):
         """Internal helper to clean a word for matching only (ignores punctuation, case, accents).
-        Does NOT modify original text data.
+        Preserves Devanagari combining marks (Nepali). Does NOT modify original text data.
         """
         import re
+        import unicodedata
         w = word.lower().strip()
-        w = re.sub(r'[^\w]', '', w, flags=re.UNICODE)
+        w = "".join(
+            c for c in w
+            if (c != '_' and (re.match(r'\w', c) or unicodedata.category(c) in ('Mn', 'Mc', 'Me')))
+        )
         accent_map = str.maketrans({
             'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ü': 'u',
             'à': 'a', 'è': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',

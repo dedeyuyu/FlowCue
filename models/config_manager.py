@@ -37,12 +37,14 @@ class ConfigManager:
         ("ja", "日语 (Japanese)"),
         ("ko", "韩语 (Korean)"),
         ("ar", "阿拉伯语 (Arabic)"),
+        ("ne", "尼泊尔语 (Nepali)"),
     ]
     
     # Video generation default rules
     DEFAULT_TASK_INTERVAL = 5
     DEFAULT_GENERATION_MODE = "VIDEO_FRAMES"
     DEFAULT_ASPECT_RATIO = "9:16"
+    DEFAULT_BATCH_ASPECT_RATIO = "9:16"
     DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
     DEFAULT_THEME_MODE = "light"
 
@@ -125,6 +127,7 @@ class ConfigManager:
         self.task_interval = self.DEFAULT_TASK_INTERVAL
         self.default_generation_mode = self.DEFAULT_GENERATION_MODE
         self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
+        self.batch_default_aspect_ratio = self.DEFAULT_BATCH_ASPECT_RATIO
         self.default_video_model = self.DEFAULT_VIDEO_MODEL
         
         # Import columns mapping
@@ -218,6 +221,9 @@ class ConfigManager:
                     valid_aspects = {a[0] for a in self.SUPPORTED_ASPECT_RATIOS}
                     self.default_aspect_ratio = aspect_val if aspect_val in valid_aspects else self.DEFAULT_ASPECT_RATIO
                     
+                    batch_aspect_val = data.get("batch_default_aspect_ratio", self.default_aspect_ratio)
+                    self.batch_default_aspect_ratio = batch_aspect_val if batch_aspect_val in valid_aspects else self.DEFAULT_BATCH_ASPECT_RATIO
+                    
                     model_val = data.get("default_video_model", self.DEFAULT_VIDEO_MODEL)
                     valid_models = {m[0] for m in self.SUPPORTED_VIDEO_MODELS}
                     self.default_video_model = model_val if model_val in valid_models else self.DEFAULT_VIDEO_MODEL
@@ -270,6 +276,7 @@ class ConfigManager:
             "task_interval": self.task_interval,
             "default_generation_mode": self.default_generation_mode,
             "default_aspect_ratio": self.default_aspect_ratio,
+            "batch_default_aspect_ratio": getattr(self, "batch_default_aspect_ratio", self.DEFAULT_BATCH_ASPECT_RATIO),
             "default_video_model": self.default_video_model,
             "import_columns": list(self.import_columns) if getattr(self, "import_columns", None) else list(self.DEFAULT_IMPORT_COLUMNS),
             "theme_mode": getattr(self, "theme_mode", self.DEFAULT_THEME_MODE),
@@ -291,6 +298,7 @@ class ConfigManager:
         self.task_interval = self.DEFAULT_TASK_INTERVAL
         self.default_generation_mode = self.DEFAULT_GENERATION_MODE
         self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
+        self.batch_default_aspect_ratio = self.DEFAULT_BATCH_ASPECT_RATIO
         self.default_video_model = self.DEFAULT_VIDEO_MODEL
         self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
         self.save()

@@ -243,7 +243,7 @@ class SettingsDialog(QDialog):
             self.combo_language.addItem(label, code)
         lang_layout.addWidget(self.combo_language, stretch=1)
         
-        lbl_lang_hint = QLabel("(* 用于语音转文字时指定目标语言)")
+        lbl_lang_hint = QLabel("(* 用于语音转文字核对字幕；选择尼泊尔语时文案断行自动按尼泊尔语标点 । 和 ॥ 切分)")
         lbl_lang_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
         lang_layout.addWidget(lbl_lang_hint)
         api_layout.addLayout(lang_layout)
@@ -344,27 +344,41 @@ class SettingsDialog(QDialog):
         row1_layout.addWidget(self.combo_default_mode, stretch=1)
         gen_rules_layout.addLayout(row1_layout)
         
-        # Row 2: Aspect Ratio & Video Model
+        # Row 2: Project Management Aspect Ratio & Batch Generate Aspect Ratio
         row2_layout = QHBoxLayout()
-        row2_layout.addWidget(QLabel("📐 默认画面尺寸:"))
+        row2_layout.addWidget(QLabel("📐 项目管理尺寸比例:"))
         self.combo_default_aspect = NoWheelComboBox()
         self.combo_default_aspect.setStyleSheet(combo_style)
         self.combo_default_aspect.setFixedWidth(135)
+        self.combo_default_aspect.setToolTip("用于「📋 项目管理」和「🤖 全局托管」导出的画面尺寸比例")
         for aspect_code, aspect_label in ConfigManager.SUPPORTED_ASPECT_RATIOS:
             self.combo_default_aspect.addItem(aspect_label, aspect_code)
         row2_layout.addWidget(self.combo_default_aspect)
         
         row2_layout.addSpacing(20)
         
-        row2_layout.addWidget(QLabel("🤖 默认生成模型:"))
+        row2_layout.addWidget(QLabel("📐 批量生成尺寸比例:"))
+        self.combo_batch_default_aspect = NoWheelComboBox()
+        self.combo_batch_default_aspect.setStyleSheet(combo_style)
+        self.combo_batch_default_aspect.setFixedWidth(135)
+        self.combo_batch_default_aspect.setToolTip("用于「🚀 批量生成」导出及一键多开分配生成的画面尺寸比例")
+        for aspect_code, aspect_label in ConfigManager.SUPPORTED_ASPECT_RATIOS:
+            self.combo_batch_default_aspect.addItem(aspect_label, aspect_code)
+        row2_layout.addWidget(self.combo_batch_default_aspect)
+        row2_layout.addStretch()
+        gen_rules_layout.addLayout(row2_layout)
+
+        # Row 3: Video Model
+        row3_layout = QHBoxLayout()
+        row3_layout.addWidget(QLabel("🤖 默认生成模型:"))
         self.combo_default_model = NoWheelComboBox()
         self.combo_default_model.setStyleSheet(combo_style)
         for model_code, model_label in ConfigManager.SUPPORTED_VIDEO_MODELS:
             self.combo_default_model.addItem(model_label, model_code)
-        row2_layout.addWidget(self.combo_default_model, stretch=1)
-        gen_rules_layout.addLayout(row2_layout)
+        row3_layout.addWidget(self.combo_default_model, stretch=1)
+        gen_rules_layout.addLayout(row3_layout)
         
-        lbl_gen_rules_hint = QLabel("💡 提示: 此处设置的间隔时间、生成模式（帧模式/素材模式）、尺寸比例（9:16/16:9）及模型（默认 Omni 1.1 Flash）将在复制/导出任务时自动同步给浏览器插件严格执行。")
+        lbl_gen_rules_hint = QLabel("💡 提示: 「项目管理尺寸比例」与「批量生成尺寸比例」已独立分开配置；此处设置的间隔时间、生成模式、各自尺寸比例及模型将在复制/导出任务时自动同步给浏览器插件严格执行。")
         lbl_gen_rules_hint.setWordWrap(True)
         lbl_gen_rules_hint.setStyleSheet("color: #0284C7; font-style: italic; font-size: 11px;")
         gen_rules_layout.addWidget(lbl_gen_rules_hint)
@@ -600,6 +614,10 @@ class SettingsDialog(QDialog):
         aspect_code = getattr(self.cm, "default_aspect_ratio", "9:16")
         idx_aspect = self.combo_default_aspect.findData(aspect_code)
         self.combo_default_aspect.setCurrentIndex(idx_aspect if idx_aspect >= 0 else 0)
+
+        batch_aspect_code = getattr(self.cm, "batch_default_aspect_ratio", aspect_code)
+        idx_batch_aspect = self.combo_batch_default_aspect.findData(batch_aspect_code)
+        self.combo_batch_default_aspect.setCurrentIndex(idx_batch_aspect if idx_batch_aspect >= 0 else 0)
         
         model_code = getattr(self.cm, "default_video_model", "omni_1_1_flash")
         idx_model = self.combo_default_model.findData(model_code)
@@ -721,6 +739,7 @@ class SettingsDialog(QDialog):
         self.cm.task_interval = self.spin_task_interval.value()
         self.cm.default_generation_mode = self.combo_default_mode.currentData() or "VIDEO_FRAMES"
         self.cm.default_aspect_ratio = self.combo_default_aspect.currentData() or "9:16"
+        self.cm.batch_default_aspect_ratio = self.combo_batch_default_aspect.currentData() or "9:16"
         self.cm.default_video_model = self.combo_default_model.currentData() or "omni_1_1_flash"
         self.cm.import_columns = [cb.currentData() for cb in self.import_col_combos]
         if hasattr(self, "combo_theme_mode"):

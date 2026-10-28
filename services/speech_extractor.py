@@ -215,11 +215,16 @@ class SpeechExtractor:
     @staticmethod
     def _normalize_word_for_compare(word):
         """Internal helper to clean a word for matching only (ignores punctuation, case, accents).
+        Preserves Unicode combining marks (e.g. Devanagari vowel signs for Nepali).
         Does NOT modify the original text data.
         """
         import re
+        import unicodedata
         w = word.lower().strip()
-        w = re.sub(r'[^\w]', '', w, flags=re.UNICODE)
+        w = "".join(
+            c for c in w
+            if (c != '_' and (re.match(r'\w', c) or unicodedata.category(c) in ('Mn', 'Mc', 'Me')))
+        )
         accent_map = str.maketrans({
             'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ü': 'u',
             'à': 'a', 'è': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',
