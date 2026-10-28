@@ -162,31 +162,34 @@ class BatchGenerateTabWidget(QWidget):
         self.btn_distribute_category.clicked.connect(self.distribute_category_presets_to_rows)
         cat_distribute_layout.addWidget(self.btn_distribute_category)
 
-        self.btn_import_row_presets_table = QPushButton("📋 表格导入预设")
-        self.btn_import_row_presets_table.setToolTip(
-            "在表格（Excel / WPS / 飞书 / 谷歌表格）中按顺序排好一列「预设名称」并复制，\n"
-            "点击此按钮即可将预设名称作为 ID 自动匹配，并一键填充到下方每一条任务的「单独预设」与「提示词」中！"
+        cat_distribute_layout.addSpacing(12)
+        cat_distribute_layout.addWidget(QLabel("📍 粘贴起始行:"))
+        self.sb_paste_start_row = NoWheelSpinBox()
+        self.sb_paste_start_row.setRange(1, 9999)
+        self.sb_paste_start_row.setValue(1)
+        self.sb_paste_start_row.setPrefix("第 ")
+        self.sb_paste_start_row.setSuffix(" 行")
+        self.sb_paste_start_row.setToolTip(
+            "设置从第几行开始粘贴表格提示词（点击下方表格任意行也会自动同步此起始行号；粘贴完成后会自动推进到下一行）"
         )
-        self.btn_import_row_presets_table.setStyleSheet(
+        cat_distribute_layout.addWidget(self.sb_paste_start_row)
+
+        self.btn_paste_prompts_table = QPushButton("📋 表格粘贴提示词")
+        self.btn_paste_prompts_table.setToolTip(
+            "直接在表格（Excel / WPS / 飞书 / 谷歌表格）中复制多行「提示词」，\n"
+            "点击此按钮即可从指定的「起始行」开始依次往下批量填充到「提示词」列（也支持在表格中选中起始行后直接按 Ctrl+V 或右键粘贴）！"
+        )
+        self.btn_paste_prompts_table.setStyleSheet(
             "QPushButton { background-color: #0288D1; color: white; padding: 5px 14px; font-size: 13px; font-weight: bold; border-radius: 4px; }"
             "QPushButton:hover { background-color: #0277BD; }"
             "QPushButton:pressed { background-color: #01579B; }"
         )
-        self.btn_import_row_presets_table.clicked.connect(lambda: self.import_row_presets_from_clipboard(start_row=0))
-        cat_distribute_layout.addWidget(self.btn_import_row_presets_table)
-
-        self.btn_copy_category_preset_names = QPushButton("📤 复制预设名")
-        self.btn_copy_category_preset_names.setToolTip(
-            "复制当前所选分类下的所有预设名称到剪贴板（每行一个），方便直接粘贴到表格中进行排序编排"
+        self.btn_paste_prompts_table.clicked.connect(
+            lambda: self.paste_prompts_from_clipboard(start_row=self.sb_paste_start_row.value() - 1)
         )
-        self.btn_copy_category_preset_names.setStyleSheet(
-            "QPushButton { background-color: #8D6E63; color: white; padding: 5px 10px; font-size: 12px; font-weight: bold; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #6D4C41; }"
-        )
-        self.btn_copy_category_preset_names.clicked.connect(self.copy_category_preset_names_to_clipboard)
-        cat_distribute_layout.addWidget(self.btn_copy_category_preset_names)
+        cat_distribute_layout.addWidget(self.btn_paste_prompts_table)
 
-        lbl_cat_hint = QLabel("💡 支持按分类「随机发放」，或在表格中排好预设名后复制并点击「📋 表格导入预设」（也支持在表格中右键粘贴）")
+        lbl_cat_hint = QLabel("💡 可直接从表格复制多行提示词，选好起始行后点击「📋 表格粘贴提示词」（或在列表某行按 Ctrl+V / 右键粘贴）")
         lbl_cat_hint.setStyleSheet("color: #8D6E63; font-size: 12px; font-weight: normal;")
         cat_distribute_layout.addWidget(lbl_cat_hint)
         cat_distribute_layout.addStretch()
@@ -225,6 +228,7 @@ class BatchGenerateTabWidget(QWidget):
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self.table.cellDoubleClicked.connect(self.on_table_cell_double_clicked)
+        self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.itemChanged.connect(self.on_table_item_changed)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.on_table_context_menu)
@@ -448,6 +452,10 @@ class BatchGenerateTabWidget(QWidget):
         self.cb_duration.blockSignals(False)
         self.sb_points.blockSignals(False)
         self.cb_template.blockSignals(False)
+        if hasattr(self, "sb_paste_start_row"):
+            img_cnt = max(1, len(self.current_project.get("images", [])))
+            self.sb_paste_start_row.setRange(1, img_cnt)
+            self.sb_paste_start_row.setValue(1)
         
         self.render_table()
 
@@ -458,6 +466,9 @@ class BatchGenerateTabWidget(QWidget):
         content = self._get_template_content_by_id(tpl_id)
                         
         for img in self.current_project["images"]:
+            # If user manually pasted/typed a custom prompt and tpl_id is cleared ("未选择"), keep user's prompt
+            if not tpl_id and img.get("prompt"):
+                continue
             # Only overwrite rows that follow the global preset (no individual template_id set)
             if not img.get("template_id"):
                 img["prompt"] = content
@@ -525,39 +536,19 @@ class BatchGenerateTabWidget(QWidget):
             f"已将全部 {len(images)} 条任务的「单独预设」与「提示词」自动铺满并保存！"
         )
 
-    def copy_category_preset_names_to_clipboard(self):
-        """Copy all preset names in the currently selected category to clipboard (one per line) for easy spreadsheet sorting."""
-        selected_cat = self.cb_category.currentData() if hasattr(self, "cb_category") else "__ALL__"
-        all_templates = self._get_batch_templates_list()
-        if selected_cat in ("__ALL__", None, ""):
-            pool = list(all_templates)
-            cat_display = "全部批量预设"
-        else:
-            pool = [t for t in all_templates if (t.get("category") or "").strip() == selected_cat]
-            cat_display = selected_cat
+    def _on_table_cell_clicked(self, row: int, col: int):
+        """Sync the paste starting row spinbox when user clicks a row in the table."""
+        if hasattr(self, "sb_paste_start_row") and row >= 0:
+            self.sb_paste_start_row.setValue(row + 1)
 
-        if not pool:
-            QMessageBox.warning(self, "无预设可复制", f"分类【{cat_display}】下暂无预设名称可复制。")
-            return
-
-        names = [(t.get("name") or "").strip() for t in pool if (t.get("name") or "").strip()]
-        QGuiApplication.clipboard().setText("\n".join(names))
-        QMessageBox.information(
-            self,
-            "复制成功",
-            f"📤 已将【{cat_display}】下的 {len(names)} 个预设名称复制到剪贴板（每行一个）！\n\n"
-            "您可以直接粘贴到表格（Excel / WPS / 飞书 / 谷歌表格）中自由排序，\n"
-            "排好后再复制该列并点击「📋 表格导入预设」即可一键匹配填充。"
-        )
-
-    def _parse_preset_names_from_clipboard(self) -> list:
+    def _parse_prompts_from_clipboard(self) -> list:
         """
-        Parse a column (or multi-column table) of preset names from clipboard.
-        Supports Excel / WPS / Feishu / Google Sheets HTML tables and TSV plain text.
-        Preserves empty cells in the middle of the column so row alignment stays 1-to-1.
+        Parse multi-row prompts copied from a spreadsheet (Excel / WPS / Feishu / Google Sheets) or plain text.
+        Supports multiline cells inside Excel (quoted TSV or HTML <table>) and preserves row alignment.
         """
         import csv
         import io
+        import re
         from bs4 import BeautifulSoup
 
         clipboard = QGuiApplication.clipboard()
@@ -565,8 +556,9 @@ class BatchGenerateTabWidget(QWidget):
         if not mime_data:
             return []
 
-        raw_rows = []
-        # 1. Try TSV plain text first
+        tsv_rows = []
+        html_rows = []
+
         if mime_data.hasText():
             text = mime_data.text()
             if text and text.strip():
@@ -574,81 +566,75 @@ class BatchGenerateTabWidget(QWidget):
                 try:
                     reader = csv.reader(io.StringIO(cleaned), delimiter="\t")
                     for cols in reader:
-                        raw_rows.append([c.strip() for c in cols] if cols else [""])
+                        tsv_rows.append([c.strip() for c in cols] if cols else [""])
                 except Exception:
-                    raw_rows = [[line.strip()] for line in cleaned.splitlines()]
+                    tsv_rows = [[line.strip()] for line in cleaned.splitlines()]
 
-        # 2. Fallback to HTML table if TSV was empty
-        if not raw_rows and mime_data.hasHtml():
+        if mime_data.hasHtml():
             html_text = mime_data.html()
             if html_text and "<tr" in html_text.lower():
                 soup = BeautifulSoup(html_text, "html.parser")
                 for tr in soup.find_all("tr"):
                     tds = tr.find_all(["td", "th"])
-                    if tds:
-                        raw_rows.append([td.get_text().strip() for td in tds])
+                    if not tds:
+                        continue
+                    row_cells = []
+                    for td in tds:
+                        for br in td.find_all("br"):
+                            br.replace_with("\n")
+                        block_tags = td.find_all(["p", "div"])
+                        if block_tags:
+                            lines = [re.sub(r"\s+", " ", b.get_text()).strip() for b in block_tags if b.get_text().strip()]
+                            cell_txt = "\n".join(lines) if lines else td.get_text().strip()
+                        else:
+                            raw = td.get_text()
+                            parts = [re.sub(r"[ \t\r]+", " ", ln).strip() for ln in raw.split("\n")]
+                            cell_txt = "\n".join(p for p in parts if p) if len(parts) > 1 else re.sub(r"\s+", " ", raw).strip()
+                        row_cells.append(cell_txt)
+                    html_rows.append(row_cells)
+
+        # Prefer TSV when row counts match or HTML is absent; use HTML if unquoted newlines split TSV rows
+        if tsv_rows and (not html_rows or len(tsv_rows) == len(html_rows)):
+            raw_rows = tsv_rows
+        elif html_rows:
+            raw_rows = html_rows
+        else:
+            raw_rows = tsv_rows
 
         if not raw_rows:
             return []
 
-        # If multiple columns were copied (e.g. [序号/图片名 | 预设名称]), pick the column with the most preset matches
+        # If user copied 2+ columns (e.g. [序号 | 提示词]), pick the column that contains the actual prompt text
         max_cols = max(len(r) for r in raw_rows)
         best_col = 0
         if max_cols > 1:
-            best_score = -1
+            # Choose the column with the longest average text length (ignoring purely numeric index columns)
+            best_len = -1
             for col_idx in range(max_cols):
-                score = 0
-                for r in raw_rows:
-                    val = r[col_idx].strip() if col_idx < len(r) else ""
-                    if val and self._find_batch_template(val) is not None:
-                        score += 1
-                if score > best_score:
-                    best_score = score
+                vals = [r[col_idx].strip() for r in raw_rows if col_idx < len(r) and r[col_idx].strip()]
+                if not vals:
+                    continue
+                if all(v.isdigit() for v in vals):
+                    continue
+                avg_len = sum(len(v) for v in vals) / len(vals)
+                if avg_len > best_len:
+                    best_len = avg_len
                     best_col = col_idx
 
         extracted = [(r[best_col].strip() if best_col < len(r) else "") for r in raw_rows]
 
-        # Auto-skip header row if the first cell is a generic column title and not a real preset name
-        header_keywords = {"预设", "单独预设", "预设名称", "预设名字", "模板", "模板名称", "批量模板", "preset", "template", "id"}
-        if extracted:
-            first_val = extracted[0].strip()
-            if first_val.lower() in header_keywords and self._find_batch_template(first_val) is None:
-                extracted = extracted[1:]
+        # Auto-skip header row if the user copied the column header "提示词" / "描述词" / "Prompt"
+        header_keywords = {"提示词", "描述词", "模板内容", "预设内容", "内容", "prompt", "prompts"}
+        if len(extracted) > 1 and extracted[0].strip().lower() in header_keywords:
+            extracted = extracted[1:]
 
         return extracted
 
-    def _apply_row_preset_in_ui(self, row: int, tpl_id: str, new_prompt: str):
-        """Update row's preset combobox and prompt cell in-place without rebuilding the whole table."""
-        if row < 0 or row >= self.table.rowCount():
-            return
-        self._is_rendering_table = True
-        try:
-            w_preset = self.table.cellWidget(row, 4)
-            if w_preset:
-                cb = w_preset.findChild(QComboBox)
-                if cb is not None:
-                    cb.blockSignals(True)
-                    found_idx = cb.findData(tpl_id) if tpl_id else 0
-                    if found_idx < 0 and tpl_id:
-                        matched = self._find_batch_template(tpl_id)
-                        if matched:
-                            found_idx = cb.findData(matched.get("id", ""))
-                    cb.setCurrentIndex(found_idx if found_idx >= 0 else 0)
-                    self._apply_row_combo_style(cb, bool(tpl_id and found_idx > 0))
-                    cb.blockSignals(False)
-
-            prompt_item = self.table.item(row, 5)
-            if prompt_item is not None:
-                prompt_item.setText(new_prompt)
-            else:
-                self.table.setItem(row, 5, QTableWidgetItem(new_prompt))
-        finally:
-            self._is_rendering_table = False
-
-    def import_row_presets_from_clipboard(self, start_row: int = 0):
+    def paste_prompts_from_clipboard(self, start_row: int = 0):
         """
-        Read a list of preset names from clipboard (copied from Excel / WPS / Feishu / Google Sheets),
-        match each preset by its Name (acting as its ID), and populate the '单独预设' and '提示词' columns.
+        Paste multi-row prompts from clipboard directly into the '提示词' column (Col 5)
+        starting from `start_row` (0-based). User-filled prompts take top priority.
+        After pasting N rows, automatically advances `sb_paste_start_row` to `start_row + N + 1`.
         """
         if not self.current_project:
             QMessageBox.warning(self, "提示", "请先在左侧选择或导入一个批量任务！")
@@ -659,129 +645,119 @@ class BatchGenerateTabWidget(QWidget):
             QMessageBox.warning(self, "提示", "当前批量任务中没有图片条目。")
             return
 
-        all_templates = self._get_batch_templates_list()
-        if not all_templates:
+        prompts = self._parse_prompts_from_clipboard()
+        if not prompts or not any(p.strip() for p in prompts):
             QMessageBox.warning(
                 self,
-                "尚无批量模板预设",
-                "当前还没有任何批量模板预设！\n\n请先点击顶部「⚙️ 模板配置」->「🚀 批量模板」添加或从表格导入预设。"
-            )
-            return
-
-        preset_names = self._parse_preset_names_from_clipboard()
-        if not preset_names or not any(p.strip() for p in preset_names):
-            QMessageBox.warning(
-                self,
-                "剪贴板无有效预设名称",
-                "未能从剪贴板读取到预设名称列表！\n\n"
+                "剪贴板无有效提示词",
+                "未能从剪贴板读取到提示词内容！\n\n"
                 "📌 使用方法：\n"
-                "1. 在表格（Excel / WPS / 飞书 / 谷歌表格）中按顺序排好一列「预设名称」\n"
-                "2. 复制该列单元格\n"
-                "3. 点击「📋 表格导入预设」（或在任务列表中右键粘贴），系统将以预设名称作为 ID 自动匹配对应的「单独预设」并填充提示词！"
+                "1. 在表格（Excel / WPS / 飞书 / 谷歌表格）中直接复制 1 行或多行「提示词」\n"
+                "2. 选择好「粘贴起始行」（或直接在下方表格中点击目标起始行）\n"
+                "3. 点击「📋 表格粘贴提示词」或直接按 Ctrl+V / 右键粘贴，即可从起始行开始依次往下填充提示词！"
             )
             return
 
-        if start_row < 0 or start_row >= len(images):
+        if start_row < 0:
             start_row = 0
+        if start_row >= len(images):
+            QMessageBox.warning(
+                self,
+                "起始行超出范围",
+                f"当前任务共有 {len(images)} 行，而您选择的起始行为第 {start_row + 1} 行，请重新选择起始行！"
+            )
+            return
 
-        global_tpl_id = self.cb_template.currentData() or self.current_project.get("template_id", "")
-        global_content = self._get_template_content_by_id(global_tpl_id)
-        follow_keywords = {"跟随整体", "跟随整体预设", "🔗 跟随整体预设", "默认", "无", "none", "default"}
+        filled_count = 0
+        actual_start_1based = start_row + 1
+        actual_end_1based = start_row + 1
 
-        matched_count = 0
-        follow_global_count = 0
-        unmatched_items = []
-
-        for offset, raw_name in enumerate(preset_names):
-            target_row = start_row + offset
-            if target_row >= len(images):
-                break
-
-            clean_name = (raw_name or "").strip()
-            if not clean_name or clean_name.lower() in follow_keywords:
-                images[target_row]["template_id"] = ""
-                images[target_row]["template_name"] = ""
-                images[target_row]["prompt"] = global_content
-                self._apply_row_preset_in_ui(target_row, "", global_content)
-                follow_global_count += 1
-                continue
-
-            matched_tpl = self._find_batch_template(clean_name)
-            if matched_tpl is not None:
-                tpl_id = matched_tpl.get("id", "")
-                tpl_content = matched_tpl.get("content", "")
-                images[target_row]["template_id"] = tpl_id
-                images[target_row]["template_name"] = matched_tpl.get("name", clean_name)
-                images[target_row]["prompt"] = tpl_content
-                self._apply_row_preset_in_ui(target_row, tpl_id, tpl_content)
-                matched_count += 1
-            else:
-                unmatched_items.append((target_row + 1, clean_name))
+        self._is_rendering_table = True
+        try:
+            for offset, text in enumerate(prompts):
+                target_row = start_row + offset
+                if target_row >= len(images):
+                    break
+                clean_text = (text or "").strip()
+                images[target_row]["prompt"] = clean_text
+                prompt_item = self.table.item(target_row, 5)
+                if prompt_item is not None:
+                    prompt_item.setText(clean_text)
+                else:
+                    self.table.setItem(target_row, 5, QTableWidgetItem(clean_text))
+                filled_count += 1
+                actual_end_1based = target_row + 1
+        finally:
+            self._is_rendering_table = False
 
         self.model.save_project(self.current_project)
 
-        msg_lines = [
-            f"✅ 表格预设导入处理完成（从第 {start_row + 1} 行开始）：",
-            f"• 成功匹配并设置单独预设：{matched_count} 条",
-        ]
-        if follow_global_count > 0:
-            msg_lines.append(f"• 空白/设为跟随整体预设：{follow_global_count} 条")
-        if len(preset_names) > (len(images) - start_row):
-            extra_cnt = len(preset_names) - (len(images) - start_row)
-            msg_lines.append(f"• 超出任务行数已自动忽略：{extra_cnt} 条")
+        # Advance starting row to the next unfilled row for convenient continuous pasting
+        next_row_0based = min(start_row + filled_count, len(images) - 1)
+        if hasattr(self, "sb_paste_start_row"):
+            self.sb_paste_start_row.setRange(1, max(1, len(images)))
+            self.sb_paste_start_row.setValue(min(start_row + filled_count + 1, len(images)))
+        self.table.setCurrentCell(next_row_0based, 5)
 
-        if unmatched_items:
-            preview_unmatched = "\n".join(f"  - 第 {r} 行：「{n}」" for r, n in unmatched_items[:10])
-            if len(unmatched_items) > 10:
-                preview_unmatched += f"\n  ... 等共 {len(unmatched_items)} 条未匹配"
-            msg_lines.append(
-                f"\n⚠️ 以下 {len(unmatched_items)} 条名称在「🚀 批量模板」中未找到同名预设（该行已保持原状）：\n"
-                f"{preview_unmatched}\n\n"
-                f"请检查表格中的预设名称是否与「⚙️ 模板配置 -> 🚀 批量模板」中的名称一致。"
-            )
-            QMessageBox.warning(self, "表格预设导入结果（部分未匹配）", "\n".join(msg_lines))
-        else:
-            QMessageBox.information(self, "表格预设导入成功", "\n".join(msg_lines))
+        extra_cnt = max(0, len(prompts) - filled_count)
+        extra_note = f"\n• 超出任务总行数的 {extra_cnt} 行已自动忽略" if extra_cnt > 0 else ""
+        next_hint = (
+            f"\n• 下一次粘贴起始行已自动推进至：第 {start_row + filled_count + 1} 行"
+            if (start_row + filled_count) < len(images)
+            else "\n• 已粘贴至最后一行"
+        )
+        QMessageBox.information(
+            self,
+            "表格提示词粘贴成功",
+            f"✅ 已成功粘贴 {filled_count} 行提示词！\n\n"
+            f"• 填充范围：第 {actual_start_1based} 行 ～ 第 {actual_end_1based} 行"
+            f"{extra_note}"
+            f"{next_hint}"
+        )
 
     def _on_table_paste_shortcut(self):
-        """Handle Ctrl+V on the table to paste preset names starting from current row (when not editing Col 5)."""
+        """Handle Ctrl+V on the table to paste multi-row prompts starting from current selected row."""
         if not self.current_project:
             return
-        cur_row = max(0, self.table.currentRow())
-        self.import_row_presets_from_clipboard(start_row=cur_row)
+        cur_row = self.table.currentRow()
+        if cur_row < 0:
+            cur_row = (self.sb_paste_start_row.value() - 1) if hasattr(self, "sb_paste_start_row") else 0
+        self.paste_prompts_from_clipboard(start_row=max(0, cur_row))
 
     def on_table_context_menu(self, pos):
-        """Right-click context menu on the batch table for quick preset pasting."""
+        """Right-click context menu on the batch table for multi-row prompt pasting from any starting row."""
         if not self.current_project:
             return
         item = self.table.itemAt(pos)
         clicked_row = item.row() if item else max(0, self.table.currentRow())
+        if hasattr(self, "sb_paste_start_row") and clicked_row >= 0:
+            self.sb_paste_start_row.setValue(clicked_row + 1)
 
         menu = QMenu(self)
-        act_paste_from_top = menu.addAction("📋 从表格粘贴「单独预设」列表 (从第 1 行开始)")
-        act_paste_from_cur = None
+        act_paste_from_cur = menu.addAction(f"📋 从第 {clicked_row + 1} 行开始粘贴表格提示词 (Ctrl+V)")
+        act_paste_from_top = None
         if clicked_row > 0:
-            act_paste_from_cur = menu.addAction(f"📋 从表格粘贴「单独预设」列表 (从第 {clicked_row + 1} 行开始)")
+            act_paste_from_top = menu.addAction("📋 从第 1 行开始粘贴表格提示词")
         menu.addSeparator()
-        act_reset_cur = menu.addAction(f"🔗 将第 {clicked_row + 1} 行恢复为「跟随整体预设」")
+        act_clear_cur_prompt = menu.addAction(f"🧹 清空第 {clicked_row + 1} 行提示词")
         act_reset_all = menu.addAction("🔄 将全部行恢复为「跟随整体预设」")
 
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is None:
             return
-        if chosen == act_paste_from_top:
-            self.import_row_presets_from_clipboard(start_row=0)
-        elif act_paste_from_cur and chosen == act_paste_from_cur:
-            self.import_row_presets_from_clipboard(start_row=clicked_row)
-        elif chosen == act_reset_cur:
+        if chosen == act_paste_from_cur:
+            self.paste_prompts_from_clipboard(start_row=clicked_row)
+        elif act_paste_from_top and chosen == act_paste_from_top:
+            self.paste_prompts_from_clipboard(start_row=0)
+        elif chosen == act_clear_cur_prompt:
             images = self.current_project.get("images", [])
             if 0 <= clicked_row < len(images):
-                global_tpl_id = self.cb_template.currentData() or self.current_project.get("template_id", "")
-                global_content = self._get_template_content_by_id(global_tpl_id)
-                images[clicked_row]["template_id"] = ""
-                images[clicked_row]["template_name"] = ""
-                images[clicked_row]["prompt"] = global_content
-                self._apply_row_preset_in_ui(clicked_row, "", global_content)
+                images[clicked_row]["prompt"] = ""
+                self._is_rendering_table = True
+                prompt_item = self.table.item(clicked_row, 5)
+                if prompt_item:
+                    prompt_item.setText("")
+                self._is_rendering_table = False
                 self.model.save_project(self.current_project)
         elif chosen == act_reset_all:
             self.reset_all_row_templates_to_global()
