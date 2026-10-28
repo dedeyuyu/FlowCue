@@ -6,9 +6,9 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QComboBox, QSpinBox, QFileDialog, QMessageBox,
-                             QSplitter, QListWidget, QFrame, QInputDialog, QDialog)
+                             QSplitter, QListWidget, QFrame, QInputDialog, QDialog, QMenu)
 from PyQt6.QtCore import Qt, pyqtSlot, QUrl
-from PyQt6.QtGui import QGuiApplication, QPixmap, QDesktopServices
+from PyQt6.QtGui import QGuiApplication, QPixmap, QDesktopServices, QShortcut, QKeySequence
 
 logger = logging.getLogger(__name__)
 from models.batch_model import BatchProjectModel
@@ -162,7 +162,31 @@ class BatchGenerateTabWidget(QWidget):
         self.btn_distribute_category.clicked.connect(self.distribute_category_presets_to_rows)
         cat_distribute_layout.addWidget(self.btn_distribute_category)
 
-        lbl_cat_hint = QLabel("💡 选择分类后点击「随机发放」，将按分类内预设顺序依次循环铺满所有单条任务")
+        self.btn_import_row_presets_table = QPushButton("📋 表格导入预设")
+        self.btn_import_row_presets_table.setToolTip(
+            "在表格（Excel / WPS / 飞书 / 谷歌表格）中按顺序排好一列「预设名称」并复制，\n"
+            "点击此按钮即可将预设名称作为 ID 自动匹配，并一键填充到下方每一条任务的「单独预设」与「提示词」中！"
+        )
+        self.btn_import_row_presets_table.setStyleSheet(
+            "QPushButton { background-color: #0288D1; color: white; padding: 5px 14px; font-size: 13px; font-weight: bold; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #0277BD; }"
+            "QPushButton:pressed { background-color: #01579B; }"
+        )
+        self.btn_import_row_presets_table.clicked.connect(lambda: self.import_row_presets_from_clipboard(start_row=0))
+        cat_distribute_layout.addWidget(self.btn_import_row_presets_table)
+
+        self.btn_copy_category_preset_names = QPushButton("📤 复制预设名")
+        self.btn_copy_category_preset_names.setToolTip(
+            "复制当前所选分类下的所有预设名称到剪贴板（每行一个），方便直接粘贴到表格中进行排序编排"
+        )
+        self.btn_copy_category_preset_names.setStyleSheet(
+            "QPushButton { background-color: #8D6E63; color: white; padding: 5px 10px; font-size: 12px; font-weight: bold; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #6D4C41; }"
+        )
+        self.btn_copy_category_preset_names.clicked.connect(self.copy_category_preset_names_to_clipboard)
+        cat_distribute_layout.addWidget(self.btn_copy_category_preset_names)
+
+        lbl_cat_hint = QLabel("💡 支持按分类「随机发放」，或在表格中排好预设名后复制并点击「📋 表格导入预设」（也支持在表格中右键粘贴）")
         lbl_cat_hint.setStyleSheet("color: #8D6E63; font-size: 12px; font-weight: normal;")
         cat_distribute_layout.addWidget(lbl_cat_hint)
         cat_distribute_layout.addStretch()
@@ -202,6 +226,11 @@ class BatchGenerateTabWidget(QWidget):
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self.table.cellDoubleClicked.connect(self.on_table_cell_double_clicked)
         self.table.itemChanged.connect(self.on_table_item_changed)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.on_table_context_menu)
+        self._paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self.table)
+        self._paste_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        self._paste_shortcut.activated.connect(self._on_table_paste_shortcut)
         right_layout.addWidget(self.table)
         
         splitter.addWidget(left_panel)
@@ -218,13 +247,53 @@ class BatchGenerateTabWidget(QWidget):
         return []
 
     def _get_template_content_by_id(self, tpl_id: str) -> str:
-        """Look up batch template content by template ID."""
+        """Look up batch template content by template ID or preset name."""
         if not tpl_id:
             return ""
-        for t in self._get_batch_templates_list():
-            if t.get("id") == tpl_id:
-                return t.get("content", "")
+        tpl = self._find_batch_template(tpl_id)
+        if tpl:
+            return tpl.get("content", "")
         return ""
+
+    def _find_batch_template(self, identifier: str):
+        """
+        Look up a batch template using preset Name as ID (or internal ID).
+        Supports:
+        1. Exact match on preset name (e.g. '男声1')
+        2. Exact match on internal id (e.g. 'bt-xxxx')
+        3. Case-insensitive match on preset name
+        4. Match after stripping category prefix like '【分类】名称', '[分类] 名称', '📌 [分类] 名称'
+        """
+        import re
+        key = (identifier or "").strip()
+        if not key:
+            return None
+        batch_templates = self._get_batch_templates_list()
+        if not batch_templates:
+            return None
+
+        # 1. Exact match on name
+        for t in batch_templates:
+            if (t.get("name") or "").strip() == key:
+                return t
+        # 2. Exact match on id
+        for t in batch_templates:
+            if (t.get("id") or "").strip() == key:
+                return t
+        # 3. Case-insensitive match on name
+        key_lower = key.lower()
+        for t in batch_templates:
+            if (t.get("name") or "").strip().lower() == key_lower:
+                return t
+        # 4. Strip optional category badge prefix e.g. "📌 [分类] 名称" or "【分类】名称"
+        stripped_key = re.sub(r'^(?:📌\s*)?(?:[\[【][^\]】]*[\]】]\s*)?', '', key).strip()
+        if stripped_key and stripped_key != key:
+            stripped_lower = stripped_key.lower()
+            for t in batch_templates:
+                t_name = (t.get("name") or "").strip()
+                if t_name == stripped_key or t_name.lower() == stripped_lower:
+                    return t
+        return None
 
     def refresh_project_list(self):
         self.list_projects.clear()
@@ -455,6 +524,267 @@ class BatchGenerateTabWidget(QWidget):
             f"🎲 已按分类【{cat_display}】（共 {pool_len} 个预设）依次循环发放，\n"
             f"已将全部 {len(images)} 条任务的「单独预设」与「提示词」自动铺满并保存！"
         )
+
+    def copy_category_preset_names_to_clipboard(self):
+        """Copy all preset names in the currently selected category to clipboard (one per line) for easy spreadsheet sorting."""
+        selected_cat = self.cb_category.currentData() if hasattr(self, "cb_category") else "__ALL__"
+        all_templates = self._get_batch_templates_list()
+        if selected_cat in ("__ALL__", None, ""):
+            pool = list(all_templates)
+            cat_display = "全部批量预设"
+        else:
+            pool = [t for t in all_templates if (t.get("category") or "").strip() == selected_cat]
+            cat_display = selected_cat
+
+        if not pool:
+            QMessageBox.warning(self, "无预设可复制", f"分类【{cat_display}】下暂无预设名称可复制。")
+            return
+
+        names = [(t.get("name") or "").strip() for t in pool if (t.get("name") or "").strip()]
+        QGuiApplication.clipboard().setText("\n".join(names))
+        QMessageBox.information(
+            self,
+            "复制成功",
+            f"📤 已将【{cat_display}】下的 {len(names)} 个预设名称复制到剪贴板（每行一个）！\n\n"
+            "您可以直接粘贴到表格（Excel / WPS / 飞书 / 谷歌表格）中自由排序，\n"
+            "排好后再复制该列并点击「📋 表格导入预设」即可一键匹配填充。"
+        )
+
+    def _parse_preset_names_from_clipboard(self) -> list:
+        """
+        Parse a column (or multi-column table) of preset names from clipboard.
+        Supports Excel / WPS / Feishu / Google Sheets HTML tables and TSV plain text.
+        Preserves empty cells in the middle of the column so row alignment stays 1-to-1.
+        """
+        import csv
+        import io
+        from bs4 import BeautifulSoup
+
+        clipboard = QGuiApplication.clipboard()
+        mime_data = clipboard.mimeData()
+        if not mime_data:
+            return []
+
+        raw_rows = []
+        # 1. Try TSV plain text first
+        if mime_data.hasText():
+            text = mime_data.text()
+            if text and text.strip():
+                cleaned = text.rstrip("\r\n")
+                try:
+                    reader = csv.reader(io.StringIO(cleaned), delimiter="\t")
+                    for cols in reader:
+                        raw_rows.append([c.strip() for c in cols] if cols else [""])
+                except Exception:
+                    raw_rows = [[line.strip()] for line in cleaned.splitlines()]
+
+        # 2. Fallback to HTML table if TSV was empty
+        if not raw_rows and mime_data.hasHtml():
+            html_text = mime_data.html()
+            if html_text and "<tr" in html_text.lower():
+                soup = BeautifulSoup(html_text, "html.parser")
+                for tr in soup.find_all("tr"):
+                    tds = tr.find_all(["td", "th"])
+                    if tds:
+                        raw_rows.append([td.get_text().strip() for td in tds])
+
+        if not raw_rows:
+            return []
+
+        # If multiple columns were copied (e.g. [序号/图片名 | 预设名称]), pick the column with the most preset matches
+        max_cols = max(len(r) for r in raw_rows)
+        best_col = 0
+        if max_cols > 1:
+            best_score = -1
+            for col_idx in range(max_cols):
+                score = 0
+                for r in raw_rows:
+                    val = r[col_idx].strip() if col_idx < len(r) else ""
+                    if val and self._find_batch_template(val) is not None:
+                        score += 1
+                if score > best_score:
+                    best_score = score
+                    best_col = col_idx
+
+        extracted = [(r[best_col].strip() if best_col < len(r) else "") for r in raw_rows]
+
+        # Auto-skip header row if the first cell is a generic column title and not a real preset name
+        header_keywords = {"预设", "单独预设", "预设名称", "预设名字", "模板", "模板名称", "批量模板", "preset", "template", "id"}
+        if extracted:
+            first_val = extracted[0].strip()
+            if first_val.lower() in header_keywords and self._find_batch_template(first_val) is None:
+                extracted = extracted[1:]
+
+        return extracted
+
+    def _apply_row_preset_in_ui(self, row: int, tpl_id: str, new_prompt: str):
+        """Update row's preset combobox and prompt cell in-place without rebuilding the whole table."""
+        if row < 0 or row >= self.table.rowCount():
+            return
+        self._is_rendering_table = True
+        try:
+            w_preset = self.table.cellWidget(row, 4)
+            if w_preset:
+                cb = w_preset.findChild(QComboBox)
+                if cb is not None:
+                    cb.blockSignals(True)
+                    found_idx = cb.findData(tpl_id) if tpl_id else 0
+                    if found_idx < 0 and tpl_id:
+                        matched = self._find_batch_template(tpl_id)
+                        if matched:
+                            found_idx = cb.findData(matched.get("id", ""))
+                    cb.setCurrentIndex(found_idx if found_idx >= 0 else 0)
+                    self._apply_row_combo_style(cb, bool(tpl_id and found_idx > 0))
+                    cb.blockSignals(False)
+
+            prompt_item = self.table.item(row, 5)
+            if prompt_item is not None:
+                prompt_item.setText(new_prompt)
+            else:
+                self.table.setItem(row, 5, QTableWidgetItem(new_prompt))
+        finally:
+            self._is_rendering_table = False
+
+    def import_row_presets_from_clipboard(self, start_row: int = 0):
+        """
+        Read a list of preset names from clipboard (copied from Excel / WPS / Feishu / Google Sheets),
+        match each preset by its Name (acting as its ID), and populate the '单独预设' and '提示词' columns.
+        """
+        if not self.current_project:
+            QMessageBox.warning(self, "提示", "请先在左侧选择或导入一个批量任务！")
+            return
+
+        images = self.current_project.get("images", [])
+        if not images:
+            QMessageBox.warning(self, "提示", "当前批量任务中没有图片条目。")
+            return
+
+        all_templates = self._get_batch_templates_list()
+        if not all_templates:
+            QMessageBox.warning(
+                self,
+                "尚无批量模板预设",
+                "当前还没有任何批量模板预设！\n\n请先点击顶部「⚙️ 模板配置」->「🚀 批量模板」添加或从表格导入预设。"
+            )
+            return
+
+        preset_names = self._parse_preset_names_from_clipboard()
+        if not preset_names or not any(p.strip() for p in preset_names):
+            QMessageBox.warning(
+                self,
+                "剪贴板无有效预设名称",
+                "未能从剪贴板读取到预设名称列表！\n\n"
+                "📌 使用方法：\n"
+                "1. 在表格（Excel / WPS / 飞书 / 谷歌表格）中按顺序排好一列「预设名称」\n"
+                "2. 复制该列单元格\n"
+                "3. 点击「📋 表格导入预设」（或在任务列表中右键粘贴），系统将以预设名称作为 ID 自动匹配对应的「单独预设」并填充提示词！"
+            )
+            return
+
+        if start_row < 0 or start_row >= len(images):
+            start_row = 0
+
+        global_tpl_id = self.cb_template.currentData() or self.current_project.get("template_id", "")
+        global_content = self._get_template_content_by_id(global_tpl_id)
+        follow_keywords = {"跟随整体", "跟随整体预设", "🔗 跟随整体预设", "默认", "无", "none", "default"}
+
+        matched_count = 0
+        follow_global_count = 0
+        unmatched_items = []
+
+        for offset, raw_name in enumerate(preset_names):
+            target_row = start_row + offset
+            if target_row >= len(images):
+                break
+
+            clean_name = (raw_name or "").strip()
+            if not clean_name or clean_name.lower() in follow_keywords:
+                images[target_row]["template_id"] = ""
+                images[target_row]["template_name"] = ""
+                images[target_row]["prompt"] = global_content
+                self._apply_row_preset_in_ui(target_row, "", global_content)
+                follow_global_count += 1
+                continue
+
+            matched_tpl = self._find_batch_template(clean_name)
+            if matched_tpl is not None:
+                tpl_id = matched_tpl.get("id", "")
+                tpl_content = matched_tpl.get("content", "")
+                images[target_row]["template_id"] = tpl_id
+                images[target_row]["template_name"] = matched_tpl.get("name", clean_name)
+                images[target_row]["prompt"] = tpl_content
+                self._apply_row_preset_in_ui(target_row, tpl_id, tpl_content)
+                matched_count += 1
+            else:
+                unmatched_items.append((target_row + 1, clean_name))
+
+        self.model.save_project(self.current_project)
+
+        msg_lines = [
+            f"✅ 表格预设导入处理完成（从第 {start_row + 1} 行开始）：",
+            f"• 成功匹配并设置单独预设：{matched_count} 条",
+        ]
+        if follow_global_count > 0:
+            msg_lines.append(f"• 空白/设为跟随整体预设：{follow_global_count} 条")
+        if len(preset_names) > (len(images) - start_row):
+            extra_cnt = len(preset_names) - (len(images) - start_row)
+            msg_lines.append(f"• 超出任务行数已自动忽略：{extra_cnt} 条")
+
+        if unmatched_items:
+            preview_unmatched = "\n".join(f"  - 第 {r} 行：「{n}」" for r, n in unmatched_items[:10])
+            if len(unmatched_items) > 10:
+                preview_unmatched += f"\n  ... 等共 {len(unmatched_items)} 条未匹配"
+            msg_lines.append(
+                f"\n⚠️ 以下 {len(unmatched_items)} 条名称在「🚀 批量模板」中未找到同名预设（该行已保持原状）：\n"
+                f"{preview_unmatched}\n\n"
+                f"请检查表格中的预设名称是否与「⚙️ 模板配置 -> 🚀 批量模板」中的名称一致。"
+            )
+            QMessageBox.warning(self, "表格预设导入结果（部分未匹配）", "\n".join(msg_lines))
+        else:
+            QMessageBox.information(self, "表格预设导入成功", "\n".join(msg_lines))
+
+    def _on_table_paste_shortcut(self):
+        """Handle Ctrl+V on the table to paste preset names starting from current row (when not editing Col 5)."""
+        if not self.current_project:
+            return
+        cur_row = max(0, self.table.currentRow())
+        self.import_row_presets_from_clipboard(start_row=cur_row)
+
+    def on_table_context_menu(self, pos):
+        """Right-click context menu on the batch table for quick preset pasting."""
+        if not self.current_project:
+            return
+        item = self.table.itemAt(pos)
+        clicked_row = item.row() if item else max(0, self.table.currentRow())
+
+        menu = QMenu(self)
+        act_paste_from_top = menu.addAction("📋 从表格粘贴「单独预设」列表 (从第 1 行开始)")
+        act_paste_from_cur = None
+        if clicked_row > 0:
+            act_paste_from_cur = menu.addAction(f"📋 从表格粘贴「单独预设」列表 (从第 {clicked_row + 1} 行开始)")
+        menu.addSeparator()
+        act_reset_cur = menu.addAction(f"🔗 将第 {clicked_row + 1} 行恢复为「跟随整体预设」")
+        act_reset_all = menu.addAction("🔄 将全部行恢复为「跟随整体预设」")
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_paste_from_top:
+            self.import_row_presets_from_clipboard(start_row=0)
+        elif act_paste_from_cur and chosen == act_paste_from_cur:
+            self.import_row_presets_from_clipboard(start_row=clicked_row)
+        elif chosen == act_reset_cur:
+            images = self.current_project.get("images", [])
+            if 0 <= clicked_row < len(images):
+                global_tpl_id = self.cb_template.currentData() or self.current_project.get("template_id", "")
+                global_content = self._get_template_content_by_id(global_tpl_id)
+                images[clicked_row]["template_id"] = ""
+                images[clicked_row]["template_name"] = ""
+                images[clicked_row]["prompt"] = global_content
+                self._apply_row_preset_in_ui(clicked_row, "", global_content)
+                self.model.save_project(self.current_project)
+        elif chosen == act_reset_all:
+            self.reset_all_row_templates_to_global()
 
     def on_row_template_changed(self, row: int, combo: QComboBox):
         """Handle changing a single row's individual template preset."""
@@ -904,6 +1234,12 @@ class BatchGenerateTabWidget(QWidget):
                     cb_row_tpl.addItem(t_label, t.get("id", ""))
 
                 found_idx = cb_row_tpl.findData(row_tpl_id) if row_tpl_id else 0
+                if found_idx < 0 and (row_tpl_id or img.get("template_name")):
+                    matched_t = self._find_batch_template(img.get("template_name") or row_tpl_id)
+                    if matched_t:
+                        row_tpl_id = matched_t.get("id", "")
+                        img["template_id"] = row_tpl_id
+                        found_idx = cb_row_tpl.findData(row_tpl_id)
                 if found_idx >= 0:
                     cb_row_tpl.setCurrentIndex(found_idx)
                 else:
