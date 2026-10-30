@@ -17,7 +17,7 @@ import logging
 from pathlib import Path
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
+                             QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
                              QAbstractItemView, QTextEdit, QGroupBox, QSplitter)
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
@@ -44,7 +44,27 @@ class HostedModeWidget(QWidget):
         self.upload_timeout = 60
         self.run_group_size = 5
         self.run_wait_seconds = 60
+        self.cruise_dwell_seconds = 1.0
+        self.cruise_interval_minutes = 5.0
         self._load_settings()
+
+        # 全局巡航状态
+        self.cruise_active = False
+        self.cruise_loop_mode = False
+        self.cruise_round = 0
+        self.cruise_queue = []
+        self.cruise_total_in_round = 0
+        self.cruise_current_idx = 0
+        self.cruise_waiting_next_round = False
+        self.cruise_next_round_deadline = 0
+
+        self.cruise_step_timer = QTimer(self)
+        self.cruise_step_timer.setSingleShot(True)
+        self.cruise_step_timer.timeout.connect(self._cruise_step)
+
+        self.cruise_wait_timer = QTimer(self)
+        self.cruise_wait_timer.setInterval(500)
+        self.cruise_wait_timer.timeout.connect(self._cruise_wait_tick)
 
         # 精准关闭管理
         self._pending_closes = {}
@@ -107,6 +127,8 @@ class HostedModeWidget(QWidget):
                 self.upload_timeout = int(d.get("upload_timeout", 60))
                 self.run_group_size = int(d.get("run_group_size", 5))
                 self.run_wait_seconds = int(d.get("run_wait_seconds", 60))
+                self.cruise_dwell_seconds = max(0.1, float(d.get("cruise_dwell_seconds", 1.0)))
+                self.cruise_interval_minutes = max(0.5, float(d.get("cruise_interval_minutes", 5.0)))
         except Exception as e:
             logger.warning(f"读取托管设置失败: {e}")
 
@@ -117,11 +139,17 @@ class HostedModeWidget(QWidget):
         self.upload_timeout = self.spin_timeout.value()
         self.run_group_size = self.spin_run_group.value()
         self.run_wait_seconds = self.spin_run_wait.value()
+        if hasattr(self, "spin_cruise_dwell"):
+            self.cruise_dwell_seconds = round(float(self.spin_cruise_dwell.value()), 2)
+        if hasattr(self, "spin_cruise_interval"):
+            self.cruise_interval_minutes = round(float(self.spin_cruise_interval.value()), 2)
         try:
             self.settings_file.write_text(json.dumps({
                 "threshold": self.threshold, "small_threshold": self.small_threshold,
                 "group_size": self.group_size, "upload_timeout": self.upload_timeout,
-                "run_group_size": self.run_group_size, "run_wait_seconds": self.run_wait_seconds},
+                "run_group_size": self.run_group_size, "run_wait_seconds": self.run_wait_seconds,
+                "cruise_dwell_seconds": self.cruise_dwell_seconds,
+                "cruise_interval_minutes": self.cruise_interval_minutes},
                 ensure_ascii=False, indent=2),
                 encoding="utf-8")
         except Exception as e:
@@ -139,6 +167,17 @@ class HostedModeWidget(QWidget):
     def _spin(self, lo, hi, val, suffix):
         s = QSpinBox()
         s.setRange(lo, hi)
+        s.setValue(val)
+        s.setSuffix(suffix)
+        s.setStyleSheet("padding: 3px; font-size: 13px;")
+        s.valueChanged.connect(lambda _: self._save_settings())
+        return s
+
+    def _dspin(self, lo, hi, step, decimals, val, suffix):
+        s = QDoubleSpinBox()
+        s.setDecimals(decimals)
+        s.setRange(lo, hi)
+        s.setSingleStep(step)
         s.setValue(val)
         s.setSuffix(suffix)
         s.setStyleSheet("padding: 3px; font-size: 13px;")
@@ -206,8 +245,8 @@ class HostedModeWidget(QWidget):
         l1.addLayout(r)
         root.addWidget(g1)
 
-        # 步骤 2 / 3
-        g2 = QGroupBox("步骤 2：分组上传图片    ·    步骤 3：按批次发送任务并开始生成")
+        # 步骤 2 / 3 / 全局巡航
+        g2 = QGroupBox("步骤 2：分组上传图片    ·    步骤 3：按批次发送任务并开始生成    ·    🧭 全局巡航（展开唤醒浏览器）")
         l2_root = QVBoxLayout(g2)
         l2_root.setSpacing(6)
 
@@ -259,6 +298,42 @@ class HostedModeWidget(QWidget):
         l3.addWidget(self.lbl_run_group_status)
         l3.addStretch()
         l2_root.addLayout(l3)
+
+        # 第三行：全局巡航（依次展开浏览器窗口到画面最上面，支持单次巡航与定时循环巡航）
+        l_cruise = QHBoxLayout()
+        lbl_cruise = QLabel("🧭 全局巡航（展开窗口）：")
+        lbl_cruise.setStyleSheet("font-weight: bold; color: #6D28D9;")
+        l_cruise.addWidget(lbl_cruise)
+        l_cruise.addWidget(QLabel("单浏览器停留："))
+        self.spin_cruise_dwell = self._dspin(0.1, 60.0, 0.1, 1, self.cruise_dwell_seconds, " 秒")
+        self.spin_cruise_dwell.setToolTip("依次将每个已连接浏览器展开到画面最上方后停留的秒数（支持小数如 0.3 秒、0.5 秒，默认 1.0 秒）")
+        l_cruise.addWidget(self.spin_cruise_dwell)
+        l_cruise.addWidget(QLabel("循环等待间隔："))
+        self.spin_cruise_interval = self._dspin(0.5, 180.0, 0.5, 1, self.cruise_interval_minutes, " 分钟")
+        self.spin_cruise_interval.setToolTip("在「循环巡航」模式下，将所有浏览器全部展开一遍后等待多久再进行下一轮巡航（默认 5.0 分钟）")
+        l_cruise.addWidget(self.spin_cruise_interval)
+
+        self.btn_cruise_once = self._btn("🧭 单次巡航", "#0284C7", "#0369A1")
+        self.btn_cruise_once.setToolTip("依次把每个已连接的浏览器窗口展开并切到画面最上方，全部巡航一遍后自动结束")
+        self.btn_cruise_once.clicked.connect(lambda: self.start_cruise(loop_mode=False))
+        l_cruise.addWidget(self.btn_cruise_once)
+
+        self.btn_cruise_loop = self._btn("🔁 开启循环巡航", "#7C3AED", "#6D28D9")
+        self.btn_cruise_loop.setToolTip("每隔设定的等待时间（如 5 分钟）自动将所有已连接的浏览器依次展开一遍，直到主动点击「停止巡航」为止")
+        self.btn_cruise_loop.clicked.connect(lambda: self.start_cruise(loop_mode=True))
+        l_cruise.addWidget(self.btn_cruise_loop)
+
+        self.btn_cruise_stop = self._btn("⏹ 停止巡航", "#DC2626", "#B91C1C")
+        self.btn_cruise_stop.setToolTip("立即停止正在进行的单次巡航或循环巡航")
+        self.btn_cruise_stop.clicked.connect(lambda: self.stop_cruise(finished_naturally=False))
+        self.btn_cruise_stop.setEnabled(False)
+        l_cruise.addWidget(self.btn_cruise_stop)
+
+        self.lbl_cruise_status = QLabel("")
+        self.lbl_cruise_status.setStyleSheet("color: #6D28D9; font-weight: bold; font-size: 12px; margin-left: 8px;")
+        l_cruise.addWidget(self.lbl_cruise_status)
+        l_cruise.addStretch()
+        l2_root.addLayout(l_cruise)
 
         root.addWidget(g2)
 
@@ -605,6 +680,166 @@ class HostedModeWidget(QWidget):
             it.setToolTip(str(tip))
         table.setItem(row, col, it)
 
+    # ──────────────────────────────── 全局巡航（单次巡航 / 循环巡航）
+    def _get_cruise_target_clients(self):
+        """获取需要巡航展开的浏览器列表（排除同一浏览器的第 2+ 个重复标签页）。"""
+        clients = self._clients()
+        primary = [c for c in clients if not c.get("secondary_tab")]
+        return primary if primary else clients
+
+    def _update_cruise_buttons(self):
+        if not hasattr(self, "btn_cruise_once"):
+            return
+        self.btn_cruise_once.setEnabled(not self.cruise_active)
+        self.btn_cruise_loop.setEnabled(not self.cruise_active)
+        self.btn_cruise_stop.setEnabled(self.cruise_active)
+        if self.cruise_active and self.cruise_loop_mode:
+            self.btn_cruise_loop.setText("🔁 循环巡航运行中...")
+        else:
+            self.btn_cruise_loop.setText("🔁 开启循环巡航")
+
+    def start_cruise(self, loop_mode=False):
+        """启动单次巡航或循环巡航：依次将每个已连接浏览器窗口展开并切到画面最上面。"""
+        if self.cruise_active:
+            self.stop_cruise(finished_naturally=False)
+
+        if not self._is_recognizing():
+            if not self.start_recognition():
+                return
+
+        targets = self._get_cruise_target_clients()
+        if not targets:
+            QMessageBox.information(
+                self,
+                "提示",
+                "当前没有已连接的浏览器。\n\n请确认已打开 Google Flow 页面，且上方「开始识别浏览器」已开启（开启后约 5~10 秒自动连接）。"
+            )
+            return
+
+        self.cruise_active = True
+        self.cruise_loop_mode = bool(loop_mode)
+        self.cruise_round = 1
+        self.cruise_queue = list(targets)
+        self.cruise_total_in_round = len(self.cruise_queue)
+        self.cruise_current_idx = 0
+        self.cruise_waiting_next_round = False
+        self.cruise_next_round_deadline = 0
+        self._update_cruise_buttons()
+
+        dwell = self.spin_cruise_dwell.value()
+        if self.cruise_loop_mode:
+            interval_min = self.spin_cruise_interval.value()
+            self._log(
+                f"🔁 开启全局循环巡航：共 {self.cruise_total_in_round} 个浏览器，每个停留 {dwell:g} 秒，"
+                f"每轮结束后等待 {interval_min:g} 分钟自动进行下一轮（直至点击「⏹ 停止巡航」）"
+            )
+        else:
+            self._log(f"🧭 开始单次巡航：共 {self.cruise_total_in_round} 个浏览器，每个停留 {dwell:g} 秒...")
+
+        self._cruise_step()
+
+    def stop_cruise(self, finished_naturally=False):
+        """停止全局巡航（单次或循环）。"""
+        was_active = self.cruise_active
+        was_loop = self.cruise_loop_mode
+        self.cruise_active = False
+        self.cruise_loop_mode = False
+        self.cruise_queue = []
+        self.cruise_waiting_next_round = False
+        self.cruise_step_timer.stop()
+        self.cruise_wait_timer.stop()
+        self._update_cruise_buttons()
+        if not finished_naturally and was_active:
+            mode_str = "循环巡航" if was_loop else "单次巡航"
+            self.lbl_cruise_status.setText(f"⏹ 已停止{mode_str}")
+            self._log(f"⏹ 用户已手动停止{mode_str}")
+
+    def _cruise_step(self):
+        """展开当前轮队列中的下一个浏览器窗口，并在停留指定秒数后继续下一个。"""
+        if not self.cruise_active:
+            return
+
+        if not self.cruise_queue:
+            # 本轮所有浏览器已全部展开完毕
+            if not self.cruise_loop_mode:
+                total = self.cruise_total_in_round
+                self._log(f"✅ 单次巡航完成：已依次展开全部 {total} 个浏览器窗口！")
+                self.lbl_cruise_status.setText(f"✅ 单次巡航已完成（共展开 {total} 个浏览器）")
+                self.stop_cruise(finished_naturally=True)
+                return
+
+            # 循环巡航模式：进入轮次等待倒计时
+            wait_min = self.spin_cruise_interval.value()
+            wait_sec = max(5.0, wait_min * 60.0)
+            self.cruise_waiting_next_round = True
+            self.cruise_next_round_deadline = time.time() + wait_sec
+            self._log(
+                f"✅ 循环巡航第 {self.cruise_round} 轮完成（已展开 {self.cruise_total_in_round} 个浏览器），"
+                f"将等待 {wait_min:g} 分钟后自动开始第 {self.cruise_round + 1} 轮巡航..."
+            )
+            self._cruise_wait_tick()
+            if not self.cruise_wait_timer.isActive():
+                self.cruise_wait_timer.start()
+            return
+
+        c = self.cruise_queue.pop(0)
+        self.cruise_current_idx += 1
+        cid = c.get("client_id", "")
+        label = self._label(c)
+        dwell = max(0.1, float(self.spin_cruise_dwell.value()))
+
+        # 在浏览器表格中高亮当前正在巡航的浏览器行
+        cids = getattr(self, "_browser_row_cids", [])
+        if cid in cids:
+            row_idx = cids.index(cid)
+            self.tbl_browsers.selectRow(row_idx)
+
+        if self.plugin_server and cid:
+            self.plugin_server.cruise_activate_client(cid)
+
+        prefix = f"🔁 循环巡航(第{self.cruise_round}轮)" if self.cruise_loop_mode else "🧭 单次巡航"
+        self.lbl_cruise_status.setText(
+            f"{prefix}：[{self.cruise_current_idx}/{self.cruise_total_in_round}] 正在展开 {label}（停留 {dwell:g}s）"
+        )
+        self._log(f"{prefix} [{self.cruise_current_idx}/{self.cruise_total_in_round}] → 已展开浏览器：{label}")
+
+        self.cruise_step_timer.start(max(100, int(round(dwell * 1000))))
+
+    def _cruise_wait_tick(self):
+        """循环巡航轮次间的倒计时检查，倒计时结束自动开启下一轮。"""
+        if not self.cruise_active or not self.cruise_loop_mode or not self.cruise_waiting_next_round:
+            self.cruise_wait_timer.stop()
+            return
+
+        rem = int(round(self.cruise_next_round_deadline - time.time()))
+        if rem <= 0:
+            self.cruise_wait_timer.stop()
+            self.cruise_waiting_next_round = False
+            targets = self._get_cruise_target_clients()
+            if not targets:
+                # 若暂时无连接浏览器，再等 10 秒探测
+                self.lbl_cruise_status.setText("🔁 循环巡航：当前暂无已连接浏览器，10 秒后重试...")
+                self.cruise_waiting_next_round = True
+                self.cruise_next_round_deadline = time.time() + 10
+                self.cruise_wait_timer.start()
+                return
+
+            self.cruise_round += 1
+            self.cruise_queue = list(targets)
+            self.cruise_total_in_round = len(self.cruise_queue)
+            self.cruise_current_idx = 0
+            dwell = self.spin_cruise_dwell.value()
+            self._log(
+                f"🔁 循环巡航第 {self.cruise_round} 轮开始：共 {self.cruise_total_in_round} 个浏览器（每个停留 {dwell:g} 秒）..."
+            )
+            self._cruise_step()
+        else:
+            mins, secs = divmod(rem, 60)
+            time_str = f"{mins:02d}分{secs:02d}秒" if mins > 0 else f"{secs}秒"
+            self.lbl_cruise_status.setText(
+                f"🔁 循环巡航等待中（已完成 {self.cruise_round} 轮）：距下一轮巡航还有 {time_str}"
+            )
+
     # ──────────────────────────────── 定位浏览器 / 备注
     def _locate_cid(self, cid, fallback_entry=None):
         if not cid and not fallback_entry:
@@ -753,6 +988,8 @@ class HostedModeWidget(QWidget):
                                      "（浏览器里已开始的任务会继续执行）\n\n确定要停止识别吗？")
             if r != QMessageBox.StandardButton.Yes:
                 return
+        if self.cruise_active:
+            self.stop_cruise(finished_naturally=False)
         self.plugin_server.stop()
         self._log("⏹ 已停止识别：所有浏览器插件已断开并回到休眠状态（手动模式不受影响）。")
         self._update_recognize_btn()
@@ -1456,7 +1693,10 @@ class HostedModeWidget(QWidget):
                         t["mode"] = default_mode
                         t["_mode_overridden"] = False
 
-                    if seg.get("duration"):
+                    if cm:
+                        is_edge = (seg_idx == 0 or seg_idx == len(proj_model.spanish_segments) - 1)
+                        t["duration"] = cm.get_duration_for_length(len(text), is_edge=is_edge)
+                    elif seg.get("duration"):
                         t["duration"] = seg.get("duration")
                 else:
                     if not t.get("_mode_overridden"):

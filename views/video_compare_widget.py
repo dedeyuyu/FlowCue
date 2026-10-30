@@ -762,7 +762,8 @@ class VideoCompareWidget(QWidget):
         # Duration label
         duration_label = ""
         if self.config_manager:
-            duration_label = f" | 预期时长: {self.config_manager.get_duration_label(char_count)}"
+            is_edge = (index == 0 or index == len(segments) - 1)
+            duration_label = f" | 预期时长: {self.config_manager.get_duration_label(char_count, is_edge=is_edge)}"
         
         self.lbl_segment_info.setText(f"序号 {seq_num:02d} | {char_count} 字符{duration_label}")
         

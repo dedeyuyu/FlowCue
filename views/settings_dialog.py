@@ -201,6 +201,22 @@ class SettingsDialog(QDialog):
         btn_char_layout.addWidget(btn_del_char)
         btn_char_layout.addStretch()
         char_layout.addLayout(btn_char_layout)
+
+        edge_dur_layout = QHBoxLayout()
+        edge_dur_layout.setContentsMargins(0, 6, 0, 0)
+        edge_dur_layout.addWidget(QLabel("⏱️ 首尾分段扩余时间:"))
+        self.spin_edge_extra_duration = NoWheelSpinBox()
+        self.spin_edge_extra_duration.setRange(0, 10)
+        self.spin_edge_extra_duration.setSuffix(" 秒")
+        self.spin_edge_extra_duration.setFixedWidth(95)
+        self.spin_edge_extra_duration.setToolTip(
+            "每个项目的第 1 个分段和最后一个分段在原本时长基础上额外增加的秒数（例如原本 6 秒加 2 秒变为 8 秒；若原本已达最大 10 秒则不再增加；设为 0 表示不增加）"
+        )
+        edge_dur_layout.addWidget(self.spin_edge_extra_duration)
+        lbl_edge_dur_hint = QLabel("(* 每个任务的第1个分段与最后一个分段自动加此秒数，最高不超过10秒；已满10秒的不加)")
+        lbl_edge_dur_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
+        edge_dur_layout.addWidget(lbl_edge_dur_hint, stretch=1)
+        char_layout.addLayout(edge_dur_layout)
         
         main_layout.addWidget(group_char_dur)
         
@@ -572,6 +588,7 @@ class SettingsDialog(QDialog):
         self.spin_max_points.setValue(self.cm.max_batch_points)
         self.txt_marker.setText(getattr(self.cm, "forced_split_marker", "///"))
         self.spin_min_segment_chars.setValue(getattr(self.cm, "min_segment_chars", 0))
+        self.spin_edge_extra_duration.setValue(getattr(self.cm, "edge_extra_duration", 2))
         
         # Load char -> duration rules
         self.table_char_dur.setRowCount(0)
@@ -682,6 +699,7 @@ class SettingsDialog(QDialog):
         self.cm.max_batch_points = self.spin_max_points.value()
         self.cm.forced_split_marker = self.txt_marker.text().strip() or "///"
         self.cm.min_segment_chars = self.spin_min_segment_chars.value()
+        self.cm.edge_extra_duration = self.spin_edge_extra_duration.value()
         
         # Read char -> duration rules
         new_char_rules = []

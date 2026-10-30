@@ -26,7 +26,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
-  // 把本标签页所在窗口切到最前面并激活该标签页（桌面软件「定位浏览器」）
+  // 把本标签页所在窗口切到最前面并激活该标签页（桌面软件「定位浏览器」/「全局巡航」）
   if (message.action === "focusMyTab") {
     const tabId = sender.tab?.id;
     const windowId = sender.tab?.windowId;
@@ -34,11 +34,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         if (windowId != null) {
           const w = await chrome.windows.get(windowId);
-          const upd = { focused: true, drawAttention: true };
+          const upd = { focused: true, drawAttention: !message.silent };
           if (w && w.state === "minimized") upd.state = "normal";
           await chrome.windows.update(windowId, upd);
         }
-        if (tabId != null) await chrome.tabs.update(tabId, { active: true });
+        if (tabId != null) await chrome.tabs.update(tabId, { active: true, autoDiscardable: false });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
+      }
+    })();
+    return true;
+  }
+
+  // 防后台休眠保活：禁止浏览器丢弃标签页，若窗口处于最小化状态则自动恢复展开为普通窗口
+  if (message.action === "keepTabAwake") {
+    const tabId = sender.tab?.id;
+    const windowId = sender.tab?.windowId;
+    (async () => {
+      try {
+        if (windowId != null) {
+          const w = await chrome.windows.get(windowId);
+          if (w && w.state === "minimized") {
+            await chrome.windows.update(windowId, { state: "normal" });
+          }
+        }
+        if (tabId != null) {
+          await chrome.tabs.update(tabId, { active: true, autoDiscardable: false });
+        }
         sendResponse({ ok: true });
       } catch (e) {
         sendResponse({ ok: false, error: String(e?.message || e) });

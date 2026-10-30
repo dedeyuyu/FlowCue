@@ -9,6 +9,7 @@ class ConfigManager:
     
     DEFAULT_MAX_BATCH_POINTS = 50
     DEFAULT_MIN_SEGMENT_CHARS = 45  # Default 45 chars (0 means disabled)
+    DEFAULT_EDGE_EXTRA_DURATION = 2  # Default extra seconds for first & last segments (capped at max 10s)
     DEFAULT_CHAR_DURATION_RULES = [
         {"max_chars": 40, "duration": 4},
         {"max_chars": 90, "duration": 6},
@@ -104,6 +105,7 @@ class ConfigManager:
         self.base_path = ""
         self.max_batch_points = self.DEFAULT_MAX_BATCH_POINTS
         self.min_segment_chars = self.DEFAULT_MIN_SEGMENT_CHARS
+        self.edge_extra_duration = self.DEFAULT_EDGE_EXTRA_DURATION
         self.forced_split_marker = self.DEFAULT_FORCED_SPLIT_MARKER
         self.char_duration_rules = [dict(r) for r in self.DEFAULT_CHAR_DURATION_RULES]
         self.duration_points_rules = [dict(r) for r in self.DEFAULT_DURATION_POINTS_RULES]
@@ -164,6 +166,11 @@ class ConfigManager:
                     self.base_path = data.get("base_path", self.base_path)
                     self.max_batch_points = data.get("max_batch_points", self.DEFAULT_MAX_BATCH_POINTS)
                     self.min_segment_chars = data.get("min_segment_chars", self.DEFAULT_MIN_SEGMENT_CHARS)
+                    try:
+                        raw_edge_extra = data.get("edge_extra_duration", self.DEFAULT_EDGE_EXTRA_DURATION)
+                        self.edge_extra_duration = max(0, min(10, int(raw_edge_extra)))
+                    except (ValueError, TypeError):
+                        self.edge_extra_duration = self.DEFAULT_EDGE_EXTRA_DURATION
                     self.forced_split_marker = data.get("forced_split_marker", self.DEFAULT_FORCED_SPLIT_MARKER)
                     
                     char_rules = data.get("char_duration_rules")
@@ -264,6 +271,7 @@ class ConfigManager:
             "base_path": self.base_path or data.get("base_path", ""),
             "max_batch_points": self.max_batch_points,
             "min_segment_chars": self.min_segment_chars,
+            "edge_extra_duration": getattr(self, "edge_extra_duration", self.DEFAULT_EDGE_EXTRA_DURATION),
             "forced_split_marker": self.forced_split_marker,
             "char_duration_rules": self.char_duration_rules,
             "duration_points_rules": self.duration_points_rules,
@@ -292,6 +300,7 @@ class ConfigManager:
     def reset_to_defaults(self):
         self.max_batch_points = self.DEFAULT_MAX_BATCH_POINTS
         self.min_segment_chars = self.DEFAULT_MIN_SEGMENT_CHARS
+        self.edge_extra_duration = self.DEFAULT_EDGE_EXTRA_DURATION
         self.char_duration_rules = [dict(r) for r in self.DEFAULT_CHAR_DURATION_RULES]
         self.duration_points_rules = [dict(r) for r in self.DEFAULT_DURATION_POINTS_RULES]
         self.enable_end_frame = getattr(self, "DEFAULT_ENABLE_END_FRAME", False)
@@ -303,22 +312,32 @@ class ConfigManager:
         self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
         self.save()
 
-    def get_duration_for_length(self, length):
-        """Calculates duration in seconds for a given character length."""
+    def get_duration_for_length(self, length, is_edge=False):
+        """Calculates duration in seconds for a given character length.
+        When is_edge=True (first or last segment of a project), adds edge_extra_duration capped at 10s."""
         sorted_rules = sorted(self.char_duration_rules, key=lambda x: x["max_chars"])
+        base_dur = 10
+        matched = False
         for r in sorted_rules:
             if length <= r["max_chars"]:
-                return r["duration"]
-        if sorted_rules:
-            return sorted_rules[-1]["duration"]
-        return 10
+                base_dur = r["duration"]
+                matched = True
+                break
+        if not matched and sorted_rules:
+            base_dur = sorted_rules[-1]["duration"]
+        if is_edge:
+            extra = max(0, int(getattr(self, "edge_extra_duration", 0) or 0))
+            if extra > 0 and base_dur < 10:
+                return min(10, base_dur + extra)
+        return base_dur
 
-    def get_duration_label(self, length):
+    def get_duration_label(self, length, is_edge=False):
         """Calculates duration label (e.g. '4s', '6s', '超时 (>10s)') for a length."""
         sorted_rules = sorted(self.char_duration_rules, key=lambda x: x["max_chars"])
         for r in sorted_rules:
             if length <= r["max_chars"]:
-                return f"{r['duration']}s"
+                dur = self.get_duration_for_length(length, is_edge=is_edge)
+                return f"{dur}s"
         if sorted_rules:
             max_dur = sorted_rules[-1]["duration"]
             return f"超时 (>{max_dur}s)"
@@ -335,6 +354,12 @@ class ConfigManager:
         for r in self.duration_points_rules:
             if r["duration"] == duration:
                 return r["points"]
+        sorted_pts = sorted(self.duration_points_rules, key=lambda x: x["duration"])
+        for r in sorted_pts:
+            if duration <= r["duration"]:
+                return r["points"]
+        if sorted_pts:
+            return sorted_pts[-1]["points"]
         return 7
 
     def get_next_gladia_key(self):

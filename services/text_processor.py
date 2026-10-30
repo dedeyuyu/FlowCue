@@ -280,6 +280,12 @@ class TextProcessor:
             block_results = TextProcessor._segment_single_block(cleaned_block, max_limit, config_manager)
             results.extend(block_results)
             
+        if results and config_manager:
+            total_segs = len(results)
+            for idx, seg in enumerate(results):
+                is_edge = (idx == 0 or idx == total_segs - 1)
+                seg["duration"] = config_manager.get_duration_for_length(seg["length"], is_edge=is_edge)
+
         return results
 
     @staticmethod

@@ -66,7 +66,7 @@
   const ackedCallbacks = new Set();
   let isolatedBridgeReady = false;
   const NON_RETRYABLE_ACTIONS = new Set([
-    "nativeFileDrag", "nativeClick", "nativeHover", "download", "closeBrowser", "focusMyTab"
+    "nativeFileDrag", "nativeClick", "nativeHover", "download", "closeBrowser", "focusMyTab", "keepTabAwake"
   ]);
 
   function sendToExtension(action, data) {
@@ -6699,6 +6699,7 @@ ${presetAfter || ""}`.trim();
       try { localStorage.setItem("flowcue_ws_ep", String(endpointIdx % WS_ENDPOINTS.length)); } catch (_) {}
       preferredIdx = endpointIdx % WS_ENDPOINTS.length;
       startBadge();
+      sendToExtension("keepTabAwake", {}).catch(() => {});
       log(`✅ 已连接桌面软件 (${wsUrl})，全局托管功能已启用`);
     }
 
@@ -6715,14 +6716,20 @@ ${presetAfter || ""}`.trim();
 
       if (action === "ping") { send({ type: "pong" }); return; }
 
-      // ===== 定位浏览器：窗口切到最前 + 页面横幅 + 标题闪烁 =====
+      // ===== 定位浏览器 / 全局巡航：窗口切到最前 + 页面横幅 + 标题闪烁 =====
       if (action === "locate_browser") {
-        const secs = Math.max(3, Math.min(30, Number((msg.params || {}).seconds) || 10));
-        locateFlashUntil = Date.now() + secs * 1000;
-        applyTitleBadge();
-        showLocateBanner(secs);
-        const r = await sendToExtension("focusMyTab", {});
-        setTimeout(applyTitleBadge, secs * 1000 + 100);
+        const params = msg.params || {};
+        const isSilent = !!params.silent;
+        const secs = Math.max(1, Math.min(30, Number(params.seconds) || (isSilent ? 2 : 10)));
+        if (!isSilent) {
+          locateFlashUntil = Date.now() + secs * 1000;
+          applyTitleBadge();
+          showLocateBanner(secs);
+          setTimeout(applyTitleBadge, secs * 1000 + 100);
+        } else {
+          applyTitleBadge();
+        }
+        const r = await sendToExtension("focusMyTab", { silent: isSilent });
         send({ action: "locate_browser_response", request_id: msg.request_id, success: true, client_id: clientId,
                data: { focused: !!(r && r.ok), error: (r && r.error) || "" } });
         return;
@@ -6804,6 +6811,7 @@ ${presetAfter || ""}`.trim();
 
       // ===== 全局托管模式 =====
       if (action === "upload_images") {
+        try { await sendToExtension("keepTabAwake", {}); } catch (_) {}
         const p = msg.params || {};
         let data;
         if (isVidsPage()) {
@@ -6822,6 +6830,7 @@ ${presetAfter || ""}`.trim();
       }
 
       if (action === "run_tasks") {
+        try { await sendToExtension("keepTabAwake", {}); } catch (_) {}
         const p = msg.params || {};
         const batchId = p.batch_id || "";
         const reply = (ok, error, extra = {}) => send({ action: "run_tasks_response", request_id: msg.request_id, success: ok,

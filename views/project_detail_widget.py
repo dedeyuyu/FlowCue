@@ -763,11 +763,12 @@ class ProjectDetailWidget(QWidget):
             
             # Calculate length and duration dynamically
             length = len(text)
+            is_edge = (idx == 0 or idx == len(segments) - 1)
             
             # Determine duration label
             if self.config_manager:
-                duration_label = self.config_manager.get_duration_label(length)
-                duration_val = self.config_manager.get_duration_for_length(length)
+                duration_label = self.config_manager.get_duration_label(length, is_edge=is_edge)
+                duration_val = self.config_manager.get_duration_for_length(length, is_edge=is_edge)
             else:
                 if length <= 40:
                     duration_label = "4s"
@@ -882,10 +883,12 @@ class ProjectDetailWidget(QWidget):
         
         # Calculate length and duration
         length = len(new_text)
+        total_rows = self.table_segments.rowCount()
+        is_edge = (row == 0 or row == total_rows - 1)
         
         if self.config_manager:
-            duration_label = self.config_manager.get_duration_label(length)
-            duration_val = self.config_manager.get_duration_for_length(length)
+            duration_label = self.config_manager.get_duration_label(length, is_edge=is_edge)
+            duration_val = self.config_manager.get_duration_for_length(length, is_edge=is_edge)
         else:
             if length <= 40:
                 duration_label = "4s"
@@ -985,6 +988,33 @@ class ProjectDetailWidget(QWidget):
                 "end_image_name": "",
                 "mode": "VIDEO_FRAMES"
             })
+        self._refresh_all_row_durations()
+
+    def _refresh_all_row_durations(self):
+        """Recalculates durations for all rows so first & last segment extra duration stays accurate after add/delete."""
+        total_rows = self.table_segments.rowCount()
+        if total_rows <= 0:
+            return
+        self.table_segments.blockSignals(True)
+        for idx in range(total_rows):
+            text_item = self.table_segments.item(idx, 1)
+            text = text_item.text().strip() if text_item else ""
+            length = len(text)
+            is_edge = (idx == 0 or idx == total_rows - 1)
+            if self.config_manager:
+                duration_label = self.config_manager.get_duration_label(length, is_edge=is_edge)
+                duration_val = self.config_manager.get_duration_for_length(length, is_edge=is_edge)
+            else:
+                duration_val = 4 if length <= 40 else (6 if length <= 90 else (8 if length <= 130 else 10))
+                duration_label = f"{duration_val}s" if length <= 170 else "超时 (>10s)"
+            dur_item = QTableWidgetItem(duration_label)
+            dur_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            if "超时" in duration_label:
+                dur_item.setForeground(Qt.GlobalColor.red)
+            self.table_segments.setItem(idx, 3, dur_item)
+            if self.project_model and idx < len(self.project_model.spanish_segments):
+                self.project_model.spanish_segments[idx]["duration"] = duration_val
+        self.table_segments.blockSignals(False)
 
 
 
@@ -1144,6 +1174,7 @@ class ProjectDetailWidget(QWidget):
         for idx in range(self.table_segments.rowCount()):
             self.refresh_table_row_index_label(idx)
         self.table_segments.blockSignals(False)
+        self._refresh_all_row_durations()
 
     def run_segmentation(self):
         """Cleans and segments the Spanish text."""
@@ -2646,7 +2677,12 @@ class ProjectDetailWidget(QWidget):
                 mode = seg.get("mode")
             else:
                 mode = default_mode
-            duration = seg.get("duration", 6)
+            is_edge = (idx == 0 or idx == len(segments) - 1)
+            if self.config_manager:
+                duration = self.config_manager.get_duration_for_length(len(text), is_edge=is_edge)
+                seg["duration"] = duration
+            else:
+                duration = seg.get("duration", 6)
             
             local_image_path = ""
             if image_name:
@@ -3142,7 +3178,12 @@ class ProjectDetailWidget(QWidget):
                 mode = seg.get("mode")
             else:
                 mode = default_mode
-            duration = seg.get("duration", 6)
+            is_edge = (idx == 0 or idx == len(segments) - 1)
+            if self.config_manager:
+                duration = self.config_manager.get_duration_for_length(len(text), is_edge=is_edge)
+                seg["duration"] = duration
+            else:
+                duration = seg.get("duration", 6)
                 
             videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
             download_name = f"{idx+1:02d}.mp4"

@@ -527,6 +527,33 @@ class PluginServer(QObject):
                 return info
         return None
 
+    def _focus_client_os_window(self, info, flash=True):
+        """Finds the OS window for a connected browser client and brings it to the top of the screen."""
+        try:
+            from services import browser_closer as bc
+            pid = info.get("browser_pid")
+            iid = info.get("instance_id") or ""
+            target = None
+            if iid:
+                # 标题里带有 [FC-XXXXX] 徽标的窗口 = 精确目标（插件已先把 Flow 标签页切为当前标签）
+                tagged = bc.find_windows_by_title_token(f"[{iid}")
+                if tagged:
+                    target = tagged[0]
+            if target is None and pid:
+                wins = bc.find_windows_by_pid(pid)
+                if len(wins) == 1:
+                    target = wins[0]
+            if target is None and info.get("email"):
+                hwnds, _, _ = bc.find_windows_for_email(info.get("email"))
+                if hwnds:
+                    target = hwnds[0]
+            if target is not None:
+                bc.bring_window_to_front(target, flash=flash)
+                return True
+        except Exception as e:
+            logger.warning(f"定位浏览器窗口失败: {e}")
+        return False
+
     def locate_client(self, client_id, seconds=10):
         """
         定位浏览器：
@@ -539,31 +566,26 @@ class PluginServer(QObject):
             return False, "浏览器未连接"
         self.send_rpc_action(client_id, "locate_browser", {"seconds": seconds})
 
-        def os_focus():
-            try:
-                from services import browser_closer as bc
-                pid = info.get("browser_pid")
-                iid = info.get("instance_id") or ""
-                target = None
-                if iid:
-                    # 标题里带有 [FC-XXXXX] 徽标的窗口 = 精确目标（插件已先把 Flow 标签页切为当前标签）
-                    tagged = bc.find_windows_by_title_token(f"[{iid}")
-                    if tagged:
-                        target = tagged[0]
-                if target is None and pid:
-                    # 多个配置共用一个浏览器进程时无法区分窗口，只在该进程只有 1 个窗口时才用 PID 兜底
-                    wins = bc.find_windows_by_pid(pid)
-                    if len(wins) == 1:
-                        target = wins[0]
-                if target is not None:
-                    bc.bring_window_to_front(target)
-            except Exception as e:
-                logger.warning(f"定位浏览器窗口失败: {e}")
-
         from PyQt6.QtCore import QTimer
-        QTimer.singleShot(700, os_focus)
+        QTimer.singleShot(700, lambda: self._focus_client_os_window(info, flash=True))
         prof = info.get("profile") or ""
         return True, f"已发送定位指令{('（' + prof + '）') if prof else ''}，该浏览器窗口会切到最前并显示红色横幅"
+
+    def cruise_activate_client(self, client_id):
+        """
+        全局巡航唤醒单个浏览器：
+        1) 插件端静默激活该标签页并将窗口恢复为展开状态（不弹红横幅）
+        2) 系统端立即 + 80ms 双重强制将该浏览器窗口展开并切到画面最上面
+        返回 (ok, message)
+        """
+        info = self.get_client(client_id)
+        if not info:
+            return False, "浏览器未连接"
+        self.send_rpc_action(client_id, "locate_browser", {"seconds": 2, "silent": True})
+        self._focus_client_os_window(info, flash=False)
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(80, lambda: self._focus_client_os_window(info, flash=False))
+        return True, "已展开并置顶"
 
     def set_instance_name(self, client_id, name):
         info = self.get_client(client_id)

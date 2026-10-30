@@ -381,23 +381,27 @@ def find_windows_by_pid(pid):
     return out
 
 
-def bring_window_to_front(hwnd):
+def bring_window_to_front(hwnd, flash=True):
     """Restore + bring a window to the foreground (works around Windows focus-stealing protection)."""
     try:
         SW_RESTORE = 9
+        SW_SHOW = 5
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, SW_RESTORE)
+        else:
+            user32.ShowWindow(hwnd, SW_SHOW)
         # 按一下 Alt 键可解除前台锁定，使 SetForegroundWindow 生效
         user32.keybd_event(0x12, 0, 0, 0)
         user32.keybd_event(0x12, 0, 2, 0)
         user32.SetForegroundWindow(hwnd)
         user32.BringWindowToTop(hwnd)
 
-        class FLASHWINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wt.UINT), ("hwnd", wt.HWND), ("dwFlags", wt.DWORD),
-                        ("uCount", wt.UINT), ("dwTimeout", wt.DWORD)]
-        fi = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 3 | 0x0C, 6, 0)  # FLASHW_ALL | FLASHW_TIMERNOFG
-        user32.FlashWindowEx(ctypes.byref(fi))
+        if flash:
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wt.UINT), ("hwnd", wt.HWND), ("dwFlags", wt.DWORD),
+                            ("uCount", wt.UINT), ("dwTimeout", wt.DWORD)]
+            fi = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 3 | 0x0C, 6, 0)  # FLASHW_ALL | FLASHW_TIMERNOFG
+            user32.FlashWindowEx(ctypes.byref(fi))
         return True
     except Exception as e:
         logger.warning(f"置顶窗口失败: {e}")

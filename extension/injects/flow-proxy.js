@@ -24,6 +24,109 @@
     }
   }
 
+  // ----------------------------------------------------
+  // 0.5 强制前台可见性伪装与 requestAnimationFrame 后台防冻结驱动引擎
+  //     解决浏览器窗口未展开、最小化或被遮挡时 React/Flow 停止渲染与不执行任务的问题
+  // ----------------------------------------------------
+  try {
+    const defineProp = (target, prop, getter) => {
+      try {
+        Object.defineProperty(target, prop, {
+          configurable: true,
+          enumerable: true,
+          get: getter
+        });
+      } catch (_) {}
+    };
+    if (typeof Document !== "undefined" && Document.prototype) {
+      defineProp(Document.prototype, "hidden", () => false);
+      defineProp(Document.prototype, "webkitHidden", () => false);
+      defineProp(Document.prototype, "mozHidden", () => false);
+      defineProp(Document.prototype, "msHidden", () => false);
+      defineProp(Document.prototype, "visibilityState", () => "visible");
+      defineProp(Document.prototype, "webkitVisibilityState", () => "visible");
+      Document.prototype.hasFocus = function() { return true; };
+    }
+    if (typeof document !== "undefined") {
+      defineProp(document, "hidden", () => false);
+      defineProp(document, "webkitHidden", () => false);
+      defineProp(document, "visibilityState", () => "visible");
+      document.hasFocus = () => true;
+    }
+
+    const BLOCKED_BG_EVENTS = new Set(["visibilitychange", "webkitvisibilitychange", "mozvisibilitychange", "freeze", "pagehide"]);
+    const wrapAddEventListener = (proto) => {
+      if (!proto || !proto.addEventListener) return;
+      const origAdd = proto.addEventListener;
+      proto.addEventListener = function(type, listener, options) {
+        if (typeof type === "string" && BLOCKED_BG_EVENTS.has(type.toLowerCase())) {
+          return;
+        }
+        return origAdd.call(this, type, listener, options);
+      };
+    };
+    wrapAddEventListener(typeof Document !== "undefined" ? Document.prototype : null);
+    wrapAddEventListener(typeof Window !== "undefined" ? Window.prototype : null);
+
+    // 后台 requestAnimationFrame 强行驱动器：当窗口未展开/被遮挡导致原生 rAF 停摆（>45ms 未响应）时自动用定时器兜底触发
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      const origRAF = window.requestAnimationFrame.bind(window);
+      const origCAF = typeof window.cancelAnimationFrame === "function" ? window.cancelAnimationFrame.bind(window) : null;
+      let syntheticIdSeq = 1000000;
+      const pendingFrames = new Map();
+
+      window.requestAnimationFrame = function(callback) {
+        if (typeof callback !== "function") return origRAF(callback);
+        const frameId = ++syntheticIdSeq;
+        let executed = false;
+        const entry = { nativeId: null, timerId: null };
+        pendingFrames.set(frameId, entry);
+
+        const runOnce = (ts) => {
+          if (executed || !pendingFrames.has(frameId)) return;
+          executed = true;
+          pendingFrames.delete(frameId);
+          if (entry.timerId !== null) clearTimeout(entry.timerId);
+          if (entry.nativeId !== null && origCAF) {
+            try { origCAF(entry.nativeId); } catch (_) {}
+          }
+          try {
+            callback(typeof ts === "number" ? ts : performance.now());
+          } catch (err) {
+            setTimeout(() => { throw err; }, 0);
+          }
+        };
+
+        try {
+          entry.nativeId = origRAF((ts) => runOnce(ts));
+        } catch (_) {}
+
+        entry.timerId = setTimeout(() => {
+          const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+          runOnce(now);
+        }, 45);
+
+        return frameId;
+      };
+
+      window.cancelAnimationFrame = function(id) {
+        const entry = pendingFrames.get(id);
+        if (entry) {
+          pendingFrames.delete(id);
+          if (entry.timerId !== null) clearTimeout(entry.timerId);
+          if (entry.nativeId !== null && origCAF) {
+            try { origCAF(entry.nativeId); } catch (_) {}
+          }
+          return;
+        }
+        if (origCAF) return origCAF(id);
+      };
+    }
+    console.log("[FlowProxy] ⚡ 已启用前台可见性锁定与后台 rAF 强行运行引擎！");
+  } catch (e) {
+    console.warn("[FlowProxy] 初始化防休眠引擎提示:", e);
+  }
+
   // Google Vids (docs.google.com) 使用 DOM 级自动化且包含 Object.prototype SEAL 检测，无需注入 Flow 专属的网络/原型钩子
   if (location.hostname === "docs.google.com") {
     console.log("[FlowProxy] 检测到 Google Vids 页面，跳过 Flow 专属原型钩子，交由 ui.js Vids 引擎接管。");
