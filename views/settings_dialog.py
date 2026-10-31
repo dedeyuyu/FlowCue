@@ -373,14 +373,14 @@ class SettingsDialog(QDialog):
         
         row2_layout.addSpacing(20)
         
-        row2_layout.addWidget(QLabel("📐 批量生成尺寸比例:"))
+        # 批量生成尺寸已改为在「🚀 批量生成」中按每个任务单独设置；此处仅保留隐藏控件以兼容旧配置
         self.combo_batch_default_aspect = NoWheelComboBox()
-        self.combo_batch_default_aspect.setStyleSheet(combo_style)
-        self.combo_batch_default_aspect.setFixedWidth(135)
-        self.combo_batch_default_aspect.setToolTip("用于「🚀 批量生成」导出及一键多开分配生成的画面尺寸比例")
+        self.combo_batch_default_aspect.setVisible(False)
         for aspect_code, aspect_label in ConfigManager.SUPPORTED_ASPECT_RATIOS:
             self.combo_batch_default_aspect.addItem(aspect_label, aspect_code)
-        row2_layout.addWidget(self.combo_batch_default_aspect)
+        lbl_batch_aspect_hint = QLabel("💡 批量生成的尺寸请在「🚀 批量生成」中为每个任务单独设置")
+        lbl_batch_aspect_hint.setStyleSheet("color: #8D6E63; font-size: 12px; font-weight: normal;")
+        row2_layout.addWidget(lbl_batch_aspect_hint)
         row2_layout.addStretch()
         gen_rules_layout.addLayout(row2_layout)
 

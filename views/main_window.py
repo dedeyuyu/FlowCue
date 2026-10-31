@@ -461,36 +461,74 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.CheckState.Checked)
             item.setData(Qt.ItemDataRole.UserRole, p['path'])
             item.setData(Qt.ItemDataRole.UserRole + 1, p)
-            
-            try:
-                proj_model = ProjectModel(p['path'])
-                report = VideoChecker.check_project_videos(proj_model, p['path'], base_storage_path=base_path)
-                
-                missing = report.get("missing_count", 0)
-                pending = report.get("pending_count", 0)
-                already = report.get("already_count", 0)
-                rate = report.get("completion_rate", 0.0)
-                
-                # 规则：
-                # 1. 缺少视频就显示红色
-                # 2. 成功归位并且没有缺少视频就显示黄色
-                # 3. 没有归位就显示默认颜色
-                if missing > 0:
-                    item.setForeground(QColor("#F87171" if is_dark else "#DC2626"))  # 红色
-                    item.setToolTip(f"❌ 缺失 {missing} 个视频片段")
-                elif rate >= 100.0 and pending == 0 and already > 0:
-                    item.setForeground(QColor("#FBBF24" if is_dark else "#D97706"))  # 黄色
-                    item.setToolTip("✅ 视频已全部归位且无缺失")
-                elif pending > 0:
-                    item.setForeground(default_fg)  # 默认色
-                    item.setToolTip(f"⚠️ 包含 {pending} 个未归位视频")
-                else:
-                    item.setForeground(default_fg)  # 默认色
-            except Exception as e:
-                print(f"Error checking project status for item {p['id']}: {e}")
-                item.setForeground(default_fg)
-                
+            item.setForeground(default_fg)
             self.list_projects.addItem(item)
+
+        # 视频完整度（红 / 黄 / 默认色）需要扫描磁盘上的视频文件夹，项目多时很慢：
+        # 改为后台线程逐个计算，算好一个就给对应项目上色，列表本身立即显示、界面不卡。
+        self._start_project_status_scan(projects, base_path)
+
+    def _start_project_status_scan(self, projects, base_path):
+        from PyQt6.QtCore import QThread, pyqtSignal
+
+        class _StatusThread(QThread):
+            status_signal = pyqtSignal(int, str, dict)
+
+            def __init__(self, gen, items, base, parent=None):
+                super().__init__(parent)
+                self.gen, self.items, self.base = gen, items, base
+
+            def run(self):
+                from models.project_model import ProjectModel
+                from services.video_checker import VideoChecker
+                for path in self.items:
+                    if self.isInterruptionRequested():
+                        return
+                    try:
+                        report = VideoChecker.check_project_videos(ProjectModel(path), path, base_storage_path=self.base)
+                        self.status_signal.emit(self.gen, str(path), {
+                            "missing": report.get("missing_count", 0), "pending": report.get("pending_count", 0),
+                            "already": report.get("already_count", 0), "rate": report.get("completion_rate", 0.0)})
+                    except Exception as e:
+                        print(f"Error checking project status for {path}: {e}")
+
+        self._status_gen = getattr(self, "_status_gen", 0) + 1
+        old = getattr(self, "_status_thread", None)
+        if old is not None and old.isRunning():
+            old.requestInterruption()
+        th = _StatusThread(self._status_gen, [p['path'] for p in projects], base_path, self)
+        th.status_signal.connect(self._apply_project_status)
+        th.finished.connect(th.deleteLater)
+        self._status_thread = th
+        th.start()
+
+    def _apply_project_status(self, gen, path, st):
+        if gen != getattr(self, "_status_gen", 0):
+            return
+        from services.theme_manager import ThemeManager
+        default_fg = ThemeManager.get_default_item_fg()
+        is_dark = ThemeManager.is_dark()
+        for i in range(self.list_projects.count()):
+            item = self.list_projects.item(i)
+            if str(item.data(Qt.ItemDataRole.UserRole)) != path:
+                continue
+            missing, pending, already, rate = st["missing"], st["pending"], st["already"], st["rate"]
+            # 规则：
+            # 1. 缺少视频就显示红色
+            # 2. 成功归位并且没有缺少视频就显示黄色
+            # 3. 没有归位就显示默认颜色
+            if missing > 0:
+                item.setForeground(QColor("#F87171" if is_dark else "#DC2626"))  # 红色
+                item.setToolTip(f"❌ 缺失 {missing} 个视频片段")
+            elif rate >= 100.0 and pending == 0 and already > 0:
+                item.setForeground(QColor("#FBBF24" if is_dark else "#D97706"))  # 黄色
+                item.setToolTip("✅ 视频已全部归位且无缺失")
+            elif pending > 0:
+                item.setForeground(default_fg)  # 默认色
+                item.setToolTip(f"⚠️ 包含 {pending} 个未归位视频")
+            else:
+                item.setForeground(default_fg)  # 默认色
+            break
 
     def _update_theme_toggle_btn(self):
         """Updates the top bar theme toggle button appearance."""
@@ -980,6 +1018,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up background tasks, plugin server, and media players before quitting."""
+        # 停止后台扫描 / 拆批线程，避免退出时线程仍在运行
+        for th in (getattr(self, "_status_thread", None),
+                   getattr(getattr(self, "hosted_mode", None), "_planner_thread", None)):
+            try:
+                if th is not None and th.isRunning():
+                    th.requestInterruption()
+                    th.wait(3000)
+            except Exception:
+                pass
         if hasattr(self, "plugin_server") and self.plugin_server:
             try:
                 self.plugin_server.stop()

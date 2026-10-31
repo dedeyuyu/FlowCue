@@ -6,9 +6,9 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QComboBox, QSpinBox, QFileDialog, QMessageBox,
-                             QSplitter, QListWidget, QFrame, QInputDialog, QDialog, QMenu)
+                             QSplitter, QListWidget, QFrame, QInputDialog, QDialog, QMenu, QToolTip)
 from PyQt6.QtCore import Qt, pyqtSlot, QUrl
-from PyQt6.QtGui import QGuiApplication, QPixmap, QDesktopServices, QShortcut, QKeySequence
+from PyQt6.QtGui import QGuiApplication, QPixmap, QDesktopServices, QShortcut, QKeySequence, QCursor
 
 logger = logging.getLogger(__name__)
 from models.batch_model import BatchProjectModel
@@ -129,6 +129,21 @@ class BatchGenerateTabWidget(QWidget):
         self.cb_duration.setCurrentText("8秒")
         self.cb_duration.currentIndexChanged.connect(self.on_duration_changed)
         config_layout.addWidget(self.cb_duration)
+
+        config_layout.addWidget(QLabel("画面尺寸:"))
+        self.cb_aspect = NoWheelComboBox()
+        self.cb_aspect.setToolTip("每个批量任务单独设置画面尺寸比例（不再跟随规则设置），导出 JSON / 一键多开分配时使用此尺寸")
+        try:
+            from models.config_manager import ConfigManager
+            _aspects = list(getattr(ConfigManager, "SUPPORTED_ASPECT_RATIOS", []))
+        except Exception:
+            _aspects = []
+        if not _aspects:
+            _aspects = [("9:16", "9:16 (竖屏)"), ("16:9", "16:9 (横屏)")]
+        for a_code, a_label in _aspects:
+            self.cb_aspect.addItem(a_label, a_code)
+        self.cb_aspect.currentIndexChanged.connect(self.on_aspect_changed)
+        config_layout.addWidget(self.cb_aspect)
         
         config_layout.addWidget(QLabel("单批次生成积分上限:"))
         self.sb_points = NoWheelSpinBox()
@@ -235,6 +250,21 @@ class BatchGenerateTabWidget(QWidget):
         self._paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self.table)
         self._paste_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
         self._paste_shortcut.activated.connect(self._on_table_paste_shortcut)
+
+        # 轻量委托：缩略图按需加载、预设下拉框点击才创建、操作按钮直接绘制（不再每行创建多个控件）
+        from views.table_delegates import ThumbnailDelegate, ComboDelegate, TableButtonDelegate
+        self._thumb_delegate = ThumbnailDelegate(lambda p: self._get_thumbnail_pixmap(p, 102, 64), self.table)
+        self.table.setItemDelegateForColumn(1, self._thumb_delegate)
+        self._preset_delegate = ComboDelegate(self._row_preset_items, self._on_row_preset_committed, self.table,
+                                              combo_factory=lambda parent: NoWheelComboBox(parent))
+        self.table.setItemDelegateForColumn(4, self._preset_delegate)
+        self._action_delegate = TableButtonDelegate(["复制提示词", "复制路径", "导出JSON"], self.table,
+                                                    colors=["#E0A96D"] * 3, hover_colors=["#D2904C"] * 3)
+        self._action_delegate.clicked.connect(self._on_row_action_clicked)
+        self.table.setItemDelegateForColumn(6, self._action_delegate)
+        self.table.setMouseTracking(True)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(6, 250)
         right_layout.addWidget(self.table)
         
         splitter.addWidget(left_panel)
@@ -302,7 +332,10 @@ class BatchGenerateTabWidget(QWidget):
     def refresh_project_list(self):
         self.list_projects.clear()
         for p in self.model.projects:
-            self.list_projects.addItem(f"{p['name']} ({len(p['images'])}图)")
+            self.list_projects.addItem(self._project_list_label(p))
+
+    def _project_list_label(self, p):
+        return f"{p['name']} ({len(p['images'])}图 · {self._get_project_aspect(p)})"
             
     def refresh_template_list(self):
         prev_tpl_id = self.cb_template.currentData()
@@ -441,6 +474,10 @@ class BatchGenerateTabWidget(QWidget):
         
         self.cb_duration.setCurrentText(f"{self.current_project.get('duration', 8)}秒")
         self.sb_points.setValue(self.current_project.get('points_cost', 50))
+        self.cb_aspect.blockSignals(True)
+        a_idx = self.cb_aspect.findData(self._get_project_aspect())
+        self.cb_aspect.setCurrentIndex(a_idx if a_idx >= 0 else 0)
+        self.cb_aspect.blockSignals(False)
         
         tpl_id = self.current_project.get("template_id", "")
         idx = self.cb_template.findData(tpl_id)
@@ -540,6 +577,16 @@ class BatchGenerateTabWidget(QWidget):
         """Sync the paste starting row spinbox when user clicks a row in the table."""
         if hasattr(self, "sb_paste_start_row") and row >= 0:
             self.sb_paste_start_row.setValue(row + 1)
+        if row < 0 or not self.current_project:
+            return
+        if col == 4:
+            it = self.table.item(row, 4)
+            if it is not None:
+                self.table.editItem(it)
+        elif col == 1:
+            images = self.current_project.get("images", [])
+            if row < len(images):
+                self._show_large_image_preview(images[row].get("path", ""), row + 1)
 
     def _parse_prompts_from_clipboard(self) -> list:
         """
@@ -762,7 +809,58 @@ class BatchGenerateTabWidget(QWidget):
         elif chosen == act_reset_all:
             self.reset_all_row_templates_to_global()
 
-    def on_row_template_changed(self, row: int, combo: QComboBox):
+    def _find_batch_template_by_id(self, tpl_id):
+        for t in self._get_batch_templates_list():
+            if t.get("id") == tpl_id:
+                return t
+        return None
+
+    def _row_preset_items(self):
+        """Items for the per-row preset dropdown (built only when the user clicks the cell)."""
+        items = [("🔗 跟随整体预设", "")]
+        for t in self._get_batch_templates_list():
+            cat = (t.get("category") or "").strip()
+            label = f"📌 [{cat}] {t.get('name', '未命名')}" if cat else f"📌 {t.get('name', '未命名')}"
+            items.append((label, t.get("id", "")))
+        return items
+
+    def _set_preset_item(self, item, tpl):
+        """Show the preset name in the cell, highlighting rows with a custom preset."""
+        from PyQt6.QtGui import QColor, QFont
+        if tpl:
+            cat = (tpl.get("category") or "").strip()
+            item.setText((f"📌 [{cat}] {tpl.get('name', '未命名')}" if cat else f"📌 {tpl.get('name', '未命名')}") + " ▾")
+            item.setData(Qt.ItemDataRole.UserRole, tpl.get("id", ""))
+            item.setForeground(QColor("#E65100"))
+            f = QFont()
+            f.setBold(True)
+            item.setFont(f)
+        else:
+            item.setText("🔗 跟随整体预设 ▾")
+            item.setData(Qt.ItemDataRole.UserRole, "")
+            item.setData(Qt.ItemDataRole.ForegroundRole, None)
+            item.setFont(QFont())
+        item.setToolTip("单击选择该单条任务的独立描述词预设（默认跟随整体预设）")
+
+    def _on_row_preset_committed(self, row: int, tpl_id: str):
+        self.on_row_template_changed(row, tpl_id)
+
+    def _on_row_action_clicked(self, row: int, which: int):
+        if not self.current_project:
+            return
+        images = self.current_project.get("images", [])
+        if not (0 <= row < len(images)):
+            return
+        if which == 0:
+            QGuiApplication.clipboard().setText(images[row].get("prompt", ""))
+            QToolTip.showText(QCursor.pos(), "已复制提示词", self.table)
+        elif which == 1:
+            QGuiApplication.clipboard().setText(images[row].get("path", ""))
+            QToolTip.showText(QCursor.pos(), "已复制图片路径", self.table)
+        elif which == 2:
+            self.export_single_json(row)
+
+    def on_row_template_changed(self, row: int, row_tpl_id: str):
         """Handle changing a single row's individual template preset."""
         if self._is_rendering_table or not self.current_project:
             return
@@ -770,7 +868,7 @@ class BatchGenerateTabWidget(QWidget):
         if row < 0 or row >= len(images):
             return
 
-        row_tpl_id = combo.currentData() or ""
+        row_tpl_id = row_tpl_id or ""
         images[row]["template_id"] = row_tpl_id
         if row_tpl_id:
             new_prompt = self._get_template_content_by_id(row_tpl_id)
@@ -779,29 +877,22 @@ class BatchGenerateTabWidget(QWidget):
             new_prompt = self._get_template_content_by_id(global_tpl_id)
 
         images[row]["prompt"] = new_prompt
-        self._apply_row_combo_style(combo, bool(row_tpl_id))
 
-        # Update prompt cell in table without rebuilding all widgets
+        # Update cells in place without rebuilding the table
         self._is_rendering_table = True
-        prompt_item = self.table.item(row, 5)
-        if prompt_item:
-            prompt_item.setText(new_prompt)
-        else:
-            self.table.setItem(row, 5, QTableWidgetItem(new_prompt))
-        self._is_rendering_table = False
+        try:
+            preset_item = self.table.item(row, 4)
+            if preset_item is not None:
+                self._set_preset_item(preset_item, self._find_batch_template_by_id(row_tpl_id) if row_tpl_id else None)
+            prompt_item = self.table.item(row, 5)
+            if prompt_item:
+                prompt_item.setText(new_prompt)
+            else:
+                self.table.setItem(row, 5, QTableWidgetItem(new_prompt))
+        finally:
+            self._is_rendering_table = False
 
         self.model.save_project(self.current_project)
-
-    def _apply_row_combo_style(self, combo: QComboBox, has_custom: bool):
-        """Visually highlight rows that have a custom individual preset."""
-        if has_custom:
-            combo.setStyleSheet(
-                "QComboBox { combobox-popup: 0; background-color: #FFF3E0; color: #E65100; border: 1.5px solid #FFB74D; border-radius: 4px; padding: 3px 6px; font-weight: bold; font-size: 12px; }"
-            )
-        else:
-            combo.setStyleSheet(
-                "QComboBox { combobox-popup: 0; background-color: #FAFAFA; color: #5D4037; border: 1px solid #D7CCC8; border-radius: 4px; padding: 3px 6px; font-size: 12px; }"
-            )
 
     def on_table_item_changed(self, item: QTableWidgetItem):
         """Persist manual edits to the Prompt column (col 5) immediately."""
@@ -837,6 +928,25 @@ class BatchGenerateTabWidget(QWidget):
             self._is_rendering_table = False
         self.model.save_project(self.current_project)
 
+    def _get_project_aspect(self, project=None):
+        """Per-task aspect ratio; legacy tasks without one fall back to the old global batch setting, then 9:16."""
+        p = project if project is not None else self.current_project
+        val = (p or {}).get("aspect_ratio") if p else None
+        if val:
+            return val
+        cm = getattr(self.main_window, "config_manager", None) if self.main_window else None
+        return getattr(cm, "batch_default_aspect_ratio", None) or "9:16"
+
+    def on_aspect_changed(self):
+        if not self.current_project:
+            return
+        self.current_project["aspect_ratio"] = self.cb_aspect.currentData() or "9:16"
+        self.model.save_project(self.current_project)
+        row = self.list_projects.currentRow()
+        it = self.list_projects.item(row) if row >= 0 else None
+        if it is not None:
+            it.setText(self._project_list_label(self.current_project))
+
     def on_points_limit_changed(self, value: int):
         """Lightweight in-memory update when points spinbox value changes; zero table rebuild or disk I/O."""
         if not self.current_project:
@@ -858,16 +968,15 @@ class BatchGenerateTabWidget(QWidget):
         self.current_project["duration"] = new_dur
         self.current_project["points_cost"] = self.sb_points.value()
         self.current_project["template_id"] = self.cb_template.currentData() or ""
+        self.current_project["aspect_ratio"] = self.cb_aspect.currentData() or "9:16"
 
         images = self.current_project.get("images", [])
         for i, img in enumerate(images):
             img["duration"] = new_dur
             if i < self.table.rowCount():
-                w_preset = self.table.cellWidget(i, 4)
-                if w_preset:
-                    cb = w_preset.findChild(QComboBox)
-                    if cb is not None:
-                        img["template_id"] = cb.currentData() or ""
+                preset_item = self.table.item(i, 4)
+                if preset_item is not None:
+                    img["template_id"] = preset_item.data(Qt.ItemDataRole.UserRole) or ""
                 prompt_item = self.table.item(i, 5)
                 if prompt_item is not None:
                     img["prompt"] = prompt_item.text()
@@ -915,7 +1024,7 @@ class BatchGenerateTabWidget(QWidget):
             cm.load()
         default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
         default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
-        batch_aspect = getattr(cm, "batch_default_aspect_ratio", getattr(cm, "default_aspect_ratio", "9:16")) if cm else "9:16"
+        batch_aspect = self._get_project_aspect()
         task_interval = getattr(cm, "task_interval", 5) if cm else 5
         
         for idx, img in enumerate(images):
@@ -1126,13 +1235,23 @@ class BatchGenerateTabWidget(QWidget):
 
     def render_table(self):
         if not self.current_project: return
+        from views.table_delegates import bulk_table_update
+        with bulk_table_update(self.table):
+            self._render_table_impl()
+
+    def _render_table_impl(self):
+        if not self.current_project: return
         self._is_rendering_table = True
         try:
             images = self.current_project["images"]
             self.table.setRowCount(len(images))
             
             project_name = self.current_project.get("name", "批量任务")
-            batch_templates = self._get_batch_templates_list()
+            # Get the actual base storage path where Chrome downloads（只取一次）
+            base_path = self.main_window.storage_manager.get_base_path() if hasattr(self.main_window, 'storage_manager') else None
+            if not base_path:
+                base_path = Path.home() / "Downloads"
+            self.table.setUpdatesEnabled(False)
             
             for i, img in enumerate(images):
                 raw_path = img.get("path", "")
@@ -1148,39 +1267,12 @@ class BatchGenerateTabWidget(QWidget):
                 idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.table.setItem(i, 0, idx_item)
 
-                # Col 1: 图片预览 (Thumbnail + Click to enlarge)
-                self.table.setItem(i, 1, QTableWidgetItem(""))
-                w_thumb = QWidget()
-                w_thumb.setStyleSheet("background: transparent;")
-                l_thumb = QHBoxLayout(w_thumb)
-                l_thumb.setContentsMargins(4, 4, 4, 4)
-                l_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                lbl_thumb = QLabel()
-                lbl_thumb.setFixedSize(106, 68)
-                lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
-                lbl_thumb.setToolTip(f"🔍 点击查看大图预览\n文件: {name}\n路径: {raw_path}")
-
-                thumb_pix = self._get_thumbnail_pixmap(raw_path, 102, 64)
-                if thumb_pix:
-                    lbl_thumb.setPixmap(thumb_pix)
-                    lbl_thumb.setStyleSheet(
-                        "QLabel { background-color: #FFFDF9; border: 1px solid #D7CCC8; border-radius: 4px; }"
-                        "QLabel:hover { border: 2px solid #E0A96D; }"
-                    )
-                else:
-                    lbl_thumb.setText("无预览" if os.path.exists(raw_path) else "文件缺失")
-                    lbl_thumb.setStyleSheet(
-                        "QLabel { background-color: #EFEBE9; color: #8D6E63; font-size: 11px; border: 1px dashed #BCAAA4; border-radius: 4px; }"
-                    )
-
-                lbl_thumb.mousePressEvent = lambda event, p=raw_path, idx_num=i+1: (
-                    self._show_large_image_preview(p, idx_num)
-                    if event.button() == Qt.MouseButton.LeftButton else None
-                )
-                l_thumb.addWidget(lbl_thumb)
-                self.table.setCellWidget(i, 1, w_thumb)
+                # Col 1: 图片预览（由 ThumbnailDelegate 按需绘制，单击查看大图）
+                thumb_item = QTableWidgetItem("")
+                thumb_item.setData(Qt.ItemDataRole.UserRole, raw_path if os.path.exists(raw_path) else "")
+                thumb_item.setToolTip(f"🔍 点击查看大图预览\n文件: {name}\n路径: {raw_path}")
+                thumb_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.table.setItem(i, 1, thumb_item)
 
                 # Col 2: 图片名称
                 name_item = QTableWidgetItem(name)
@@ -1194,72 +1286,29 @@ class BatchGenerateTabWidget(QWidget):
                 dur_item.setFlags(dur_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.table.setItem(i, 3, dur_item)
 
-                # Col 4: 单独预设 (Per-row template dropdown)
-                self.table.setItem(i, 4, QTableWidgetItem(""))
-                w_preset = QWidget()
-                w_preset.setStyleSheet("background: transparent;")
-                l_preset = QHBoxLayout(w_preset)
-                l_preset.setContentsMargins(4, 4, 4, 4)
-
-                cb_row_tpl = NoWheelComboBox()
-                cb_row_tpl.setToolTip("为该单条任务指定独立的描述词预设（默认跟随整体预设）")
-                cb_row_tpl.addItem("🔗 跟随整体预设", "")
-                for t in batch_templates:
-                    cat = (t.get("category") or "").strip()
-                    t_label = f"📌 [{cat}] {t.get('name', '未命名')}" if cat else f"📌 {t.get('name', '未命名')}"
-                    cb_row_tpl.addItem(t_label, t.get("id", ""))
-
-                found_idx = cb_row_tpl.findData(row_tpl_id) if row_tpl_id else 0
-                if found_idx < 0 and (row_tpl_id or img.get("template_name")):
+                # Col 4: 单独预设（平时只显示文字，单击时才弹出下拉框，由 ComboDelegate 处理）
+                found_t = self._find_batch_template_by_id(row_tpl_id) if row_tpl_id else None
+                if not found_t and (row_tpl_id or img.get("template_name")):
                     matched_t = self._find_batch_template(img.get("template_name") or row_tpl_id)
                     if matched_t:
                         row_tpl_id = matched_t.get("id", "")
                         img["template_id"] = row_tpl_id
-                        found_idx = cb_row_tpl.findData(row_tpl_id)
-                if found_idx >= 0:
-                    cb_row_tpl.setCurrentIndex(found_idx)
-                else:
-                    cb_row_tpl.setCurrentIndex(0)
-
-                self._apply_row_combo_style(cb_row_tpl, bool(row_tpl_id and found_idx > 0))
-                cb_row_tpl.currentIndexChanged.connect(
-                    lambda _, r=i, combo=cb_row_tpl: self.on_row_template_changed(r, combo)
-                )
-                l_preset.addWidget(cb_row_tpl)
-                self.table.setCellWidget(i, 4, w_preset)
+                        found_t = matched_t
+                preset_item = QTableWidgetItem("")
+                preset_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+                self._set_preset_item(preset_item, found_t)
+                self.table.setItem(i, 4, preset_item)
 
                 # Col 5: 提示词 (Editable)
                 prompt_item = QTableWidgetItem(prompt)
                 prompt_item.setToolTip("双击可直接手动编辑此任务的提示词，修改后自动保存")
                 self.table.setItem(i, 5, prompt_item)
                 
-                # Col 6: 操作
-                self.table.setItem(i, 6, QTableWidgetItem(""))
-                w_action = QWidget()
-                l_action = QHBoxLayout(w_action)
-                l_action.setContentsMargins(2, 2, 2, 2)
-                
-                btn_copy_prompt = QPushButton("复制提示词")
-                btn_copy_prompt.clicked.connect(
-                    lambda _, idx=i: QGuiApplication.clipboard().setText(
-                        self.current_project["images"][idx].get("prompt", "")
-                    )
-                )
-                
-                btn_copy_path = QPushButton("复制路径")
-                btn_copy_path.clicked.connect(lambda _, p=raw_path: QGuiApplication.clipboard().setText(p))
-                
-                btn_export = QPushButton("导出JSON")
-                btn_export.clicked.connect(lambda _, idx=i: self.export_single_json(idx))
-                
-                l_action.addWidget(btn_copy_prompt)
-                l_action.addWidget(btn_copy_path)
-                l_action.addWidget(btn_export)
-                self.table.setCellWidget(i, 6, w_action)
-                # Get the actual base storage path where Chrome downloads
-                base_path = self.main_window.storage_manager.get_base_path() if hasattr(self.main_window, 'storage_manager') else None
-                if not base_path:
-                    base_path = Path.home() / "Downloads"
+                # Col 6: 操作（复制提示词 / 复制路径 / 导出JSON 三个按钮由 TableButtonDelegate 绘制）
+                op_item = QTableWidgetItem("")
+                op_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.table.setItem(i, 6, op_item)
+                # Chrome 下载目录（已在循环外计算一次）
                     
                 check_path = Path(base_path) / "Flow" / project_name / f"{image_path.stem}.mp4"
                 
@@ -1268,6 +1317,7 @@ class BatchGenerateTabWidget(QWidget):
                 else:
                     self.change_row_color(i, copied=False)
         finally:
+            self.table.setUpdatesEnabled(True)
             self._is_rendering_table = False
 
     def export_single_json(self, index):
@@ -1283,7 +1333,7 @@ class BatchGenerateTabWidget(QWidget):
             cm.load()
         default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
         default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
-        batch_aspect = getattr(cm, "batch_default_aspect_ratio", getattr(cm, "default_aspect_ratio", "9:16")) if cm else "9:16"
+        batch_aspect = self._get_project_aspect()
         task_interval = getattr(cm, "task_interval", 5) if cm else 5
         data = [{
             "prompt": img.get("prompt", ""),
@@ -1313,7 +1363,7 @@ class BatchGenerateTabWidget(QWidget):
             cm.load()
         default_mode = getattr(cm, "default_generation_mode", "VIDEO_FRAMES") if cm else "VIDEO_FRAMES"
         default_model = getattr(cm, "default_video_model", "omni_1_1_flash") if cm else "omni_1_1_flash"
-        batch_aspect = getattr(cm, "batch_default_aspect_ratio", getattr(cm, "default_aspect_ratio", "9:16")) if cm else "9:16"
+        batch_aspect = self._get_project_aspect()
         task_interval = getattr(cm, "task_interval", 5) if cm else 5
         out = []
         for i in images:
