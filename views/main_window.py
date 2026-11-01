@@ -4,12 +4,34 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QListWidgetItem, QSplitter, QFileDialog, QMessageBox,
                              QInputDialog, QMenu, QToolTip, QDialog, QSpinBox,
                              QProgressBar, QFrame)
-from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QCursor, QColor
 from models.storage_manager import StorageManager
 from views.import_dialog import ImportDialog
 from views.project_detail_widget import ProjectDetailWidget
 from pathlib import Path
+
+class _StatusThread(QThread):
+    status_signal = pyqtSignal(int, str, dict)
+
+    def __init__(self, gen, items, base, parent=None):
+        super().__init__(parent)
+        self.gen, self.items, self.base = gen, list(items), base
+
+    def run(self):
+        from models.project_model import ProjectModel
+        from services.video_checker import VideoChecker
+        for path in self.items:
+            if self.isInterruptionRequested():
+                return
+            try:
+                report = VideoChecker.check_project_videos(ProjectModel(path), path, base_storage_path=self.base)
+                self.status_signal.emit(self.gen, str(path), {
+                    "missing": report.get("missing_count", 0), "pending": report.get("pending_count", 0),
+                    "already": report.get("already_count", 0), "rate": report.get("completion_rate", 0.0)})
+            except Exception as e:
+                print(f"Error checking project status for {path}: {e}")
+
 
 class RenameProjectDialog(QDialog):
     """Dialog for modifying all parts of a project (Index, Project Name, and Notes)."""
@@ -469,36 +491,27 @@ class MainWindow(QMainWindow):
         self._start_project_status_scan(projects, base_path)
 
     def _start_project_status_scan(self, projects, base_path):
-        from PyQt6.QtCore import QThread, pyqtSignal
-
-        class _StatusThread(QThread):
-            status_signal = pyqtSignal(int, str, dict)
-
-            def __init__(self, gen, items, base, parent=None):
-                super().__init__(parent)
-                self.gen, self.items, self.base = gen, items, base
-
-            def run(self):
-                from models.project_model import ProjectModel
-                from services.video_checker import VideoChecker
-                for path in self.items:
-                    if self.isInterruptionRequested():
-                        return
-                    try:
-                        report = VideoChecker.check_project_videos(ProjectModel(path), path, base_storage_path=self.base)
-                        self.status_signal.emit(self.gen, str(path), {
-                            "missing": report.get("missing_count", 0), "pending": report.get("pending_count", 0),
-                            "already": report.get("already_count", 0), "rate": report.get("completion_rate", 0.0)})
-                    except Exception as e:
-                        print(f"Error checking project status for {path}: {e}")
-
         self._status_gen = getattr(self, "_status_gen", 0) + 1
         old = getattr(self, "_status_thread", None)
-        if old is not None and old.isRunning():
-            old.requestInterruption()
+        if old is not None:
+            try:
+                if old.isRunning():
+                    old.requestInterruption()
+            except RuntimeError:
+                pass
+            self._status_thread = None
         th = _StatusThread(self._status_gen, [p['path'] for p in projects], base_path, self)
         th.status_signal.connect(self._apply_project_status)
-        th.finished.connect(th.deleteLater)
+
+        def _on_status_done(t=th):
+            if getattr(self, "_status_thread", None) is t:
+                self._status_thread = None
+            try:
+                t.deleteLater()
+            except RuntimeError:
+                pass
+
+        th.finished.connect(_on_status_done)
         self._status_thread = th
         th.start()
 
@@ -837,8 +850,11 @@ class MainWindow(QMainWindow):
             # 1. Stop any active download thread first
             if project_id in self.active_downloads:
                 thread = self.active_downloads.pop(project_id)
-                if thread and thread.isRunning():
-                    thread.stop()
+                try:
+                    if thread and thread.isRunning():
+                        thread.stop()
+                except RuntimeError:
+                    pass
             
             # 2. Delete the directory recursively
             import shutil

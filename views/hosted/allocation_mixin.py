@@ -113,8 +113,14 @@ class AllocationMixin:
         if errors or not items:
             QMessageBox.information(self, "提示", "\n".join(errors) if errors else "没有勾选任何项目。")
             return
-        if getattr(self, "_planner_thread", None) is not None and self._planner_thread.isRunning():
-            return
+        old_th = getattr(self, "_planner_thread", None)
+        if old_th is not None:
+            try:
+                if old_th.isRunning():
+                    return
+            except RuntimeError:
+                pass
+            self._planner_thread = None
 
         # 拆批放到后台线程执行，界面不卡；完成后回到主线程继续分配
         from services.batch_planner import ProjectBatchPlannerThread
@@ -125,6 +131,16 @@ class AllocationMixin:
                                        open_project=self._planner_open_project(), parent=self)
         th.progress_signal.connect(lambda n, total, label: self.lbl_summary.setText(f"⏳ 拆批中 {n}/{total}：{label}"))
         th.finished_signal.connect(self._on_planner_finished)
+
+        def _on_planner_thread_done(t=th):
+            if getattr(self, "_planner_thread", None) is t:
+                self._planner_thread = None
+            try:
+                t.deleteLater()
+            except RuntimeError:
+                pass
+
+        th.finished.connect(_on_planner_thread_done)
         self._planner_thread = th
         th.start()
 

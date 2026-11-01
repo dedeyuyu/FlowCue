@@ -606,14 +606,29 @@ class PropertyPanelMixin:
 
     def _start_icon_decode_thread(self):
         th = getattr(self, "_icon_thread", None)
-        if th is not None and th.isRunning():
-            return  # 当前线程结束后会再次检查队列
+        if th is not None:
+            try:
+                if th.isRunning():
+                    return  # 当前线程结束后会再次检查队列
+            except RuntimeError:
+                pass
+            self._icon_thread = None
         if not getattr(self, "_icon_queue", None):
             return
         keys, self._icon_queue = self._icon_queue, []
         th = _IconDecodeThread(keys, self)
         th.decoded.connect(self._on_icon_decoded)
-        th.finished.connect(self._start_icon_decode_thread)
+
+        def _on_icon_done(t=th):
+            if getattr(self, "_icon_thread", None) is t:
+                self._icon_thread = None
+            try:
+                t.deleteLater()
+            except RuntimeError:
+                pass
+            self._start_icon_decode_thread()
+
+        th.finished.connect(_on_icon_done)
         self._icon_thread = th
         th.start()
 
