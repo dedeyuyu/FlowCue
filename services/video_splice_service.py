@@ -9,10 +9,13 @@ import os
 import sys
 import json
 import time
+import uuid
 import shutil
 import hashlib
 import tempfile
+import threading
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -99,10 +102,20 @@ class VideoSpliceService:
         target_height: int,
         fps: float = 30.0,
         has_audio: bool = True,
+        is_cancelled_cb=None,
     ) -> bool:
-        """Trims a single clip to [cut_in, cut_out] and normalizes video/audio streams for seamless concat."""
+        """Trims a single clip to [cut_in, cut_out] and normalizes video/audio streams for seamless concat.
+
+        The clip is first rendered into a unique temporary file and then atomically moved to
+        `out_clip_path`, so a cancelled / killed FFmpeg run never leaves a half-written file that
+        would later be mistaken for a valid SHA-256 cache entry (and parallel workers never collide).
+        """
         ffmpeg_bin = FFmpegHelper.get_ffmpeg_path()
+        out_clip_path = Path(out_clip_path)
         out_clip_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_clip_path = out_clip_path.with_name(
+            f"{out_clip_path.stem}.part{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:6]}{out_clip_path.suffix}"
+        )
 
         cut_in = max(0.0, float(cut_in))
         cut_out = max(cut_in + 0.1, float(cut_out))
@@ -143,17 +156,24 @@ class VideoSpliceService:
             "-c:a", "aac", "-b:a", "192k",
             "-avoid_negative_ts", "make_zero",
             "-shortest",
-            str(out_clip_path),
+            str(tmp_clip_path),
         ])
 
-        res = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=300,
-            creationflags=_SUBPROCESS_FLAGS,
-        )
-        return res.returncode == 0 and out_clip_path.exists() and out_clip_path.stat().st_size > 512
+        try:
+            returncode, _out, _err, _cancelled = FFmpegHelper.run_cancellable(
+                cmd, timeout=300, is_cancelled_cb=is_cancelled_cb,
+            )
+            if returncode == 0 and tmp_clip_path.exists() and tmp_clip_path.stat().st_size > 512:
+                os.replace(str(tmp_clip_path), str(out_clip_path))
+            return out_clip_path.exists() and out_clip_path.stat().st_size > 512 and returncode == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                if tmp_clip_path.exists():
+                    tmp_clip_path.unlink()
+            except Exception:
+                pass
 
     @classmethod
     def splice_single_project_plan(
@@ -245,8 +265,11 @@ class VideoSpliceService:
                         target_height=target_h,
                         fps=fps,
                         has_audio=media_info.get("has_audio", True),
+                        is_cancelled_cb=is_cancelled_cb,
                     )
                     if not ok:
+                        if _cancelled():
+                            return False, {"error": "用户已取消合并任务"}
                         return False, {"error": f"第 {seq_num:02d} 段视频 FFmpeg 裁切失败: {vp.name}"}
 
                 proc_name = f"{idx + 1:03d}_{vp.stem}_{cut_in:.2f}-{cut_out:.2f}.mp4"
@@ -330,14 +353,20 @@ class VideoSpliceService:
             if len(trimmed_files) == 1:
                 shutil.copy2(trimmed_files[0], output_video_path)
             else:
+                # Each task gets its own unique concat list + temporary output file, so several
+                # tasks can be spliced in parallel without temp filename collisions.
                 with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".txt", delete=False, encoding="utf-8"
+                    mode="w", suffix=".txt", prefix="flowcue_concat_", delete=False, encoding="utf-8"
                 ) as tf:
                     concat_list_path = Path(tf.name)
                     for clip_file in trimmed_files:
                         escaped_path = str(clip_file.resolve()).replace("'", "'\\''")
                         tf.write(f"file '{escaped_path}'\n")
 
+                tmp_output_path = output_video_path.with_name(
+                    f"{output_video_path.stem}.part{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:6]}"
+                    f"{output_video_path.suffix}"
+                )
                 try:
                     cmd_concat = [
                         ffmpeg_bin,
@@ -347,16 +376,14 @@ class VideoSpliceService:
                         "-i", str(concat_list_path),
                         "-c", "copy",
                         "-movflags", "+faststart",
-                        str(output_video_path),
+                        str(tmp_output_path),
                     ]
-                    res_concat = subprocess.run(
-                        cmd_concat,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=600,
-                        creationflags=_SUBPROCESS_FLAGS,
+                    rc_concat, _o, _e, was_cancelled = FFmpegHelper.run_cancellable(
+                        cmd_concat, timeout=600, is_cancelled_cb=is_cancelled_cb,
                     )
-                    if res_concat.returncode != 0 or not output_video_path.exists():
+                    if was_cancelled or _cancelled():
+                        return False, {"error": "用户已取消合并任务"}
+                    if rc_concat != 0 or not tmp_output_path.exists():
                         cmd_reenc = [
                             ffmpeg_bin,
                             "-y", "-v", "error",
@@ -366,21 +393,27 @@ class VideoSpliceService:
                             "-c:v", "libx264", "-crf", "18", "-preset", "fast",
                             "-c:a", "aac", "-b:a", "192k",
                             "-movflags", "+faststart",
-                            str(output_video_path),
+                            str(tmp_output_path),
                         ]
-                        res_reenc = subprocess.run(
-                            cmd_reenc,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            timeout=900,
-                            creationflags=_SUBPROCESS_FLAGS,
+                        rc_reenc, _o2, err_reenc, was_cancelled = FFmpegHelper.run_cancellable(
+                            cmd_reenc, timeout=900, is_cancelled_cb=is_cancelled_cb,
                         )
-                        if res_reenc.returncode != 0:
-                            err_txt = res_reenc.stderr.decode("utf-8", errors="replace")[:300]
+                        if was_cancelled or _cancelled():
+                            return False, {"error": "用户已取消合并任务"}
+                        if rc_reenc != 0:
+                            err_txt = (err_reenc or b"").decode("utf-8", errors="replace")[:300]
                             return False, {"error": f"FFmpeg 合并拼接失败: {err_txt}"}
+                    try:
+                        os.replace(str(tmp_output_path), str(output_video_path))
+                    except Exception as e:
+                        return False, {"error": f"无法写入成片（文件可能正被占用）: {output_video_path.name} ({e})"}
                 finally:
                     try:
                         concat_list_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        tmp_output_path.unlink(missing_ok=True)
                     except Exception:
                         pass
 
@@ -456,8 +489,9 @@ class VideoSpliceWorker(QThread):
 
 
 class BatchMultiProjectSpliceWorker(QThread):
-    """Background worker that splices multiple selected FlowCue tasks one by one
-    and collects all spliced MP4 + SRT + word-timeline payloads for one-click import into Batch Reels.
+    """Background worker that splices multiple selected FlowCue tasks (up to 4 in parallel,
+    see `max_parallel_tasks`; 1 = one by one) and collects all spliced MP4 + SRT + word-timeline
+    payloads (in the original task order) for one-click import into Batch Reels.
     """
 
     task_started = pyqtSignal(str)
@@ -465,6 +499,8 @@ class BatchMultiProjectSpliceWorker(QThread):
     task_finished = pyqtSignal(str, bool, dict)
     overall_progress = pyqtSignal(int, int, str)
     all_finished = pyqtSignal(int, int, list)
+
+    MAX_PARALLEL_TASKS_LIMIT = 4
 
     def __init__(
         self,
@@ -474,6 +510,7 @@ class BatchMultiProjectSpliceWorker(QThread):
         base_storage_path=None,
         skip_already_merged: bool = False,
         parent=None,
+        max_parallel_tasks: int = 4,
     ):
         """
         Args:
@@ -481,13 +518,21 @@ class BatchMultiProjectSpliceWorker(QThread):
             projects_list: list of {"id": str, "path": Path/str} to build plan & splice automatically
             base_storage_path: base storage path for VideoChecker
             skip_already_merged / reuse_existing_merged: if True and output_video_path + .srt + manifest exist, reuse
+            max_parallel_tasks: number of tasks spliced in parallel (并行线程数, clamped to 1..4)
         """
         super().__init__(parent)
         self.tasks_to_splice = tasks_to_splice or []
         self.projects_list = projects_list or []
         self.base_storage_path = base_storage_path
         self.reuse_existing_merged = bool(reuse_existing_merged or skip_already_merged)
+        try:
+            self.max_parallel_tasks = max(1, min(self.MAX_PARALLEL_TASKS_LIMIT, int(max_parallel_tasks or 1)))
+        except (TypeError, ValueError):
+            self.max_parallel_tasks = 1
         self._cancelled = False
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancelled or self.isInterruptionRequested())
 
     def cancel(self):
         self._cancelled = True
@@ -509,7 +554,11 @@ class BatchMultiProjectSpliceWorker(QThread):
         # Auto-relocate any pending videos found in download folder so splicing has all ready files
         if report.get("pending_count", 0) > 0:
             try:
-                VideoChecker.relocate_videos(report, proj_path)
+                relocate_fn = getattr(VideoChecker, "relocate_found_videos", None)
+                if callable(relocate_fn):
+                    relocate_fn(report)
+                else:
+                    VideoChecker.relocate_videos(report, proj_path)
                 report = VideoChecker.check_project_videos(model, proj_path, base_storage_path=self.base_storage_path)
             except Exception:
                 pass
@@ -570,100 +619,159 @@ class BatchMultiProjectSpliceWorker(QThread):
             "segments_plan": plan,
         }
 
+    def _splice_one(self, idx: int, raw_item: dict, total: int):
+        """Splices a single task inside a pool thread (independent FFmpeg processes, per-project
+        engineering/cache dirs and unique temp files, so up to 4 tasks can safely run in parallel).
+
+        Returns:
+            tuple: (ok: bool, payload: dict | None)
+        """
+        if self._is_cancelled():
+            return False, None
+
+        if "segments_plan" not in raw_item:
+            proj_id = str(raw_item.get("id") or raw_item.get("project_id") or f"Task_{idx + 1}")
+            self.task_started.emit(proj_id)
+            self.task_progress.emit(proj_id, 0, "🎬 正在准备合并拼接（加载项目 / 归位视频）...")
+            try:
+                item = self._build_task_item_from_project(raw_item)
+            except Exception as e:
+                self.task_finished.emit(proj_id, False, {"error": f"加载项目失败: {e}"})
+                return False, None
+        else:
+            item = raw_item
+            proj_id = str(item.get("project_id", f"Task_{idx + 1}"))
+            self.task_started.emit(proj_id)
+
+        proj_path = Path(item.get("project_path", ""))
+        out_video = Path(item.get("output_video_path", ""))
+        plan = item.get("segments_plan", [])
+
+        if not plan:
+            self.task_finished.emit(proj_id, False, {"error": "没有可合并的有效视频片段"})
+            return False, None
+
+        # Check fast reuse if requested
+        out_srt = out_video.with_suffix(".srt")
+        manifest_path = out_video.parent / f"{out_video.stem}-工程" / "处理片段" / "处理片段清单.json"
+        if self.reuse_existing_merged and out_video.exists() and out_srt.exists() and manifest_path.exists():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    m_data = json.load(f)
+                dur = float(m_data.get("total_duration") or m_data.get("output_duration") or 0.0)
+                words = m_data.get("merged_words", [])
+                clips = m_data.get("clips", [])
+                res = {
+                    "project_name": proj_id,
+                    "video_path": str(out_video),
+                    "srt_path": str(out_srt),
+                    "manifest_path": str(manifest_path),
+                    "output_dir": str(out_video.parent),
+                    "duration": dur,
+                    "total_duration": dur,
+                    "total_clips": len(clips) or len(plan),
+                    "cache_hits": len(clips) or len(plan),
+                    "words": words,
+                    "merged_words": words,
+                    "segments": clips,
+                    "reused_full_video": True,
+                    "reused_existing": True,
+                }
+                self.task_finished.emit(proj_id, True, res)
+                return True, res
+            except Exception:
+                pass
+
+        if self._is_cancelled():
+            self.task_finished.emit(proj_id, False, {"error": "用户已取消合并任务"})
+            return False, None
+
+        ok, res = VideoSpliceService.splice_single_project_plan(
+            segments_plan=plan,
+            output_video_path=out_video,
+            project_path=proj_path,
+            progress_cb=lambda pct, msg, pid=proj_id: self.task_progress.emit(pid, pct, msg),
+            is_cancelled_cb=self._is_cancelled,
+        )
+
+        if ok:
+            payload = {
+                "project_name": proj_id,
+                "video_path": res.get("video_path", ""),
+                "srt_path": res.get("srt_path", ""),
+                "manifest_path": res.get("manifest_path", ""),
+                "output_dir": str(out_video.parent),
+                "duration": res.get("total_duration", 0.0),
+                "total_duration": res.get("total_duration", 0.0),
+                "total_clips": res.get("total_clips", 0),
+                "cache_hits": res.get("cache_hits", 0),
+                "words": res.get("merged_words", []),
+                "merged_words": res.get("merged_words", []),
+                "segments": res.get("clips", []),
+            }
+            self.task_finished.emit(proj_id, True, payload)
+            return True, payload
+
+        self.task_finished.emit(proj_id, False, res)
+        return False, None
+
     def run(self):
         work_items = list(self.tasks_to_splice) if self.tasks_to_splice else list(self.projects_list)
         total = len(work_items)
-        completed_payloads = []
         success_count = 0
+        done_count = 0
+        payload_by_index = {}
 
-        for idx, raw_item in enumerate(work_items):
-            if self._cancelled or self.isInterruptionRequested():
-                break
+        if total == 0:
+            self.overall_progress.emit(0, 0, "✅ 批量拼接完成：没有需要拼接的任务")
+            self.all_finished.emit(0, 0, [])
+            return
 
-            if "segments_plan" not in raw_item:
-                proj_id = str(raw_item.get("id") or raw_item.get("project_id") or f"Task_{idx + 1}")
-                self.task_started.emit(proj_id)
-                self.overall_progress.emit(idx, total, f"🎬 正在准备合并拼接 ({idx + 1}/{total}): {proj_id}")
-                try:
-                    item = self._build_task_item_from_project(raw_item)
-                except Exception as e:
-                    self.task_finished.emit(proj_id, False, {"error": f"加载项目失败: {e}"})
+        workers = max(1, min(self.max_parallel_tasks, total))
+        self.overall_progress.emit(
+            0, total, f"🎬 正在合并拼接 {total} 个任务（并行线程数 {workers}）..."
+        )
+
+        executor = ThreadPoolExecutor(max_workers=workers)
+        pending_cancelled = False
+        try:
+            fut_to_idx = {
+                executor.submit(self._splice_one, idx, raw_item, total): idx
+                for idx, raw_item in enumerate(work_items)
+            }
+            for fut in as_completed(fut_to_idx):
+                if fut.cancelled():
                     continue
-            else:
-                item = raw_item
-                proj_id = str(item.get("project_id", f"Task_{idx + 1}"))
-                self.task_started.emit(proj_id)
-                self.overall_progress.emit(idx, total, f"🎬 正在合并拼接 ({idx + 1}/{total}): {proj_id}")
-
-            proj_path = Path(item.get("project_path", ""))
-            out_video = Path(item.get("output_video_path", ""))
-            plan = item.get("segments_plan", [])
-
-            if not plan:
-                self.task_finished.emit(proj_id, False, {"error": "没有可合并的有效视频片段"})
-                continue
-
-            # Check fast reuse if requested
-            out_srt = out_video.with_suffix(".srt")
-            manifest_path = out_video.parent / f"{out_video.stem}-工程" / "处理片段" / "处理片段清单.json"
-            if self.reuse_existing_merged and out_video.exists() and out_srt.exists() and manifest_path.exists():
+                idx = fut_to_idx[fut]
                 try:
-                    with open(manifest_path, "r", encoding="utf-8") as f:
-                        m_data = json.load(f)
-                    dur = float(m_data.get("total_duration") or m_data.get("output_duration") or 0.0)
-                    words = m_data.get("merged_words", [])
-                    clips = m_data.get("clips", [])
-                    res = {
-                        "project_name": proj_id,
-                        "video_path": str(out_video),
-                        "srt_path": str(out_srt),
-                        "manifest_path": str(manifest_path),
-                        "output_dir": str(out_video.parent),
-                        "duration": dur,
-                        "total_duration": dur,
-                        "total_clips": len(clips) or len(plan),
-                        "cache_hits": len(clips) or len(plan),
-                        "words": words,
-                        "merged_words": words,
-                        "segments": clips,
-                        "reused_full_video": True,
-                        "reused_existing": True,
-                    }
+                    ok, payload = fut.result()
+                except Exception as exc:
+                    ok, payload = False, None
+                    raw = work_items[idx] if idx < len(work_items) else {}
+                    pid = str(raw.get("id") or raw.get("project_id") or f"Task_{idx + 1}")
+                    self.task_finished.emit(pid, False, {"error": f"合并拼接异常: {exc}"})
+                done_count += 1
+                if ok and payload:
                     success_count += 1
-                    completed_payloads.append(res)
-                    self.task_finished.emit(proj_id, True, res)
-                    continue
-                except Exception:
-                    pass
+                    payload_by_index[idx] = payload
+                self.overall_progress.emit(
+                    done_count, total,
+                    f"🎬 已完成 {done_count}/{total} 个任务（成功 {success_count}，并行线程数 {workers}）",
+                )
+                if self._is_cancelled() and not pending_cancelled:
+                    # Drop queued tasks; running ones abort quickly (their FFmpeg processes are killed)
+                    pending_cancelled = True
+                    for f in fut_to_idx:
+                        f.cancel()
+        finally:
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:  # Python < 3.9
+                executor.shutdown(wait=True)
 
-            ok, res = VideoSpliceService.splice_single_project_plan(
-                segments_plan=plan,
-                output_video_path=out_video,
-                project_path=proj_path,
-                progress_cb=lambda pct, msg, pid=proj_id: self.task_progress.emit(pid, pct, msg),
-                is_cancelled_cb=lambda: self._cancelled or self.isInterruptionRequested(),
-            )
-
-            if ok:
-                success_count += 1
-                payload = {
-                    "project_name": proj_id,
-                    "video_path": res.get("video_path", ""),
-                    "srt_path": res.get("srt_path", ""),
-                    "manifest_path": res.get("manifest_path", ""),
-                    "output_dir": str(out_video.parent),
-                    "duration": res.get("total_duration", 0.0),
-                    "total_duration": res.get("total_duration", 0.0),
-                    "total_clips": res.get("total_clips", 0),
-                    "cache_hits": res.get("cache_hits", 0),
-                    "words": res.get("merged_words", []),
-                    "merged_words": res.get("merged_words", []),
-                    "segments": res.get("clips", []),
-                }
-                completed_payloads.append(payload)
-                self.task_finished.emit(proj_id, True, payload)
-            else:
-                self.task_finished.emit(proj_id, False, res)
+        # Keep the original task order for the Batch Reels payload list
+        completed_payloads = [payload_by_index[i] for i in sorted(payload_by_index)]
+        success_count = len(completed_payloads)
 
         self.overall_progress.emit(
             total, total,

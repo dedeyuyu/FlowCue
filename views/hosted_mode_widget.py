@@ -32,6 +32,7 @@ class HostedModeWidget(CruiseMixin, BrowserOpsMixin, AllocationMixin, UploadMixi
         # 设置
         self.threshold = 50
         self.small_threshold = 40
+        self.max_subtasks_per_batch = 10
         self.group_size = 5
         self.upload_timeout = 60
         self.run_group_size = 5
@@ -111,10 +112,16 @@ class HostedModeWidget(CruiseMixin, BrowserOpsMixin, AllocationMixin, UploadMixi
 
     def _load_settings(self):
         try:
+            cm = getattr(self.mw, "config_manager", None)
+            cfg_subtasks = int(getattr(cm, "max_subtasks_per_batch", 10)) if cm is not None else 10
+            self.max_subtasks_per_batch = max(0, cfg_subtasks)
             if self.settings_file.exists():
                 d = json.loads(self.settings_file.read_text(encoding="utf-8"))
                 self.threshold = int(d.get("threshold", 50))
                 self.small_threshold = int(d.get("small_threshold", 40))
+                # 若规则设置 (.app_config.json) 已保存则以规则设置为准；否则默认 10
+                if cm is None and "max_subtasks_per_batch" in d:
+                    self.max_subtasks_per_batch = max(0, int(d.get("max_subtasks_per_batch", 10)))
                 self.group_size = int(d.get("group_size", 5))
                 self.upload_timeout = int(d.get("upload_timeout", 60))
                 self.run_group_size = int(d.get("run_group_size", 5))
@@ -124,9 +131,31 @@ class HostedModeWidget(CruiseMixin, BrowserOpsMixin, AllocationMixin, UploadMixi
         except Exception as e:
             logger.warning(f"读取托管设置失败: {e}")
 
+    def sync_from_config_manager(self):
+        """当「⚙️ 规则设置」保存后同步单任务子任务上限到全局托管界面。"""
+        cm = getattr(self.mw, "config_manager", None)
+        if cm is None:
+            return
+        new_val = max(0, int(getattr(cm, "max_subtasks_per_batch", 10)))
+        self.max_subtasks_per_batch = new_val
+        if hasattr(self, "spin_max_subtasks"):
+            self.spin_max_subtasks.blockSignals(True)
+            self.spin_max_subtasks.setValue(new_val)
+            self.spin_max_subtasks.blockSignals(False)
+        self._schedule_refresh()
+
     def _save_settings(self):
         self.threshold = self.spin_threshold.value()
         self.small_threshold = self.spin_small.value()
+        if hasattr(self, "spin_max_subtasks"):
+            self.max_subtasks_per_batch = self.spin_max_subtasks.value()
+            cm = getattr(self.mw, "config_manager", None)
+            if cm is not None and getattr(cm, "max_subtasks_per_batch", None) != self.max_subtasks_per_batch:
+                cm.max_subtasks_per_batch = self.max_subtasks_per_batch
+                try:
+                    cm.save()
+                except Exception:
+                    pass
         self.group_size = self.spin_group.value()
         self.upload_timeout = self.spin_timeout.value()
         self.run_group_size = self.spin_run_group.value()
@@ -138,6 +167,7 @@ class HostedModeWidget(CruiseMixin, BrowserOpsMixin, AllocationMixin, UploadMixi
         try:
             self.settings_file.write_text(json.dumps({
                 "threshold": self.threshold, "small_threshold": self.small_threshold,
+                "max_subtasks_per_batch": self.max_subtasks_per_batch,
                 "group_size": self.group_size, "upload_timeout": self.upload_timeout,
                 "run_group_size": self.run_group_size, "run_wait_seconds": self.run_wait_seconds,
                 "cruise_dwell_seconds": self.cruise_dwell_seconds,
@@ -221,6 +251,13 @@ class HostedModeWidget(CruiseMixin, BrowserOpsMixin, AllocationMixin, UploadMixi
         self.spin_small.setToolTip("批次表中积分低于此值的批次会标注「(小)」，仅用于显示。\n"
                                    "分配规则：按浏览器剩余积分从低到高优先分配，为每个浏览器量身打包不超过其剩余积分的任务。")
         r.addWidget(self.spin_small)
+        r.addWidget(QLabel("单任务子任务上限："))
+        self.spin_max_subtasks = self._spin(0, 100, self.max_subtasks_per_batch, " 个")
+        self.spin_max_subtasks.setSpecialValueText("不限")
+        self.spin_max_subtasks.setToolTip(
+            "限制每个批次/每个账号单次分配的子任务（分镜）数量不超过该值（默认 10 个，可在「⚙️ 规则设置」中配置，设为 0 表示不限制）。"
+        )
+        r.addWidget(self.spin_max_subtasks)
         self.btn_close_marked = self._btn("🔴 关闭已标记的低积分浏览器", "#DC2626", "#B91C1C")
         self.btn_close_marked.clicked.connect(self.on_close_marked)
         r.addWidget(self.btn_close_marked)

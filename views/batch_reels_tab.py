@@ -77,6 +77,8 @@ class BatchReelsTabWidget(QWidget):
         self._focus_udp_sock = None
         self._focus_notifier = None
         self.embedded_hwnd = 0
+        self._ready_hwnd = 0
+        self._poll_in_flight = False
         self.embedded_qwindow = None
         self.embedded_container = None
         self.is_docked = True
@@ -92,7 +94,7 @@ class BatchReelsTabWidget(QWidget):
         self._init_ui()
 
         self._poll_timer = QTimer(self)
-        self._poll_timer.setInterval(450)
+        self._poll_timer.setInterval(180)
         self._poll_timer.timeout.connect(self._poll_engine_status)
 
         app = QApplication.instance()
@@ -276,6 +278,21 @@ class BatchReelsTabWidget(QWidget):
 
         top_layout.addStretch()
 
+        self.btn_export_titles_presets = QPushButton("📤 导出标题与预设")
+        self.btn_export_titles_presets.setToolTip(
+            "批量导出各任务的【标题（导出命名/覆层标题）】与【覆层预设名称】\n"
+            "• 支持一键复制为两列 TSV 直接粘贴到 Excel / 飞书表格\n"
+            "• 支持单独复制标题整列、单独复制覆层预设整列，或保存为 .tsv/.txt/.csv 文件"
+        )
+        self.btn_export_titles_presets.setStyleSheet(
+            "QPushButton { background: #4F46E5; color: white; font-size: 12px; font-weight: bold; padding: 4px 10px; border-radius: 4px; border: none; }"
+            "QPushButton:hover { background: #4338CA; }"
+        )
+        self.btn_export_titles_presets.clicked.connect(
+            lambda: self._send_ctrl_command("open_export_titles_presets", "POST", "/open-export-titles-presets")
+        )
+        top_layout.addWidget(self.btn_export_titles_presets)
+
         self.btn_preset_dir = QPushButton("📂 预设存放目录")
         self.btn_preset_dir.setToolTip(
             "查看字幕预设与覆层预设的永久存放目录（自动双备份，软件更新绝不丢失）：\n"
@@ -380,8 +397,11 @@ class BatchReelsTabWidget(QWidget):
         if not self._is_process_alive():
             self.ensure_engine_started()
         elif self._engine_ready:
-            QTimer.singleShot(150, lambda: self._send_ctrl_command("fit", "POST", "/fit-preview"))
-            QTimer.singleShot(200, self.focus_embedded_electron_hwnd)
+            if self.is_docked and self._ready_hwnd and self._ready_hwnd != self.embedded_hwnd:
+                self._embed_hwnd(self._ready_hwnd)
+            else:
+                QTimer.singleShot(120, lambda: self._send_ctrl_command("fit", "POST", "/fit-preview"))
+                QTimer.singleShot(160, self.focus_embedded_electron_hwnd)
 
     def _is_process_alive(self) -> bool:
         return self.electron_proc is not None and self.electron_proc.poll() is None
@@ -430,12 +450,15 @@ class BatchReelsTabWidget(QWidget):
         self.ctrl_port = _pick_free_port(preferred=5180)
         self._engine_ready = False
         self.embedded_hwnd = 0
+        self._ready_hwnd = 0
+        self._poll_in_flight = False
 
         env = os.environ.copy()
         env["VIDEOKIT_ROOT"] = self.VIDEOKIT_ROOT
         env["VITE_PORT"] = str(self.vite_port)
         env["FLOWCUE_CTRL_PORT"] = str(self.ctrl_port)
         env["FLOWCUE_FOCUS_UDP_PORT"] = str(self.focus_udp_port)
+        env["FLOWCUE_HIDE_UNTIL_EMBED"] = "1"
         env.pop("ELECTRON_RUN_AS_NODE", None)
 
         self.status_badge.setText("⏳ 正在启动 批量Reels 渲染引擎...")
@@ -460,8 +483,12 @@ class BatchReelsTabWidget(QWidget):
     def _poll_engine_status(self):
         if not self._is_process_alive():
             self._poll_timer.stop()
+            self._poll_in_flight = False
             self.status_badge.setText("🔴 批量Reels 引擎已停止")
             return
+        if self._poll_in_flight:
+            return
+        self._poll_in_flight = True
 
         worker = _ReelsControlWorker(self.ctrl_port, "poll_status", "GET", "/status", parent=self)
         worker.finished_signal.connect(self._on_ctrl_finished)
@@ -470,6 +497,8 @@ class BatchReelsTabWidget(QWidget):
         worker.start()
 
     def _cleanup_worker(self, w):
+        if getattr(w, "action", "") == "poll_status":
+            self._poll_in_flight = False
         if w in self._active_workers:
             self._active_workers.remove(w)
 
@@ -487,11 +516,13 @@ class BatchReelsTabWidget(QWidget):
 
     def _on_ctrl_finished(self, action: str, ok: bool, data: dict, err: str):
         if action == "poll_status":
+            self._poll_in_flight = False
             if ok and data.get("ready") and data.get("hwnd"):
                 self._poll_timer.stop()
                 self._engine_ready = True
                 hwnd = int(data["hwnd"])
-                if self.is_docked and hwnd != self.embedded_hwnd:
+                self._ready_hwnd = hwnd
+                if self.is_docked and self.isVisible() and hwnd != self.embedded_hwnd:
                     self._embed_hwnd(hwnd)
                 if "limitUnder3Min" in data:
                     self.chk_limit_3min.blockSignals(True)

@@ -177,8 +177,13 @@ class AllocationMixin:
         # 这样 12 / 15 / 30 积分这类低积分号会被优先用满，同时仍保持多浏览器并行。
         cm = getattr(self.mw, "config_manager", None)
         max_batch = int(getattr(cm, "max_batch_points", 50) or 50) if cm else 50
+        default_subtasks = int(getattr(cm, "max_subtasks_per_batch", 10)) if cm is not None else 10
+        max_subtasks = int(getattr(self, "max_subtasks_per_batch", default_subtasks) or 0)
+        if hasattr(self, "spin_max_subtasks"):
+            max_subtasks = int(self.spin_max_subtasks.value() or 0)
         cap = {c["client_id"]: int(c.get("remaining_points", 0)) for c in known}
         count = {cid: 0 for cid in cap}
+        subtask_count = {cid: 0 for cid in cap}
         by_id = {c["client_id"]: c for c in known}
         order = sorted(cap.keys(), key=lambda cid: (cap[cid], cid))
         self.plan = {}
@@ -218,15 +223,27 @@ class AllocationMixin:
                 "run_state": "未开始", "ok": 0, "fail": 0, "done_paths": set(), "fail_msgs": {},
             }
 
-        def pack(limit):
-            """从分镜池中取出一个项目内、总积分不超过 limit 的最优组合（大任务优先装入）。"""
+        def pack(limit, item_limit=0):
+            """从分镜池中取出一个项目内、总积分不超过 limit 且子任务数不超过 item_limit 的最优组合。"""
             for pp in proj_order:
                 pool = pools[pp]
                 if not pool:
                     continue
                 picked, used = [], 0
-                for x in sorted(pool, key=lambda x: -x["pts"]):
+                picked_imgs = set()
+                for x in sorted(pool, key=lambda x: (-x["pts"], x["seg"])):
+                    if item_limit > 0 and len(picked) >= item_limit:
+                        break
                     if used + x["pts"] <= limit:
+                        # 同时确保单批关联的去重图片数量不超过 item_limit（若设置了上限）
+                        if item_limit > 0:
+                            t_imgs = {
+                                p for k in ("local_image_path", "end_local_image_path")
+                                if (p := x["task"].get(k))
+                            }
+                            if len(picked_imgs | t_imgs) > item_limit and picked:
+                                continue
+                            picked_imgs |= t_imgs
                         picked.append(x)
                         used += x["pts"]
                 if picked:
@@ -239,6 +256,7 @@ class AllocationMixin:
             to_low = self._is_low(by_id[cid])
             cap[cid] -= b["points"]
             count[cid] += 1
+            subtask_count[cid] += len(b["tasks"])
             c = by_id[cid]
             b["cid"], b["email"], b["to_low"] = cid, self._email(c), to_low
             b["iid"], b["who"] = self._iid(c), self._who(c)
@@ -254,10 +272,13 @@ class AllocationMixin:
             for cid in order:
                 if not any(pools.values()):
                     break
+                if max_subtasks > 0 and subtask_count[cid] >= max_subtasks:
+                    continue
+                rem_items = (max_subtasks - subtask_count[cid]) if max_subtasks > 0 else 0
                 limit = min(cap[cid], max_batch)
                 if limit <= 0:
                     continue
-                pp, picked = pack(limit)
+                pp, picked = pack(limit, rem_items)
                 if not picked:
                     continue
                 b = make_batch(pp, picked)
@@ -265,10 +286,10 @@ class AllocationMixin:
                 new_batches.append(b)
                 progress = True
 
-        # 剩余没有浏览器接得下的分镜：按单批上限打包，标记为未分配
+        # 剩余没有浏览器接得下的分镜：按单批上限（及子任务上限）打包，标记为未分配
         for pp in proj_order:
             while pools[pp]:
-                _, picked = pack(max_batch)
+                _, picked = pack(max_batch, max_subtasks)
                 if not picked:
                     # 单个分镜就超过单批上限，单独成批
                     picked = [pools[pp].pop(0)]
@@ -279,8 +300,9 @@ class AllocationMixin:
         batches = new_batches
         self.batches = batches
         un = [b for b in batches if not b["cid"]]
-        self._log(f"✅ 分配完成：{len(batches)} 批，已分配 {len(batches) - len(un)} 批，"
-                  f"涉及 {len(self.plan)} 个浏览器" + (f"；⚠️ {len(un)} 批因积分不足未分配" if un else ""))
+        cap_hint = f"（单号子任务上限 ≤{max_subtasks} 个）" if max_subtasks > 0 else ""
+        self._log(f"✅ 分配完成{cap_hint}：{len(batches)} 批，已分配 {len(batches) - len(un)} 批，"
+                  f"涉及 {len(self.plan)} 个浏览器" + (f"；⚠️ {len(un)} 批因积分或子任务上限未分配" if un else ""))
         for b in batches:
             if b["cid"]:
                 self._log(f"   {b['short']}（{b['points']} 积分）→ {self._label(b)}" + (" [低积分号]" if b["to_low"] else ""))

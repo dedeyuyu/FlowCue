@@ -13,17 +13,24 @@ from PyQt6.QtWidgets import QApplication, QWidget, QComboBox, QTableWidget, QLis
 
 
 class _ThemeEventFilter(QObject):
-    """监听任意新建、显示或动态修改样式的 QWidget / QDialog / QMenu，自动适配其局部 QSS。"""
+    """监听任意新建、显示或动态修改样式的 QWidget / QDialog / QMenu，自动适配其局部 QSS。
+
+    性能说明：仅在暗色模式下安装（亮色模式下全局 QSS 已完整覆盖文字颜色，无需逐控件转换）；
+    不再处理 Polish 事件，StyleChange 事件走快速缓存路径，apply_theme 批量刷新期间直接跳过。
+    """
 
     def eventFilter(self, obj, event):
+        if ThemeManager._bulk:
+            return False
         try:
             etype = event.type()
-            if etype in (QEvent.Type.Show, QEvent.Type.Polish, QEvent.Type.StyleChange):
+            if etype == QEvent.Type.Show:
                 if isinstance(obj, QWidget):
-                    ThemeManager.refresh_widget_style(
-                        obj,
-                        recursive=(etype == QEvent.Type.Show and obj.isWindow()),
-                    )
+                    is_win = obj.isWindow()
+                    ThemeManager.refresh_widget_style(obj, recursive=is_win, adapt_items=is_win)
+            elif etype == QEvent.Type.StyleChange:
+                if isinstance(obj, QWidget):
+                    ThemeManager.refresh_widget_style(obj, recursive=False)
         except Exception:
             pass
         return False
@@ -35,7 +42,10 @@ class ThemeManager:
 
     _current_mode: str = "light"
     _event_filter: _ThemeEventFilter = None
+    _filter_installed: bool = False
+    _bulk: bool = False
     _refreshing_ids: set = set()
+    _adapt_cache: dict = {}
 
     # ── 暗色模式下的颜色映射表 ──
     _BG_MAP_DARK = {
@@ -648,6 +658,18 @@ class ThemeManager:
         if not orig_qss:
             return orig_qss
 
+        cache_key = (orig_qss, mode)
+        cached = cls._adapt_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result = cls._adapt_qss_uncached(orig_qss, mode)
+        if len(cls._adapt_cache) > 4000:
+            cls._adapt_cache.clear()
+        cls._adapt_cache[cache_key] = result
+        return result
+
+    @classmethod
+    def _adapt_qss_uncached(cls, orig_qss: str, mode: str) -> str:
         if mode == cls.LIGHT:
             prefix_light = []
             suffix_light = []
@@ -760,8 +782,11 @@ class ThemeManager:
         return "".join(prefix_dark) + qss + "".join(suffix_dark)
 
     @classmethod
-    def refresh_widget_style(cls, widget: QWidget, recursive: bool = True):
-        """刷新指定控件（及其子控件）的局部 QSS，使其匹配当前亮色/暗色主题。"""
+    def refresh_widget_style(cls, widget: QWidget, recursive: bool = True, adapt_items: bool = False):
+        """刷新指定控件（及其子控件）的局部 QSS，使其匹配当前亮色/暗色主题。
+
+        adapt_items=True 时同时转换表格/列表中已存在单元格的背景与文字颜色（仅在主题切换或窗口首次显示时使用）。
+        """
         if widget is None:
             return
         wid = id(widget)
@@ -776,22 +801,28 @@ class ThemeManager:
                 if view is not None:
                     view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-            if isinstance(widget, (QTableWidget, QListWidget)):
+            if adapt_items and isinstance(widget, (QTableWidget, QListWidget)):
                 cls.adapt_table_or_list_items(widget)
 
             cur_qss = widget.styleSheet()
             if cur_qss:
                 last_applied = widget.property("_last_applied_theme_qss")
-                orig_qss = widget.property("_orig_light_qss")
-                # 若业务代码刚刚设置了新的 QSS，更新原始 QSS 记录
-                if orig_qss is None or (last_applied is not None and cur_qss != last_applied):
-                    orig_qss = cur_qss
-                    widget.setProperty("_orig_light_qss", orig_qss)
+                # 快速路径：主题未变且 QSS 未被业务代码修改，直接跳过（避免祖先 setStyleSheet 引发的大量重复转换）
+                if (last_applied is not None and cur_qss == last_applied
+                        and widget.property("_theme_mode") == cls._current_mode):
+                    pass
+                else:
+                    orig_qss = widget.property("_orig_light_qss")
+                    # 若业务代码刚刚设置了新的 QSS，更新原始 QSS 记录
+                    if orig_qss is None or (last_applied is not None and cur_qss != last_applied):
+                        orig_qss = cur_qss
+                        widget.setProperty("_orig_light_qss", orig_qss)
 
-                adapted = cls.adapt_qss(orig_qss, cls._current_mode)
-                widget.setProperty("_last_applied_theme_qss", adapted)
-                if cur_qss != adapted:
-                    widget.setStyleSheet(adapted)
+                    adapted = cls.adapt_qss(orig_qss, cls._current_mode)
+                    widget.setProperty("_last_applied_theme_qss", adapted)
+                    widget.setProperty("_theme_mode", cls._current_mode)
+                    if cur_qss != adapted:
+                        widget.setStyleSheet(adapted)
         except Exception:
             pass
         finally:
@@ -800,7 +831,7 @@ class ThemeManager:
         if recursive:
             try:
                 for child in widget.findChildren(QWidget):
-                    cls.refresh_widget_style(child, recursive=False)
+                    cls.refresh_widget_style(child, recursive=False, adapt_items=adapt_items)
             except Exception:
                 pass
 
@@ -808,6 +839,7 @@ class ThemeManager:
     def apply_theme(cls, mode: str = "light", app: QApplication = None):
         """在 QApplication 上应用亮色或暗色主题，并实时刷新所有已打开的窗口与控件。"""
         mode = cls.DARK if str(mode).lower() == cls.DARK else cls.LIGHT
+        mode_changed = (mode != cls._current_mode)
         cls._current_mode = mode
 
         if app is None:
@@ -815,33 +847,65 @@ class ThemeManager:
         if app is None:
             return
 
-        # 1. 使用跨平台一致的 Fusion 引擎，彻底隔离 Windows 11 原生深色主题对文字颜色的强制覆盖
+        top_widgets = list(app.topLevelWidgets())
+        frozen = []
+        cls._bulk = True
         try:
-            app.setStyle("Fusion")
-        except Exception:
-            pass
+            for tw in top_widgets:
+                try:
+                    if tw.isVisible() and tw.updatesEnabled():
+                        tw.setUpdatesEnabled(False)
+                        frozen.append(tw)
+                except Exception:
+                    pass
 
-        # 2. 同步 Qt 6.5+ ColorScheme 提示
-        try:
-            hints = app.styleHints()
-            if hasattr(hints, "setColorScheme") and hasattr(Qt, "ColorScheme"):
-                scheme = Qt.ColorScheme.Dark if mode == cls.DARK else Qt.ColorScheme.Light
-                hints.setColorScheme(scheme)
-        except Exception:
-            pass
+            # 1. 使用跨平台一致的 Fusion 引擎，彻底隔离 Windows 11 原生深色主题对文字颜色的强制覆盖
+            #    （仅在尚未是 Fusion 时设置，避免每次切换主题都重建全部控件样式，耗时数秒）
+            try:
+                cur_style_name = ""
+                try:
+                    cur_style_name = (app.style().name() or "").lower()
+                except Exception:
+                    cur_style_name = ""
+                if cur_style_name != "fusion":
+                    app.setStyle("Fusion")
+            except Exception:
+                pass
 
-        # 3. 设置全局 Palette 与全局兜底 QSS
-        app.setPalette(cls.build_palette(mode))
-        app.setStyleSheet(cls.get_global_stylesheet(mode))
+            # 2. 同步 Qt 6.5+ ColorScheme 提示
+            try:
+                hints = app.styleHints()
+                if hasattr(hints, "setColorScheme") and hasattr(Qt, "ColorScheme"):
+                    scheme = Qt.ColorScheme.Dark if mode == cls.DARK else Qt.ColorScheme.Light
+                    hints.setColorScheme(scheme)
+            except Exception:
+                pass
 
-        # 4. 安装全局事件过滤器（拦截后续打开的弹窗、下拉菜单等）
-        if cls._event_filter is None:
-            cls._event_filter = _ThemeEventFilter(app)
-            app.installEventFilter(cls._event_filter)
+            # 3. 设置全局 Palette 与全局兜底 QSS
+            app.setPalette(cls.build_palette(mode))
+            app.setStyleSheet(cls.get_global_stylesheet(mode))
 
-        # 5. 遍历当前所有顶层窗口与子控件，实时转换局部 QSS
-        for top_widget in app.topLevelWidgets():
-            cls.refresh_widget_style(top_widget, recursive=True)
+            # 4. 暗色模式安装全局事件过滤器（拦截后续打开的弹窗、下拉菜单等）；亮色模式无需逐控件转换，移除过滤器以消除开销
+            if cls._event_filter is None:
+                cls._event_filter = _ThemeEventFilter(app)
+            if mode == cls.DARK and not cls._filter_installed:
+                app.installEventFilter(cls._event_filter)
+                cls._filter_installed = True
+            elif mode == cls.LIGHT and cls._filter_installed:
+                app.removeEventFilter(cls._event_filter)
+                cls._filter_installed = False
+
+            # 5. 遍历当前所有顶层窗口与子控件，实时转换局部 QSS（首次以亮色启动时无需遍历）
+            if mode == cls.DARK or mode_changed:
+                for top_widget in top_widgets:
+                    cls.refresh_widget_style(top_widget, recursive=True, adapt_items=True)
+        finally:
+            cls._bulk = False
+            for tw in frozen:
+                try:
+                    tw.setUpdatesEnabled(True)
+                except Exception:
+                    pass
 
     # ── 提供给业务代码的动态颜色辅助函数 ──
     @classmethod

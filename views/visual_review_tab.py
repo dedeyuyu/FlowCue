@@ -84,10 +84,12 @@ class VisualReviewTabWidget(QWidget):
         self._focus_udp_sock = None
         self._focus_notifier = None
         self.embedded_hwnd = 0
+        self._ready_hwnd = 0
         self.embedded_qwindow = None
         self.embedded_container = None
         self.is_docked = True
         self._engine_ready = False
+        self._poll_in_flight = False
         self._pending_folders = []
         self._active_workers = []
         self._saved_win_style = None
@@ -99,7 +101,7 @@ class VisualReviewTabWidget(QWidget):
         self._init_ui()
 
         self._poll_timer = QTimer(self)
-        self._poll_timer.setInterval(450)
+        self._poll_timer.setInterval(180)
         self._poll_timer.timeout.connect(self._poll_engine_status)
 
         app = QApplication.instance()
@@ -303,7 +305,7 @@ class VisualReviewTabWidget(QWidget):
 
         self.placeholder_label = QLabel(
             "👁️ 正在启动 VideoKit 原版「素材快速审核」极速引擎...\n\n"
-            "包含：按名字/文件夹分组 · 组内4x静音齐播对比 · 悬停0.5x~10x倍速预览 · 双击大图滚轮无级缩放 · ✓合格/△勉强/✕淘汰打标 · 定额抽取与防相邻打散导出"
+            "包含：按名字/文件夹分组 · 组内4x静音齐播对比 · 悬停0.5x~10x倍速预览 · 双击大图滚轮无级缩放 · 🗑️删除/⏸️暂缓一键处理 · 定额抽取与防相邻打散导出"
         )
         self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.placeholder_label.setStyleSheet(
@@ -329,7 +331,10 @@ class VisualReviewTabWidget(QWidget):
         if not self._is_process_alive():
             self.ensure_engine_started()
         elif self._engine_ready:
-            QTimer.singleShot(150, self.focus_embedded_electron_hwnd)
+            if self.is_docked and self._ready_hwnd and self._ready_hwnd != self.embedded_hwnd:
+                self._embed_hwnd(self._ready_hwnd)
+            else:
+                QTimer.singleShot(150, self.focus_embedded_electron_hwnd)
 
     def _is_process_alive(self) -> bool:
         return self.electron_proc is not None and self.electron_proc.poll() is None
@@ -377,6 +382,8 @@ class VisualReviewTabWidget(QWidget):
         self.ctrl_port = _pick_free_port(preferred=5182)
         self._engine_ready = False
         self.embedded_hwnd = 0
+        self._ready_hwnd = 0
+        self._poll_in_flight = False
 
         env = os.environ.copy()
         env["VIDEOKIT_ROOT"] = self.VIDEOKIT_ROOT
@@ -384,6 +391,7 @@ class VisualReviewTabWidget(QWidget):
         env["FLOWCUE_CTRL_PORT"] = str(self.ctrl_port)
         env["FLOWCUE_FOCUS_UDP_PORT"] = str(self.focus_udp_port)
         env["FLOWCUE_WORKBENCH_MODE"] = "visual-review"
+        env["FLOWCUE_HIDE_UNTIL_EMBED"] = "1"
         env.pop("ELECTRON_RUN_AS_NODE", None)
 
         self.status_badge.setText("⏳ 正在启动 素材快速审核 引擎...")
@@ -408,8 +416,12 @@ class VisualReviewTabWidget(QWidget):
     def _poll_engine_status(self):
         if not self._is_process_alive():
             self._poll_timer.stop()
+            self._poll_in_flight = False
             self.status_badge.setText("🔴 素材快速审核引擎已停止")
             return
+        if self._poll_in_flight:
+            return
+        self._poll_in_flight = True
 
         worker = _VisualReviewControlWorker(self.ctrl_port, "poll_status", "GET", "/status", parent=self)
         worker.finished_signal.connect(self._on_ctrl_finished)
@@ -432,11 +444,13 @@ class VisualReviewTabWidget(QWidget):
 
     def _on_ctrl_finished(self, action: str, ok: bool, data: dict, err: str):
         if action == "poll_status":
+            self._poll_in_flight = False
             if ok and data.get("ready") and data.get("hwnd"):
                 self._poll_timer.stop()
                 self._engine_ready = True
                 hwnd = int(data["hwnd"])
-                if self.is_docked and hwnd != self.embedded_hwnd:
+                self._ready_hwnd = hwnd
+                if self.is_docked and hwnd != self.embedded_hwnd and self.isVisible():
                     self._embed_hwnd(hwnd)
                 self.status_badge.setText("🟢 素材快速审核已就绪 (VideoKit 原生极速预览引擎)")
                 self.status_badge.setStyleSheet(
@@ -474,6 +488,7 @@ class VisualReviewTabWidget(QWidget):
                     self._saved_win_style = cur_style
                 new_style = cur_style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
                 user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
+                user32.ShowWindow(hwnd, 5)  # SW_SHOW
 
             if self.embedded_container is not None:
                 self.host_layout.removeWidget(self.embedded_container)
@@ -667,7 +682,9 @@ class VisualReviewTabWidget(QWidget):
             self.embedded_container = None
         self.embedded_qwindow = None
         self.embedded_hwnd = 0
+        self._ready_hwnd = 0
         self._engine_ready = False
+        self._poll_in_flight = False
 
         if self.electron_proc is not None:
             try:

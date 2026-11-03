@@ -8,6 +8,8 @@ Upgraded with VideoKit's high-concurrency pipeline:
 4. Word-level timestamp extraction (Gladia utterances.words / ElevenLabs words)
 5. Automatic breath/silence trimming (前留白 pad_before / 后留白 pad_after)
 6. Multi-threaded concurrent batch extraction with thread-safe multi-key rotation
+7. ApiKeyPool: multiple API keys in parallel, ≤ 3 concurrent requests per key, automatic
+   failover (401/429 → key disabled / cooled down, segment retried on another key)
 """
 import json
 import time
@@ -19,6 +21,240 @@ import requests
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from services.ffmpeg_helper import FFmpegHelper
+
+
+# Serializes ProjectModel.save() calls issued from concurrent verification worker threads
+_PROJECT_SAVE_LOCK = threading.RLock()
+
+
+def _shutdown_executor(executor):
+    """Shuts down a ThreadPoolExecutor, cancelling queued (not yet started) futures.
+    Running futures finish quickly because they poll the worker's cancel flag."""
+    try:
+        executor.shutdown(wait=True, cancel_futures=True)
+    except TypeError:  # Python < 3.9
+        executor.shutdown(wait=True)
+
+
+def compute_concurrency_plan(num_keys: int, parallel_tasks: int, parallel_segments: int,
+                             per_key_limit: int = 3, max_tasks: int = 4, max_segments: int = 40) -> dict:
+    """Computes the effective verification concurrency, capped by the number of API keys.
+
+    Theoretical max = parallel_tasks * parallel_segments (≤ 4 * 40 = 160).
+    Actual max      = min(theoretical, num_keys * per_key_limit)  (each key ≤ 3 concurrent requests).
+
+    When keys are insufficient the parallelism is automatically reduced: the number of parallel
+    tasks is kept (unless it alone exceeds the cap) and the per-task segment parallelism shrinks
+    so that tasks * segments ≈ cap. The ApiKeyPool still strictly enforces the cap at runtime.
+
+    Returns:
+        dict: {
+            "num_keys", "per_key_limit", "key_capacity", "requested_tasks", "requested_segments",
+            "requested_total", "effective_total", "tasks", "segments", "adjusted", "note"
+        }
+    """
+    try:
+        n_keys = max(0, int(num_keys or 0))
+    except (TypeError, ValueError):
+        n_keys = 0
+    per_key = max(1, int(per_key_limit or 3))
+    req_tasks = max(1, min(int(max_tasks or 4), int(parallel_tasks or 1)))
+    req_segs = max(1, min(int(max_segments or 40), int(parallel_segments or 1)))
+    requested = req_tasks * req_segs
+    cap = n_keys * per_key
+
+    if n_keys <= 0:
+        return {
+            "num_keys": 0,
+            "per_key_limit": per_key,
+            "key_capacity": 0,
+            "requested_tasks": req_tasks,
+            "requested_segments": req_segs,
+            "requested_total": requested,
+            "effective_total": 0,
+            "tasks": req_tasks,
+            "segments": 1,
+            "adjusted": True,
+            "note": "⚠️ 未检测到可用 API Key：仅能读取本地缓存结果，新的片段将无法核对",
+        }
+
+    effective = min(requested, cap)
+    if effective < requested:
+        eff_tasks = max(1, min(req_tasks, effective))
+        eff_segs = max(1, min(req_segs, -(-effective // eff_tasks)))  # ceil division
+        note = (
+            f"检测到 {n_keys} 个 Key，每个 Key 最多 {per_key} 个并发请求，最多并行 {cap} 个请求；"
+            f"已自动调整为：任务并行 {eff_tasks} × 分段并行 {eff_segs}（实际同时请求 ≤ {effective}，"
+            f"原设置 {req_tasks} × {req_segs} = {requested}）"
+        )
+        adjusted = True
+    else:
+        eff_tasks, eff_segs = req_tasks, req_segs
+        note = (
+            f"检测到 {n_keys} 个 Key（最多并行 {cap} 个请求），"
+            f"当前：任务并行 {eff_tasks} × 分段并行 {eff_segs} = {requested} 个并发请求"
+        )
+        adjusted = False
+
+    return {
+        "num_keys": n_keys,
+        "per_key_limit": per_key,
+        "key_capacity": cap,
+        "requested_tasks": req_tasks,
+        "requested_segments": req_segs,
+        "requested_total": requested,
+        "effective_total": effective,
+        "tasks": eff_tasks,
+        "segments": eff_segs,
+        "adjusted": adjusted,
+        "note": note,
+    }
+
+
+class ApiKeyPool:
+    """Thread-safe API key pool limiting concurrent requests per key (default ≤ 3 per Gladia key).
+
+    - `acquire()` blocks until a key slot is free and returns the least-loaded healthy key
+      (round-robin among equally loaded keys); returns None when cancelled or when every key
+      has been disabled (invalid / quota exhausted).
+    - `release(key, outcome)` frees the slot and records the outcome:
+        "ok"      → resets the key's failure strikes
+        "auth"    → key disabled for the rest of this pool's lifetime (401/402/403, invalid key)
+        "rate"    → key cooled down temporarily (429 / concurrency / quota), escalating per strike
+        "network" / "fatal" → key unaffected
+    """
+
+    DEFAULT_PER_KEY_LIMIT = 3
+    RATE_LIMIT_COOLDOWN_SECONDS = 15.0
+    MAX_RATE_STRIKES = 4
+    LONG_COOLDOWN_SECONDS = 300.0
+
+    def __init__(self, keys, per_key_limit: int = DEFAULT_PER_KEY_LIMIT):
+        uniq = []
+        for k in (keys or []):
+            k = str(k or "").strip()
+            if k and k not in uniq:
+                uniq.append(k)
+        self.keys = uniq
+        self.per_key_limit = max(1, int(per_key_limit or self.DEFAULT_PER_KEY_LIMIT))
+        self._cond = threading.Condition(threading.Lock())
+        self._in_use = {k: 0 for k in self.keys}
+        self._cooldown_until = {k: 0.0 for k in self.keys}
+        self._strikes = {k: 0 for k in self.keys}
+        self._disabled = {}
+        self._rr = 0
+        self._peak_in_use = 0
+        self._total_in_use = 0
+
+    # ── Introspection ───────────────────────────────────
+    @property
+    def capacity(self) -> int:
+        return len(self.keys) * self.per_key_limit
+
+    @property
+    def peak_concurrency(self) -> int:
+        return self._peak_in_use
+
+    def in_use_total(self) -> int:
+        with self._cond:
+            return self._total_in_use
+
+    def in_use_of(self, key) -> int:
+        with self._cond:
+            return self._in_use.get(key, 0)
+
+    def is_disabled(self, key) -> bool:
+        with self._cond:
+            return key in self._disabled
+
+    def usable_key_count(self) -> int:
+        with self._cond:
+            return sum(1 for k in self.keys if k not in self._disabled)
+
+    def all_disabled(self) -> bool:
+        with self._cond:
+            return self._all_disabled_locked()
+
+    def _all_disabled_locked(self) -> bool:
+        return bool(self.keys) and all(k in self._disabled for k in self.keys)
+
+    def status_text(self) -> str:
+        with self._cond:
+            now = time.monotonic()
+            disabled = len(self._disabled)
+            cooling = sum(1 for k in self.keys if k not in self._disabled and self._cooldown_until[k] > now)
+            return f"Key 池: 共 {len(self.keys)} 个 / 失效 {disabled} / 冷却中 {cooling} / 占用 {self._total_in_use}"
+
+    # ── Acquire / Release ───────────────────────────────
+    def _pick_locked(self, exclude) -> str | None:
+        n = len(self.keys)
+        if n == 0:
+            return None
+        now = time.monotonic()
+        exclude = exclude or set()
+        best = None
+        best_excluded = None
+        for off in range(n):
+            i = (self._rr + off) % n
+            k = self.keys[i]
+            if k in self._disabled or self._cooldown_until[k] > now:
+                continue
+            load = self._in_use[k]
+            if load >= self.per_key_limit:
+                continue
+            if k in exclude:
+                if best_excluded is None or load < best_excluded[2]:
+                    best_excluded = (i, k, load)
+                continue
+            if best is None or load < best[2]:
+                best = (i, k, load)
+        if best is None and best_excluded is not None:
+            # Only fall back to an already-tried key when every healthy key has been tried
+            healthy = [k for k in self.keys if k not in self._disabled]
+            if all(k in exclude for k in healthy):
+                best = best_excluded
+        if best is None:
+            return None
+        self._rr = (best[0] + 1) % n
+        return best[1]
+
+    def acquire(self, exclude=None, cancel_check=None, timeout: float | None = None) -> str | None:
+        deadline = (time.monotonic() + float(timeout)) if timeout else None
+        with self._cond:
+            while True:
+                if callable(cancel_check) and cancel_check():
+                    return None
+                if not self.keys or self._all_disabled_locked():
+                    return None
+                key = self._pick_locked(exclude)
+                if key is not None:
+                    self._in_use[key] += 1
+                    self._total_in_use += 1
+                    self._peak_in_use = max(self._peak_in_use, self._total_in_use)
+                    return key
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                self._cond.wait(0.25)
+
+    def release(self, key, outcome: str = "ok"):
+        with self._cond:
+            if key in self._in_use and self._in_use[key] > 0:
+                self._in_use[key] -= 1
+                self._total_in_use = max(0, self._total_in_use - 1)
+            if key in self._strikes:
+                if outcome == "ok":
+                    self._strikes[key] = 0
+                elif outcome == "auth":
+                    self._disabled[key] = "auth"
+                elif outcome == "rate":
+                    self._strikes[key] += 1
+                    strikes = self._strikes[key]
+                    if strikes >= self.MAX_RATE_STRIKES:
+                        cooldown = self.LONG_COOLDOWN_SECONDS
+                    else:
+                        cooldown = self.RATE_LIMIT_COOLDOWN_SECONDS * strikes
+                    self._cooldown_until[key] = time.monotonic() + cooldown
+            self._cond.notify_all()
 
 
 class SpeechExtractor:
@@ -120,8 +356,14 @@ class SpeechExtractor:
     # Gladia v2 Fast Extraction (with FFmpeg 16kHz audio + word timings)
     # ═══════════════════════════════════════════════════════
     @staticmethod
-    def extract_with_gladia(video_path, api_key, language="es", use_cache=True):
+    def extract_with_gladia(video_path, api_key, language="es", use_cache=True,
+                            prepared_audio_path=None, video_duration=None, cancel_check=None):
         """Extracts speech text and word-level timestamps from a video file using Gladia API v2.
+
+        Optional args (used by the parallel key-pool pipeline):
+            prepared_audio_path: already-extracted lightweight audio file to upload (skips FFmpeg).
+            video_duration: already-probed video duration in seconds (skips ffprobe).
+            cancel_check: callable returning True to abort polling early.
 
         Returns:
             dict: {
@@ -144,8 +386,12 @@ class SpeechExtractor:
                 return cached
 
         # Probe video duration and extract lightweight 16kHz mono audio for instant upload
-        video_duration = FFmpegHelper.get_media_duration(video_path)
-        upload_file_path = Path(FFmpegHelper.extract_fast_audio_for_asr(video_path))
+        if video_duration is None or float(video_duration or 0.0) <= 0:
+            video_duration = FFmpegHelper.get_media_duration(video_path)
+        if prepared_audio_path and Path(prepared_audio_path).exists():
+            upload_file_path = Path(prepared_audio_path)
+        else:
+            upload_file_path = Path(FFmpegHelper.extract_fast_audio_for_asr(video_path))
         mime_type = "audio/mpeg" if upload_file_path.suffix.lower() == ".mp3" else (
             "audio/wav" if upload_file_path.suffix.lower() == ".wav" else "video/mp4"
         )
@@ -213,6 +459,11 @@ class SpeechExtractor:
 
             # Step 3: Fast polling (0.6s interval)
             for attempt in range(SpeechExtractor.MAX_POLL_ATTEMPTS):
+                if callable(cancel_check) and cancel_check():
+                    return {
+                        "success": False, "text": "", "words": [], "video_duration": video_duration,
+                        "error": "已取消", "cancelled": True,
+                    }
                 time.sleep(SpeechExtractor.POLL_INTERVAL_SECONDS)
 
                 poll_response = session.get(
@@ -303,8 +554,12 @@ class SpeechExtractor:
     # ElevenLabs Scribe Fast Extraction (with FFmpeg 16kHz audio + word timings)
     # ═══════════════════════════════════════════════════════
     @staticmethod
-    def extract_with_elevenlabs(video_path, api_key, language="es", use_cache=True):
+    def extract_with_elevenlabs(video_path, api_key, language="es", use_cache=True,
+                                prepared_audio_path=None, video_duration=None, cancel_check=None):
         """Extracts speech text and word-level timestamps using ElevenLabs Speech-to-Text API.
+
+        Optional args `prepared_audio_path` / `video_duration` skip FFmpeg/ffprobe when already
+        prepared by the parallel key-pool pipeline (`cancel_check` is accepted for API symmetry).
 
         Returns:
             dict: {
@@ -326,8 +581,12 @@ class SpeechExtractor:
                     cached["video_duration"] = FFmpegHelper.get_media_duration(video_path)
                 return cached
 
-        video_duration = FFmpegHelper.get_media_duration(video_path)
-        upload_file_path = Path(FFmpegHelper.extract_fast_audio_for_asr(video_path))
+        if video_duration is None or float(video_duration or 0.0) <= 0:
+            video_duration = FFmpegHelper.get_media_duration(video_path)
+        if prepared_audio_path and Path(prepared_audio_path).exists():
+            upload_file_path = Path(prepared_audio_path)
+        else:
+            upload_file_path = Path(FFmpegHelper.extract_fast_audio_for_asr(video_path))
         mime_type = "audio/mpeg" if upload_file_path.suffix.lower() == ".mp3" else (
             "audio/wav" if upload_file_path.suffix.lower() == ".wav" else "video/mp4"
         )
@@ -891,6 +1150,148 @@ class SpeechExtractor:
 
         return {"success": False, "text": "", "words": [], "video_duration": 0.0, "error": last_error, "key_used": ""}
 
+    # ═══════════════════════════════════════════════════════
+    # Multi-key parallel pipeline (ApiKeyPool: ≤ 3 concurrent requests per key)
+    # ═══════════════════════════════════════════════════════
+    @staticmethod
+    def classify_api_error(error_text: str) -> str:
+        """Classifies an extraction error string into "auth" | "rate" | "network" | "fatal"."""
+        e = str(error_text or "")
+        low = e.lower()
+        if "轮询次数已达上限" in e:
+            return "fatal"
+        if any(s in e for s in ("HTTP 401", "HTTP 402", "HTTP 403", "无效", "过期")) or any(
+            s in low for s in ("invalid api key", "invalid key", "unauthorized", "forbidden", "payment required")
+        ):
+            return "auth"
+        if any(s in e for s in ("HTTP 429", "超限")) or any(
+            s in low for s in ("rate limit", "quota", "concurren", "too many", "exceeded", "limit reached")
+        ):
+            return "rate"
+        if any(s in e for s in ("超时", "网络连接失败", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")) or any(
+            s in low for s in ("timeout", "timed out", "connection")
+        ):
+            return "network"
+        return "fatal"
+
+    @staticmethod
+    def create_key_pool(config_manager, engine: str = "gladia") -> "ApiKeyPool":
+        """Builds an ApiKeyPool from the configured keys of the given engine."""
+        keys = []
+        if config_manager is not None:
+            if hasattr(config_manager, "get_speech_keys"):
+                keys = config_manager.get_speech_keys(engine)
+            elif engine == "elevenlabs":
+                keys = list(getattr(config_manager, "elevenlabs_api_keys", []) or [])
+            else:
+                keys = list(getattr(config_manager, "gladia_api_keys", []) or [])
+        per_key = int(getattr(config_manager, "SPEECH_MAX_CONCURRENT_PER_KEY", ApiKeyPool.DEFAULT_PER_KEY_LIMIT) or 3)
+        return ApiKeyPool(keys, per_key_limit=per_key)
+
+    @staticmethod
+    def extract_with_pool(video_path, engine, key_pool, language="es", use_cache=True,
+                          cancel_check=None, max_attempts=None):
+        """Extracts text + word timings using a shared ApiKeyPool (thread-safe, multi-key parallel).
+
+        - Local cache hits never consume a key slot.
+        - FFmpeg audio extraction / ffprobe happen BEFORE taking a key slot, so slots are only
+          held during network I/O.
+        - Auth failures (401/402/403) disable the key; rate/quota failures (429...) cool it down;
+          the segment is retried on another key. Network errors are retried up to 2 times.
+
+        Returns:
+            dict: same shape as extract_with_retry (+ "cancelled": bool on cancellation)
+        """
+        def _fail(msg, dur=0.0, cancelled=False):
+            return {
+                "success": False, "text": "", "words": [], "video_duration": dur,
+                "error": msg, "key_used": "", "cancelled": cancelled,
+            }
+
+        def _is_cancelled():
+            return bool(callable(cancel_check) and cancel_check())
+
+        if use_cache:
+            cached = SpeechExtractor.load_cached_transcription(video_path)
+            if cached:
+                if cached.get("video_duration", 0.0) <= 0:
+                    cached["video_duration"] = FFmpegHelper.get_media_duration(video_path)
+                cached["key_used"] = "cache"
+                return cached
+
+        if engine == "gladia":
+            extract_fn = SpeechExtractor.extract_with_gladia
+            engine_name = "Gladia"
+        elif engine == "elevenlabs":
+            extract_fn = SpeechExtractor.extract_with_elevenlabs
+            engine_name = "ElevenLabs"
+        else:
+            return _fail(f"不支持的引擎: {engine}")
+
+        if key_pool is None or not getattr(key_pool, "keys", None):
+            return _fail(f"未配置 {engine_name} API Key，请在规则设置中添加")
+
+        vp = Path(video_path)
+        if not vp.exists():
+            return _fail(f"文件不存在: {vp}")
+        if _is_cancelled():
+            return _fail("已取消", cancelled=True)
+
+        video_duration = FFmpegHelper.get_media_duration(vp)
+        audio_path = FFmpegHelper.extract_fast_audio_for_asr(vp)
+
+        attempts = int(max_attempts or max(3, min(8, len(key_pool.keys) + 2)))
+        tried = set()
+        last_error = ""
+        network_retries = 0
+
+        for _ in range(attempts):
+            if _is_cancelled():
+                return _fail("已取消", video_duration, cancelled=True)
+            api_key = key_pool.acquire(exclude=tried, cancel_check=cancel_check)
+            if api_key is None:
+                if _is_cancelled():
+                    return _fail("已取消", video_duration, cancelled=True)
+                last_error = (
+                    f"所有 {engine_name} API Key 均不可用（无效 / 额度用尽）"
+                    + (f"；最后错误: {last_error}" if last_error else "")
+                )
+                break
+
+            try:
+                result = extract_fn(
+                    vp, api_key, language, use_cache=False,
+                    prepared_audio_path=audio_path, video_duration=video_duration,
+                    cancel_check=cancel_check,
+                )
+            except Exception as exc:
+                result = {"success": False, "text": "", "words": [], "video_duration": video_duration,
+                          "error": f"{engine_name} 提取异常: {exc}"}
+
+            if result.get("success"):
+                key_pool.release(api_key, "ok")
+                result["key_used"] = api_key[:8] + "..."
+                return result
+
+            if result.get("cancelled"):
+                key_pool.release(api_key, "fatal")
+                result.setdefault("key_used", "")
+                return result
+
+            last_error = result.get("error", "未知错误")
+            outcome = SpeechExtractor.classify_api_error(last_error)
+            key_pool.release(api_key, outcome)
+
+            if outcome in ("auth", "rate"):
+                tried.add(api_key)
+                continue
+            if outcome == "network" and network_retries < 2:
+                network_retries += 1
+                continue
+            break
+
+        return _fail(last_error or "未知错误", video_duration)
+
 
 class ExtractionWorker(QThread):
     """High-concurrency background worker thread for batch speech extraction & breath trimming.
@@ -918,6 +1319,7 @@ class ExtractionWorker(QThread):
         use_cache=True,
         max_workers=8,
         parent=None,
+        key_pool=None,
     ):
         super().__init__(parent)
         self.segments_to_process = segments_to_process
@@ -927,8 +1329,14 @@ class ExtractionWorker(QThread):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.use_cache = use_cache
-        self.max_workers = max(1, min(16, int(max_workers or 8)))
+        # Desired segment parallelism (分段并行数, 1..40); actual value is capped by keys * 3 in run()
+        self.max_workers = max(1, min(40, int(max_workers or 8)))
+        self.key_pool = key_pool
+        self.concurrency_plan = None
         self._cancelled = False
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancelled or self.isInterruptionRequested())
 
     def cancel(self):
         """Requests cancellation of the extraction process."""
@@ -951,14 +1359,17 @@ class ExtractionWorker(QThread):
         if self._cancelled or self.isInterruptionRequested():
             return {"cancelled": True, "segment_index": seg_idx}
 
-        result = SpeechExtractor.extract_with_retry(
+        result = SpeechExtractor.extract_with_pool(
             video_path,
             self.engine,
-            self.config_manager,
+            self.key_pool,
             self.language,
-            max_retries=4,
             use_cache=(not force_no_cache),
+            cancel_check=self._is_cancelled,
         )
+
+        if result.get("cancelled"):
+            return {"cancelled": True, "segment_index": seg_idx}
 
         if not result.get("success"):
             return {
@@ -1012,16 +1423,20 @@ class ExtractionWorker(QThread):
 
         self.config_manager.reset_key_rotation()
 
-        # Scale concurrency smartly based on key count (minimum 4 concurrent workers even with 1 key)
-        if self.engine == "gladia":
-            key_cnt = max(1, len(self.config_manager.gladia_api_keys))
-        else:
-            key_cnt = max(1, len(self.config_manager.elevenlabs_api_keys))
-        workers = min(total, max(4, min(self.max_workers, key_cnt * 4)))
+        # Multi-key pool: each key ≤ 3 concurrent requests → segment parallelism capped by keys * 3
+        if self.key_pool is None:
+            self.key_pool = SpeechExtractor.create_key_pool(self.config_manager, self.engine)
+        plan = compute_concurrency_plan(
+            len(self.key_pool.keys), 1, self.max_workers,
+            per_key_limit=self.key_pool.per_key_limit, max_tasks=1, max_segments=40,
+        )
+        self.concurrency_plan = plan
+        workers = max(1, min(total, plan["effective_total"] or 1))
 
-        self.progress.emit(0, total, f"⚡ 正在高速并发核对 ({workers} 线程并发)...")
+        self.progress.emit(0, total, f"⚡ 正在高速并发核对 ({workers} 线程并发) · {plan['note']}")
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
             future_to_seg = {
                 executor.submit(self._process_single_segment, seg_info): seg_info
                 for seg_info in self.segments_to_process
@@ -1073,12 +1488,21 @@ class ExtractionWorker(QThread):
                         f"⚠️ 第 {seg_idx + 1:02d} 段失败 ({completed_count}/{total})",
                     )
                     self.segment_done.emit(seg_idx, "", 0.0)
+        finally:
+            _shutdown_executor(executor)
 
         self.finished.emit(success_count, total, errors)
 
 
 class BatchMultiProjectVerifyWorker(QThread):
-    """Parallel multi-project batch subtitle verification worker (up to 4 tasks in parallel).
+    """Parallel multi-project batch subtitle verification worker.
+
+    Concurrency model:
+        - 任务并行数 (max_parallel_tasks, 1..4): projects verified at the same time
+        - 分段并行数 (max_parallel_segments, 1..40): segments per project verified concurrently
+        - Theoretical max = tasks * segments (≤ 160); actual concurrency is capped by the shared
+          ApiKeyPool (each API key ≤ 3 concurrent requests → total ≤ num_keys * 3). When keys are
+          insufficient the parallelism is automatically reduced (see `concurrency_note`).
 
     Signals:
         task_started(str): project_id
@@ -1086,6 +1510,7 @@ class BatchMultiProjectVerifyWorker(QThread):
         task_finished(str, dict): (project_id, result_summary_dict)
         overall_progress(int, int, str): (completed_tasks, total_tasks, status_text)
         all_finished(int, int, list): (success_tasks_count, total_tasks_count, all_results_list)
+        concurrency_note(str): human-readable note describing the effective concurrency / auto-adjustment
     """
 
     task_started = pyqtSignal(str)
@@ -1093,8 +1518,11 @@ class BatchMultiProjectVerifyWorker(QThread):
     task_finished = pyqtSignal(str, dict)
     overall_progress = pyqtSignal(int, int, str)
     all_finished = pyqtSignal(int, int, list)
+    concurrency_note = pyqtSignal(str)
 
     MAX_PARALLEL_TASKS_LIMIT = 4
+    MAX_PARALLEL_SEGMENTS_LIMIT = 40
+    INCREMENTAL_SAVE_EVERY = 10
 
     def __init__(
         self,
@@ -1108,6 +1536,8 @@ class BatchMultiProjectVerifyWorker(QThread):
         skip_already_checked: bool = True,
         force_no_cache: bool = False,
         parent=None,
+        max_parallel_segments: int = None,
+        key_pool=None,
     ):
         super().__init__(parent)
         self.projects_list = list(projects_list or [])
@@ -1118,11 +1548,23 @@ class BatchMultiProjectVerifyWorker(QThread):
         self.max_parallel_tasks = max(
             1, min(self.MAX_PARALLEL_TASKS_LIMIT, int(max_parallel_tasks or 4))
         )
+        if max_parallel_segments is None:
+            max_parallel_segments = getattr(config_manager, "verify_parallel_segments", 10)
+        # Strictly clamp per-task segment concurrency to [1, 40]
+        self.max_parallel_segments = max(
+            1, min(self.MAX_PARALLEL_SEGMENTS_LIMIT, int(max_parallel_segments or 10))
+        )
         self.pad_before = float(pad_before)
         self.pad_after = float(pad_after)
         self.skip_already_checked = bool(skip_already_checked)
         self.force_no_cache = bool(force_no_cache)
+        self.key_pool = key_pool
+        self.concurrency_plan = None
+        self._seg_workers = 1
         self._cancelled = False
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancelled or self.isInterruptionRequested())
 
     def cancel(self):
         self._cancelled = True
@@ -1152,9 +1594,31 @@ class BatchMultiProjectVerifyWorker(QThread):
             base_dir = self.base_storage_path or proj_path.parent
             report = VideoChecker.check_project_videos(model, proj_path, base_storage_path=base_dir)
 
+            # Check if any newly generated replacement videos exist in pre_relocate_dir
+            pre_dir = report.get("pre_relocate_dir", "")
+            post_dir = Path(report.get("post_relocate_dir", str(proj_path / "downloads" / "videos")))
+            replaced_indices = set()
+            if pre_dir and Path(pre_dir).exists():
+                import shutil
+                post_dir.mkdir(parents=True, exist_ok=True)
+                for i, d in enumerate(report.get("segments_detail", [])):
+                    exp_name = d.get("download_name", f"{i + 1:02d}.mp4")
+                    cand = Path(pre_dir) / exp_name
+                    if cand.exists():
+                        target = post_dir / exp_name
+                        try:
+                            if target.exists():
+                                target.unlink()
+                            shutil.move(str(cand), str(target))
+                            SpeechExtractor.invalidate_cache(target)
+                            replaced_indices.add(i)
+                        except Exception:
+                            pass
+
             # Auto-relocate any pending videos in Flow/ download folder
             if report.get("pending_count", 0) > 0:
                 VideoChecker.relocate_found_videos(report)
+            if replaced_indices or report.get("pending_count", 0) > 0:
                 report = VideoChecker.check_project_videos(model, proj_path, base_storage_path=base_dir)
 
             segments = model.spanish_segments
@@ -1190,7 +1654,7 @@ class BatchMultiProjectVerifyWorker(QThread):
                 existing_ext = seg.get("extracted_text", "")
 
                 # Always refresh similarity for already-extracted segments (e.g. Spanish number words fix)
-                if existing_ext and orig_text:
+                if existing_ext and orig_text and i not in replaced_indices:
                     recalc_sim = SpeechExtractor.calculate_similarity(orig_text, existing_ext)
                     if abs(float(seg.get("similarity_score", 0.0) or 0.0) - recalc_sim) >= 0.1:
                         seg["similarity_score"] = recalc_sim
@@ -1207,7 +1671,9 @@ class BatchMultiProjectVerifyWorker(QThread):
                 if not Path(vp).exists():
                     continue
 
-                if (
+                if i in replaced_indices:
+                    SpeechExtractor.invalidate_cache(vp)
+                elif (
                     self.skip_already_checked
                     and not self.force_no_cache
                     and seg.get("checked", False)
@@ -1220,6 +1686,7 @@ class BatchMultiProjectVerifyWorker(QThread):
                     "segment_index": i,
                     "video_path": vp,
                     "original_text": orig_text,
+                    "force_no_cache": (i in replaced_indices),
                 })
 
             total_to_extract = len(to_extract)
@@ -1228,7 +1695,8 @@ class BatchMultiProjectVerifyWorker(QThread):
 
             if total_to_extract == 0:
                 if modified:
-                    model.save()
+                    with _PROJECT_SAVE_LOCK:
+                        model.save()
                 checked_now = sum(1 for s in segments if s.get("checked", False))
                 flagged_now = sum(
                     1
@@ -1257,23 +1725,25 @@ class BatchMultiProjectVerifyWorker(QThread):
                 proj_id, 0, total_to_extract, f"🔄 正在核对 (0/{total_to_extract})..."
             )
 
-            # Use 2 intra-task threads so 4 parallel tasks * 2 threads = up to 8 concurrent segment requests
-            intra_workers = min(total_to_extract, 2)
+            # 分段并行数: per-task segment threads (actual API concurrency enforced by the shared key pool)
+            intra_workers = max(1, min(total_to_extract, int(self._seg_workers or 1)))
 
             def _extract_seg_item(item):
-                if self._cancelled or self.isInterruptionRequested():
+                if self._is_cancelled():
                     return {"cancelled": True, "segment_index": item["segment_index"]}
                 s_idx = item["segment_index"]
                 v_path = item["video_path"]
                 o_text = item["original_text"]
-                res = SpeechExtractor.extract_with_retry(
+                res = SpeechExtractor.extract_with_pool(
                     v_path,
                     self.engine,
-                    self.config_manager,
+                    self.key_pool,
                     language=language,
-                    max_retries=4,
-                    use_cache=(not self.force_no_cache),
+                    use_cache=(not self.force_no_cache and not item.get("force_no_cache", False)),
+                    cancel_check=self._is_cancelled,
                 )
+                if res.get("cancelled"):
+                    return {"cancelled": True, "segment_index": s_idx}
                 if not res.get("success"):
                     return {
                         "cancelled": False,
@@ -1306,7 +1776,9 @@ class BatchMultiProjectVerifyWorker(QThread):
                 }
 
             done_in_task = 0
-            with ThreadPoolExecutor(max_workers=intra_workers) as seg_pool:
+            unsaved_results = 0
+            seg_pool = ThreadPoolExecutor(max_workers=intra_workers)
+            try:
                 futs = {seg_pool.submit(_extract_seg_item, it): it for it in to_extract}
                 for fut in as_completed(futs):
                     if self._cancelled or self.isInterruptionRequested():
@@ -1359,6 +1831,12 @@ class BatchMultiProjectVerifyWorker(QThread):
 
                         extracted_ok += 1
                         modified = True
+                        unsaved_results += 1
+                        # Incremental, lock-serialized save so progress survives cancel / crash
+                        if unsaved_results >= self.INCREMENTAL_SAVE_EVERY:
+                            with _PROJECT_SAVE_LOCK:
+                                model.save()
+                            unsaved_results = 0
                         self.task_progress.emit(
                             proj_id,
                             done_in_task,
@@ -1374,9 +1852,12 @@ class BatchMultiProjectVerifyWorker(QThread):
                             total_to_extract,
                             f"⚠️ 第 {s_idx + 1:02d} 段失败 ({done_in_task}/{total_to_extract})",
                         )
+            finally:
+                _shutdown_executor(seg_pool)
 
             if modified:
-                model.save()
+                with _PROJECT_SAVE_LOCK:
+                    model.save()
 
             checked_now = sum(1 for s in segments if s.get("checked", False))
             flagged_now = sum(
@@ -1422,14 +1903,33 @@ class BatchMultiProjectVerifyWorker(QThread):
             return
 
         self.config_manager.reset_key_rotation()
-        workers = min(total_tasks, self.max_parallel_tasks)
-        self.overall_progress.emit(0, total_tasks, f"🚀 正在并列核对所有任务 (并发任务数: {workers})...")
+
+        # Shared multi-key pool across ALL parallel tasks: each key ≤ 3 concurrent requests
+        if self.key_pool is None:
+            self.key_pool = SpeechExtractor.create_key_pool(self.config_manager, self.engine)
+        plan = compute_concurrency_plan(
+            len(self.key_pool.keys),
+            min(self.max_parallel_tasks, total_tasks),
+            self.max_parallel_segments,
+            per_key_limit=self.key_pool.per_key_limit,
+            max_tasks=self.MAX_PARALLEL_TASKS_LIMIT,
+            max_segments=self.MAX_PARALLEL_SEGMENTS_LIMIT,
+        )
+        self.concurrency_plan = plan
+        self._seg_workers = max(1, int(plan["segments"]))
+        workers = max(1, min(total_tasks, int(plan["tasks"])))
+        self.concurrency_note.emit(plan["note"])
+        self.overall_progress.emit(
+            0, total_tasks,
+            f"🚀 正在并列核对所有任务 (任务并行 {workers} × 分段并行 {self._seg_workers}) · {plan['note']}",
+        )
 
         completed_tasks = 0
         success_tasks = 0
         all_results = []
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             fut_to_proj = {
                 pool.submit(self._verify_single_project, proj): proj
                 for proj in self.projects_list
@@ -1458,6 +1958,8 @@ class BatchMultiProjectVerifyWorker(QThread):
                     total_tasks,
                     f"📊 总任务进度: {completed_tasks}/{total_tasks} (已完成: {res.get('project_id', '')})",
                 )
+        finally:
+            _shutdown_executor(pool)
 
         self.all_finished.emit(success_tasks, total_tasks, all_results)
 

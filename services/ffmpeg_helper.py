@@ -7,9 +7,12 @@ and cross-platform subprocess execution without console window popups.
 import os
 import sys
 import json
+import time
+import uuid
 import shutil
 import tempfile
 import hashlib
+import threading
 import subprocess
 from pathlib import Path
 
@@ -242,6 +245,12 @@ class FFmpegHelper:
         if out_mp3.exists() and out_mp3.stat().st_size > 256:
             return str(out_mp3)
 
+        # Write to a unique temporary file first and atomically move it into place, so that
+        # concurrent workers (multi-task / multi-segment parallel verification) never read a
+        # half-written audio file or collide on the same output filename.
+        unique_tag = f"{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:6]}"
+        tmp_mp3 = temp_dir / f"{video_path.stem}_{digest}.part{unique_tag}.mp3"
+
         ffmpeg_bin = cls.get_ffmpeg_path()
         cmd = [
             ffmpeg_bin,
@@ -252,7 +261,7 @@ class FFmpegHelper:
             "-ac", "1",
             "-ar", "16000",
             "-b:a", "48k",
-            str(out_mp3),
+            str(tmp_mp3),
         ]
         try:
             res = subprocess.run(
@@ -262,15 +271,19 @@ class FFmpegHelper:
                 timeout=30,
                 creationflags=_SUBPROCESS_FLAGS,
             )
-            if res.returncode == 0 and out_mp3.exists() and out_mp3.stat().st_size > 256:
-                return str(out_mp3)
+            if res.returncode == 0 and tmp_mp3.exists() and tmp_mp3.stat().st_size > 256:
+                if cls._atomic_move(tmp_mp3, out_mp3):
+                    return str(out_mp3)
         except Exception:
             pass
+        finally:
+            cls._safe_unlink(tmp_mp3)
 
         # Fallback: try PCM 16kHz wav if libmp3lame is unavailable
         out_wav = temp_dir / f"{video_path.stem}_{digest}.wav"
         if out_wav.exists() and out_wav.stat().st_size > 256:
             return str(out_wav)
+        tmp_wav = temp_dir / f"{video_path.stem}_{digest}.part{unique_tag}.wav"
         try:
             cmd_wav = [
                 ffmpeg_bin,
@@ -281,7 +294,7 @@ class FFmpegHelper:
                 "-ac", "1",
                 "-ar", "16000",
                 "-c:a", "pcm_s16le",
-                str(out_wav),
+                str(tmp_wav),
             ]
             res2 = subprocess.run(
                 cmd_wav,
@@ -290,9 +303,85 @@ class FFmpegHelper:
                 timeout=30,
                 creationflags=_SUBPROCESS_FLAGS,
             )
-            if res2.returncode == 0 and out_wav.exists() and out_wav.stat().st_size > 256:
-                return str(out_wav)
+            if res2.returncode == 0 and tmp_wav.exists() and tmp_wav.stat().st_size > 256:
+                if cls._atomic_move(tmp_wav, out_wav):
+                    return str(out_wav)
+        except Exception:
+            pass
+        finally:
+            cls._safe_unlink(tmp_wav)
+
+        return str(video_path)
+
+    @staticmethod
+    def _atomic_move(src: Path, dst: Path) -> bool:
+        """Atomically replaces dst with src. Returns True on success (or if another worker
+        already produced a valid dst in the meantime)."""
+        try:
+            os.replace(str(src), str(dst))
+            return True
+        except Exception:
+            try:
+                return dst.exists() and dst.stat().st_size > 256
+            except Exception:
+                return False
+
+    @staticmethod
+    def _safe_unlink(path: Path):
+        try:
+            if path and Path(path).exists():
+                Path(path).unlink()
         except Exception:
             pass
 
-        return str(video_path)
+    @staticmethod
+    def run_cancellable(cmd, timeout: float = 600, is_cancelled_cb=None, poll_interval: float = 0.3):
+        """Runs a subprocess (e.g. ffmpeg) that can be terminated when `is_cancelled_cb()` returns True.
+
+        Each call spawns an independent process (no shared state), so it is safe to call from
+        multiple worker threads in parallel.
+
+        Returns:
+            tuple: (returncode: int, stdout: bytes, stderr: bytes, cancelled: bool)
+                   returncode is -1 on timeout / cancellation / launch failure.
+        """
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_SUBPROCESS_FLAGS,
+            )
+        except Exception as e:
+            return -1, b"", str(e).encode("utf-8", errors="replace"), False
+
+        start = time.monotonic()
+        out_chunks, err_chunks = b"", b""
+        while True:
+            try:
+                out, err = proc.communicate(timeout=poll_interval)
+                out_chunks += out or b""
+                err_chunks += err or b""
+                return proc.returncode, out_chunks, err_chunks, False
+            except subprocess.TimeoutExpired:
+                cancelled = bool(callable(is_cancelled_cb) and is_cancelled_cb())
+                timed_out = (time.monotonic() - start) > float(timeout or 600)
+                if cancelled or timed_out:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        out, err = proc.communicate(timeout=5)
+                        out_chunks += out or b""
+                        err_chunks += err or b""
+                    except Exception:
+                        pass
+                    msg = b"cancelled" if cancelled else b"timeout"
+                    return -1, out_chunks, (err_chunks + b"\n" + msg), cancelled
+            except Exception as e:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return -1, out_chunks, str(e).encode("utf-8", errors="replace"), False

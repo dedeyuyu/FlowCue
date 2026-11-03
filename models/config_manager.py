@@ -8,6 +8,7 @@ class ConfigManager:
     CONFIG_FILE_NAME = ".app_config.json"
     
     DEFAULT_MAX_BATCH_POINTS = 50
+    DEFAULT_MAX_SUBTASKS_PER_BATCH = 10  # Default max subtasks per batch/account in hosted mode (0 means unlimited)
     DEFAULT_MIN_SEGMENT_CHARS = 45  # Default 45 chars (0 means disabled)
     DEFAULT_EDGE_EXTRA_DURATION = 2  # Default extra seconds for first & last segments (capped at max 10s)
     DEFAULT_CHAR_DURATION_RULES = [
@@ -40,6 +41,22 @@ class ConfigManager:
         ("ar", "阿拉伯语 (Arabic)"),
         ("ne", "尼泊尔语 (Nepali)"),
     ]
+
+    # Auto breath-trimming default padding (前留白 / 后留白, seconds)
+    DEFAULT_BREATH_PAD_BEFORE = 0.10
+    DEFAULT_BREATH_PAD_AFTER = 0.15
+
+    # Speech-verify concurrency defaults
+    # Each Gladia API key supports at most 3 concurrent requests → max total = num_keys * 3
+    SPEECH_MAX_CONCURRENT_PER_KEY = 3
+    DEFAULT_VERIFY_PARALLEL_TASKS = 4      # 任务并行数 (1..4)
+    DEFAULT_VERIFY_PARALLEL_SEGMENTS = 10  # 分段并行数 (1..40)
+    MAX_VERIFY_PARALLEL_TASKS = 4
+    MAX_VERIFY_PARALLEL_SEGMENTS = 40
+
+    # Batch splice concurrency defaults
+    DEFAULT_SPLICE_PARALLEL_TASKS = 4      # 并行线程数 (1..4)
+    MAX_SPLICE_PARALLEL_TASKS = 4
     
     # Video generation default rules
     DEFAULT_TASK_INTERVAL = 5
@@ -104,6 +121,7 @@ class ConfigManager:
         
         self.base_path = ""
         self.max_batch_points = self.DEFAULT_MAX_BATCH_POINTS
+        self.max_subtasks_per_batch = self.DEFAULT_MAX_SUBTASKS_PER_BATCH
         self.min_segment_chars = self.DEFAULT_MIN_SEGMENT_CHARS
         self.edge_extra_duration = self.DEFAULT_EDGE_EXTRA_DURATION
         self.forced_split_marker = self.DEFAULT_FORCED_SPLIT_MARKER
@@ -116,6 +134,15 @@ class ConfigManager:
         self.speech_language = self.DEFAULT_SPEECH_LANGUAGE
         self._gladia_key_index = 0     # Current rotation index
         self._elevenlabs_key_index = 0 # Current rotation index
+
+        # Auto breath-trimming default padding (前留白 / 后留白)
+        self.breath_pad_before = self.DEFAULT_BREATH_PAD_BEFORE
+        self.breath_pad_after = self.DEFAULT_BREATH_PAD_AFTER
+
+        # Speech-verify / batch-splice concurrency settings
+        self.verify_parallel_tasks = self.DEFAULT_VERIFY_PARALLEL_TASKS
+        self.verify_parallel_segments = self.DEFAULT_VERIFY_PARALLEL_SEGMENTS
+        self.splice_parallel_tasks = self.DEFAULT_SPLICE_PARALLEL_TASKS
         
         # Plugin server settings
         self.enable_plugin_server = True
@@ -165,6 +192,10 @@ class ConfigManager:
                     data = json.load(f)
                     self.base_path = data.get("base_path", self.base_path)
                     self.max_batch_points = data.get("max_batch_points", self.DEFAULT_MAX_BATCH_POINTS)
+                    self.max_subtasks_per_batch = self._clamp_int(
+                        data.get("max_subtasks_per_batch", self.DEFAULT_MAX_SUBTASKS_PER_BATCH),
+                        0, 100, self.DEFAULT_MAX_SUBTASKS_PER_BATCH,
+                    )
                     self.min_segment_chars = data.get("min_segment_chars", self.DEFAULT_MIN_SEGMENT_CHARS)
                     try:
                         raw_edge_extra = data.get("edge_extra_duration", self.DEFAULT_EDGE_EXTRA_DURATION)
@@ -186,22 +217,52 @@ class ConfigManager:
                         self.duration_points_rules = [dict(r) for r in self.DEFAULT_DURATION_POINTS_RULES]
                     
                     # Load speech extraction settings
-                    self.gladia_api_keys = data.get("gladia_api_keys", [])
-                    self.elevenlabs_api_keys = data.get("elevenlabs_api_keys", [])
+                    # (backward compatible: legacy single-key fields "gladia_api_key" / "elevenlabs_api_key"
+                    #  and string values are merged into the key lists and count as one key each)
+                    self.gladia_api_keys = self._normalize_key_list(
+                        data.get("gladia_api_keys", []), data.get("gladia_api_key", "")
+                    )
+                    self.elevenlabs_api_keys = self._normalize_key_list(
+                        data.get("elevenlabs_api_keys", []), data.get("elevenlabs_api_key", "")
+                    )
                     self.speech_language = data.get("speech_language", self.DEFAULT_SPEECH_LANGUAGE)
+
+                    # Auto breath-trimming default padding (前留白 / 后留白)
+                    self.breath_pad_before = self._clamp_float(
+                        data.get("breath_pad_before", self.DEFAULT_BREATH_PAD_BEFORE),
+                        0.0, 2.0, self.DEFAULT_BREATH_PAD_BEFORE,
+                    )
+                    self.breath_pad_after = self._clamp_float(
+                        data.get("breath_pad_after", self.DEFAULT_BREATH_PAD_AFTER),
+                        0.0, 2.0, self.DEFAULT_BREATH_PAD_AFTER,
+                    )
+
+                    # Speech-verify / batch-splice concurrency settings
+                    self.verify_parallel_tasks = self._clamp_int(
+                        data.get("verify_parallel_tasks", self.DEFAULT_VERIFY_PARALLEL_TASKS),
+                        1, self.MAX_VERIFY_PARALLEL_TASKS, self.DEFAULT_VERIFY_PARALLEL_TASKS,
+                    )
+                    self.verify_parallel_segments = self._clamp_int(
+                        data.get("verify_parallel_segments", self.DEFAULT_VERIFY_PARALLEL_SEGMENTS),
+                        1, self.MAX_VERIFY_PARALLEL_SEGMENTS, self.DEFAULT_VERIFY_PARALLEL_SEGMENTS,
+                    )
+                    self.splice_parallel_tasks = self._clamp_int(
+                        data.get("splice_parallel_tasks", self.DEFAULT_SPLICE_PARALLEL_TASKS),
+                        1, self.MAX_SPLICE_PARALLEL_TASKS, self.DEFAULT_SPLICE_PARALLEL_TASKS,
+                    )
                     
                     # Environment variable overrides (supports comma- or newline-separated keys)
                     import os
                     env_gladia = os.environ.get("GLADIA_API_KEYS") or os.environ.get("GLADIA_API_KEY")
                     if env_gladia:
-                        k_list = [k.strip() for k in env_gladia.replace(",", "\n").splitlines() if k.strip()]
+                        k_list = self._normalize_key_list(env_gladia)
                         if k_list:
                             self.gladia_api_keys = k_list
                             self._gladia_from_env = True
 
                     env_eleven = os.environ.get("ELEVENLABS_API_KEYS") or os.environ.get("ELEVENLABS_API_KEY")
                     if env_eleven:
-                        k_list = [k.strip() for k in env_eleven.replace(",", "\n").splitlines() if k.strip()]
+                        k_list = self._normalize_key_list(env_eleven)
                         if k_list:
                             self.elevenlabs_api_keys = k_list
                             self._eleven_from_env = True
@@ -267,9 +328,17 @@ class ConfigManager:
         gladia_to_save = [] if getattr(self, "_gladia_from_env", False) else self.gladia_api_keys
         eleven_to_save = [] if getattr(self, "_eleven_from_env", False) else self.elevenlabs_api_keys
 
+        # Legacy single-key fields were merged into the key lists on load; drop them so a key
+        # removed by the user in settings does not re-appear from the legacy field.
+        if not getattr(self, "_gladia_from_env", False):
+            data.pop("gladia_api_key", None)
+        if not getattr(self, "_eleven_from_env", False):
+            data.pop("elevenlabs_api_key", None)
+
         data.update({
             "base_path": self.base_path or data.get("base_path", ""),
             "max_batch_points": self.max_batch_points,
+            "max_subtasks_per_batch": int(getattr(self, "max_subtasks_per_batch", self.DEFAULT_MAX_SUBTASKS_PER_BATCH)),
             "min_segment_chars": self.min_segment_chars,
             "edge_extra_duration": getattr(self, "edge_extra_duration", self.DEFAULT_EDGE_EXTRA_DURATION),
             "forced_split_marker": self.forced_split_marker,
@@ -278,6 +347,11 @@ class ConfigManager:
             "gladia_api_keys": gladia_to_save,
             "elevenlabs_api_keys": eleven_to_save,
             "speech_language": self.speech_language,
+            "breath_pad_before": round(float(getattr(self, "breath_pad_before", self.DEFAULT_BREATH_PAD_BEFORE)), 3),
+            "breath_pad_after": round(float(getattr(self, "breath_pad_after", self.DEFAULT_BREATH_PAD_AFTER)), 3),
+            "verify_parallel_tasks": int(getattr(self, "verify_parallel_tasks", self.DEFAULT_VERIFY_PARALLEL_TASKS)),
+            "verify_parallel_segments": int(getattr(self, "verify_parallel_segments", self.DEFAULT_VERIFY_PARALLEL_SEGMENTS)),
+            "splice_parallel_tasks": int(getattr(self, "splice_parallel_tasks", self.DEFAULT_SPLICE_PARALLEL_TASKS)),
             "enable_plugin_server": self.enable_plugin_server,
             "plugin_server_port": self.plugin_server_port,
             "enable_end_frame": self.enable_end_frame,
@@ -299,6 +373,7 @@ class ConfigManager:
 
     def reset_to_defaults(self):
         self.max_batch_points = self.DEFAULT_MAX_BATCH_POINTS
+        self.max_subtasks_per_batch = self.DEFAULT_MAX_SUBTASKS_PER_BATCH
         self.min_segment_chars = self.DEFAULT_MIN_SEGMENT_CHARS
         self.edge_extra_duration = self.DEFAULT_EDGE_EXTRA_DURATION
         self.char_duration_rules = [dict(r) for r in self.DEFAULT_CHAR_DURATION_RULES]
@@ -310,7 +385,54 @@ class ConfigManager:
         self.batch_default_aspect_ratio = self.DEFAULT_BATCH_ASPECT_RATIO
         self.default_video_model = self.DEFAULT_VIDEO_MODEL
         self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
+        self.breath_pad_before = self.DEFAULT_BREATH_PAD_BEFORE
+        self.breath_pad_after = self.DEFAULT_BREATH_PAD_AFTER
         self.save()
+
+    @staticmethod
+    def _normalize_key_list(*sources) -> list:
+        """Merges API keys from lists / comma- or newline-separated strings into a de-duplicated list
+        (order preserved). Used for backward-compatible loading of single-key and multi-key configs."""
+        keys = []
+        seen = set()
+        for src in sources:
+            if not src:
+                continue
+            if isinstance(src, str):
+                items = src.replace(",", "\n").splitlines()
+            elif isinstance(src, (list, tuple)):
+                items = []
+                for it in src:
+                    if isinstance(it, str):
+                        items.extend(it.replace(",", "\n").splitlines())
+            else:
+                continue
+            for k in items:
+                k = str(k).strip().strip("'\"").strip()
+                if k and k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+        return keys
+
+    @staticmethod
+    def _clamp_int(value, lo, hi, default):
+        try:
+            return max(lo, min(hi, int(value)))
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _clamp_float(value, lo, hi, default):
+        try:
+            return max(lo, min(hi, float(value)))
+        except (ValueError, TypeError):
+            return default
+
+    def get_speech_keys(self, engine: str = "gladia") -> list:
+        """Returns the configured API key list for the given speech engine ("gladia" / "elevenlabs")."""
+        if engine == "elevenlabs":
+            return list(self.elevenlabs_api_keys or [])
+        return list(self.gladia_api_keys or [])
 
     def get_duration_for_length(self, length, is_edge=False):
         """Calculates duration in seconds for a given character length.

@@ -462,8 +462,8 @@ class PropertyPanelMixin:
         self.lbl_prop_index.setText(f"当前句：第 {row + 1} 句")
         self.txt_prop_text.setPlainText(seg.get("text", ""))
         
-        # Refresh combo lists & placeholders
-        self.refresh_prop_image_combo_items()
+        # Refresh combo lists & placeholders（目录未变化时跳过图片下拉框重建）
+        self.refresh_prop_image_combo_items(only_if_changed=True)
         self.refresh_prop_template_motion_combos()
         
         # Select current image (首帧)
@@ -522,10 +522,27 @@ class PropertyPanelMixin:
         self.combo_prop_motion.blockSignals(False)
         self.combo_prop_mode.blockSignals(False)
 
-    def refresh_prop_image_combo_items(self):
-        self.combo_prop_image.blockSignals(True)
+    def refresh_prop_image_combo_items(self, only_if_changed=False):
+        """重建首帧/尾帧图片下拉框。
+
+        only_if_changed=True（点击分句时使用）：若 downloads 目录未变化则跳过重建，避免每次点击都遍历目录。
+        注意：此处使用「恢复调用前的 blockSignals 状态」而非直接解除屏蔽，
+        防止外层 on_table_selection_changed 的信号屏蔽被提前解除，导致点击一行触发多次保存与重复解码。
+        """
+        sig = None
+        if self.project_path:
+            try:
+                downloads_dir_sig = self.project_path / "downloads"
+                sig = (str(self.project_path), downloads_dir_sig.stat().st_mtime_ns if downloads_dir_sig.exists() else 0)
+            except Exception:
+                sig = None
+        if only_if_changed and sig is not None and sig == getattr(self, "_prop_img_sig", None) and self.combo_prop_image.count() > 0:
+            return
+
+        prev_block_img = self.combo_prop_image.blockSignals(True)
+        prev_block_end = None
         if hasattr(self, "combo_prop_end_image"):
-            self.combo_prop_end_image.blockSignals(True)
+            prev_block_end = self.combo_prop_end_image.blockSignals(True)
             
         current_data = self.combo_prop_image.currentData()
         current_end_data = self.combo_prop_end_image.currentData() if hasattr(self, "combo_prop_end_image") else None
@@ -560,9 +577,10 @@ class PropertyPanelMixin:
             if idx_end >= 0:
                 self.combo_prop_end_image.setCurrentIndex(idx_end)
                 
-        self.combo_prop_image.blockSignals(False)
-        if hasattr(self, "combo_prop_end_image"):
-            self.combo_prop_end_image.blockSignals(False)
+        self._prop_img_sig = sig
+        self.combo_prop_image.blockSignals(prev_block_img)
+        if hasattr(self, "combo_prop_end_image") and prev_block_end is not None:
+            self.combo_prop_end_image.blockSignals(prev_block_end)
 
     def get_small_image_icon(self, file_path, sync=False):
         """
@@ -649,6 +667,38 @@ class PropertyPanelMixin:
             if idx >= 0:
                 combo.setItemIcon(idx, icon)
 
+    def _load_preview_pixmap_cached(self, file_path, max_w=220, max_h=150):
+        """解码属性面板预览图（带 LRU 缓存 + JPEG draft 快速缩小解码），避免每次点击分句都全尺寸解码图片。"""
+        from PIL import Image
+        from PyQt6.QtGui import QImage, QPixmap
+        if not hasattr(self, "_preview_pix_cache"):
+            from collections import OrderedDict
+            self._preview_pix_cache = OrderedDict()
+        try:
+            st = os.stat(file_path)
+            key = (str(file_path), st.st_mtime_ns, st.st_size, max_w, max_h)
+        except Exception:
+            key = None
+        if key is not None and key in self._preview_pix_cache:
+            self._preview_pix_cache.move_to_end(key)
+            return self._preview_pix_cache[key]
+        with Image.open(file_path) as pil_img:
+            try:
+                pil_img.draft("RGB", (max_w * 2, max_h * 2))
+            except Exception:
+                pass
+            pil_img.thumbnail((max_w, max_h))
+            pil_img_rgba = pil_img.convert("RGBA")
+            width, height = pil_img_rgba.size
+            raw_data = pil_img_rgba.tobytes("raw", "RGBA")
+            qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
+            pixmap = QPixmap.fromImage(qimg)
+        if key is not None:
+            self._preview_pix_cache[key] = pixmap
+            while len(self._preview_pix_cache) > 120:
+                self._preview_pix_cache.popitem(last=False)
+        return pixmap
+
     def update_prop_image_preview(self, image_name):
         if not image_name:
             self.lbl_prop_preview.clear()
@@ -662,15 +712,7 @@ class PropertyPanelMixin:
             return
             
         try:
-            from PIL import Image
-            from PyQt6.QtGui import QImage, QPixmap
-            with Image.open(file_path) as pil_img:
-                pil_img.thumbnail((220, 150))
-                pil_img_rgba = pil_img.convert("RGBA")
-                width, height = pil_img_rgba.size
-                raw_data = pil_img_rgba.tobytes("raw", "RGBA")
-                qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
-                pixmap = QPixmap.fromImage(qimg)
+            pixmap = self._load_preview_pixmap_cached(file_path, 220, 150)
             self.lbl_prop_preview.setPixmap(pixmap)
         except Exception as e:
             print(f"Error loading preview: {e}")
@@ -692,15 +734,7 @@ class PropertyPanelMixin:
             return
             
         try:
-            from PIL import Image
-            from PyQt6.QtGui import QImage, QPixmap
-            with Image.open(file_path) as pil_img:
-                pil_img.thumbnail((220, 150))
-                pil_img_rgba = pil_img.convert("RGBA")
-                width, height = pil_img_rgba.size
-                raw_data = pil_img_rgba.tobytes("raw", "RGBA")
-                qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
-                pixmap = QPixmap.fromImage(qimg)
+            pixmap = self._load_preview_pixmap_cached(file_path, 220, 150)
             self.lbl_prop_end_preview.setPixmap(pixmap)
         except Exception as e:
             print(f"Error loading end preview: {e}")
@@ -808,8 +842,8 @@ class PropertyPanelMixin:
         if not hasattr(self, "combo_prop_template") or not self.template_manager:
             return
             
-        self.combo_prop_template.blockSignals(True)
-        self.combo_prop_motion.blockSignals(True)
+        prev_block_tpl = self.combo_prop_template.blockSignals(True)
+        prev_block_mot = self.combo_prop_motion.blockSignals(True)
         
         current_tpl = self.combo_prop_template.currentData()
         current_motion = self.combo_prop_motion.currentData()
@@ -843,8 +877,9 @@ class PropertyPanelMixin:
             if idx >= 0:
                 self.combo_prop_motion.setCurrentIndex(idx)
                 
-        self.combo_prop_template.blockSignals(False)
-        self.combo_prop_motion.blockSignals(False)
+        # 恢复调用前的信号屏蔽状态（不要直接解除，否则外层 on_table_selection_changed 的屏蔽失效）
+        self.combo_prop_template.blockSignals(prev_block_tpl)
+        self.combo_prop_motion.blockSignals(prev_block_mot)
         
         if hasattr(self, "combo_prop_mode") and self.combo_prop_mode.count() > 0:
             default_mode_code = getattr(self.config_manager, "default_generation_mode", "VIDEO_FRAMES") if self.config_manager else "VIDEO_FRAMES"

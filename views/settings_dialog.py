@@ -3,12 +3,22 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QSpinBox, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QMessageBox, QGroupBox, QAbstractItemView, 
                              QLineEdit, QComboBox, QTextEdit, QScrollArea, QWidget,
-                             QCheckBox, QGridLayout)
-from PyQt6.QtCore import Qt
+                             QCheckBox, QGridLayout, QDoubleSpinBox, QSizePolicy)
+from PyQt6.QtCore import Qt, QTimer
 
 
 class NoWheelSpinBox(QSpinBox):
     """QSpinBox that ignores mouse wheel events so scrolling the dialog never accidentally modifies values."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that ignores mouse wheel events so scrolling the dialog never accidentally modifies values."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -40,7 +50,11 @@ class SettingsDialog(QDialog):
 
     def init_ui(self):
         self.setWindowTitle("⚙️ 系统规则与积分设置 (Rules & Points Settings)")
-        self.resize(680, 750)
+        self.resize(740, 760)
+        self.setMinimumSize(420, 480)
+        self._current_import_cols_per_row = 0
+        self.import_col_labels = []
+        self.import_col_combos = []
         
         self.setStyleSheet("""
             QDialog {
@@ -67,7 +81,7 @@ class SettingsDialog(QDialog):
                 font-size: 13px;
                 color: #5D4037;
             }
-            QSpinBox {
+            QSpinBox, QDoubleSpinBox {
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
@@ -113,7 +127,9 @@ class SettingsDialog(QDialog):
         
         # Use a scroll area so the dialog doesn't overflow on small screens
         scroll_area = QScrollArea(self)
+        self.scroll_area = scroll_area
         scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_area.setStyleSheet("QScrollArea { border: none; background-color: #FAF6F0; }")
         scroll_content = QWidget()
         main_layout = QVBoxLayout(scroll_content)
@@ -129,36 +145,57 @@ class SettingsDialog(QDialog):
         from models.config_manager import ConfigManager as _CM
         for t_code, t_label in _CM.SUPPORTED_THEME_MODES:
             self.combo_theme_mode.addItem(t_label, t_code)
-        self.combo_theme_mode.setFixedWidth(210)
+        self.combo_theme_mode.setMinimumWidth(140)
+        self.combo_theme_mode.setMaximumWidth(210)
+        self.combo_theme_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_theme_mode.setMinimumContentsLength(6)
         self.combo_theme_mode.currentIndexChanged.connect(self._on_theme_combo_changed)
         theme_layout.addWidget(self.combo_theme_mode)
         lbl_theme_hint = QLabel("(* 支持一键切换亮色模式与暗色模式，也可直接在主窗口右上角快捷切换)")
+        lbl_theme_hint.setWordWrap(True)
         lbl_theme_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
         theme_layout.addWidget(lbl_theme_hint, stretch=1)
         main_layout.addWidget(group_theme)
         
-        # Section 1: Batch Points Budget & Forced Split Marker
-        group_points = QGroupBox("1. 单批次最高积分上限与强制断句标记 (Batch Settings)")
-        pts_layout = QHBoxLayout(group_points)
-        pts_layout.setContentsMargins(12, 12, 12, 12)
-        
+        # Section 1: Batch Points Budget, Max Subtasks & Forced Split Marker
+        group_points = QGroupBox("1. 单批次最高积分上限、子任务上限与强制断句标记 (Batch Settings)")
+        pts_outer_layout = QVBoxLayout(group_points)
+        pts_outer_layout.setContentsMargins(12, 12, 12, 12)
+        pts_outer_layout.setSpacing(6)
+
+        pts_layout = QHBoxLayout()
         pts_layout.addWidget(QLabel("每批次导出上限:"))
         self.spin_max_points = NoWheelSpinBox()
         self.spin_max_points.setRange(1, 1000)
         self.spin_max_points.setSuffix(" 积分")
         pts_layout.addWidget(self.spin_max_points)
+
+        pts_layout.addSpacing(12)
+
+        pts_layout.addWidget(QLabel("单任务子任务上限:"))
+        self.spin_max_subtasks = NoWheelSpinBox()
+        self.spin_max_subtasks.setRange(0, 100)
+        self.spin_max_subtasks.setSuffix(" 个")
+        self.spin_max_subtasks.setSpecialValueText("不限")
+        self.spin_max_subtasks.setToolTip(
+            "「🤖 全局托管」分配任务时，限制单个批次/单个账号分配的子任务（分镜）数量上限（默认 10 个，设为 0 表示不限制）"
+        )
+        pts_layout.addWidget(self.spin_max_subtasks)
         
-        pts_layout.addSpacing(15)
+        pts_layout.addSpacing(12)
         
         pts_layout.addWidget(QLabel("强制断句标记:"))
         self.txt_marker = QLineEdit()
         self.txt_marker.setFixedWidth(70)
         self.txt_marker.setPlaceholderText("///")
         pts_layout.addWidget(self.txt_marker)
+        pts_layout.addStretch(1)
+        pts_outer_layout.addLayout(pts_layout)
         
-        lbl_hint = QLabel("(* 出现此标记处强制切断)")
+        lbl_hint = QLabel("(* 单任务子任务上限默认 10 个，与「🤖 全局托管」实时联动，设为 0 表示不限制；出现强制断句标记处强制切断)")
+        lbl_hint.setWordWrap(True)
         lbl_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
-        pts_layout.addWidget(lbl_hint, stretch=1)
+        pts_outer_layout.addWidget(lbl_hint)
         
         main_layout.addWidget(group_points)
         
@@ -175,6 +212,7 @@ class SettingsDialog(QDialog):
         min_chars_layout.addWidget(self.spin_min_segment_chars)
         
         lbl_min_hint = QLabel("(* 除 /// 强制断句外最高权重；过短片段自动与相邻段合并或均分为中等段落)")
+        lbl_min_hint.setWordWrap(True)
         lbl_min_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
         min_chars_layout.addWidget(lbl_min_hint, stretch=1)
         
@@ -214,6 +252,7 @@ class SettingsDialog(QDialog):
         )
         edge_dur_layout.addWidget(self.spin_edge_extra_duration)
         lbl_edge_dur_hint = QLabel("(* 每个任务的第1个分段与最后一个分段自动加此秒数，最高不超过10秒；已满10秒的不加)")
+        lbl_edge_dur_hint.setWordWrap(True)
         lbl_edge_dur_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
         edge_dur_layout.addWidget(lbl_edge_dur_hint, stretch=1)
         char_layout.addLayout(edge_dur_layout)
@@ -254,21 +293,28 @@ class SettingsDialog(QDialog):
         lang_layout = QHBoxLayout()
         lang_layout.addWidget(QLabel("🌐 识别语言:"))
         self.combo_language = NoWheelComboBox()
+        self.combo_language.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_language.setMinimumContentsLength(6)
+        self.combo_language.setMinimumWidth(110)
         from models.config_manager import ConfigManager
         for code, label in ConfigManager.SUPPORTED_LANGUAGES:
             self.combo_language.addItem(label, code)
         lang_layout.addWidget(self.combo_language, stretch=1)
         
         lbl_lang_hint = QLabel("(* 用于语音转文字核对字幕；选择尼泊尔语时文案断行自动按尼泊尔语标点 । 和 ॥ 切分)")
+        lbl_lang_hint.setWordWrap(True)
         lbl_lang_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
-        lang_layout.addWidget(lbl_lang_hint)
+        lang_layout.addWidget(lbl_lang_hint, stretch=2)
         api_layout.addLayout(lang_layout)
         
         # Gladia API Keys
-        api_layout.addWidget(QLabel("🔑 Gladia API Keys (每行一个，自动轮询):"))
+        lbl_gladia_hdr = QLabel("🔑 Gladia API Keys (每行一个，多个 Key 并行使用，每个 Key 最多 3 个并发请求):")
+        lbl_gladia_hdr.setWordWrap(True)
+        api_layout.addWidget(lbl_gladia_hdr)
         self.txt_gladia_keys = QTextEdit()
-        self.txt_gladia_keys.setMaximumHeight(72)
+        self.txt_gladia_keys.setMaximumHeight(88)
         self.txt_gladia_keys.setPlaceholderText("粘贴 Gladia API Key，每行一个...\n例: gla_xxxxxxxxxxxxxxxxxxxx\ngla_yyyyyyyyyyyyyyyyyyyy")
+        self.txt_gladia_keys.textChanged.connect(self._update_gladia_key_count_label)
         self.txt_gladia_keys.setStyleSheet("""
             QTextEdit {
                 background-color: white;
@@ -281,9 +327,16 @@ class SettingsDialog(QDialog):
             }
         """)
         api_layout.addWidget(self.txt_gladia_keys)
+
+        self.lbl_gladia_key_count = QLabel("")
+        self.lbl_gladia_key_count.setWordWrap(True)
+        self.lbl_gladia_key_count.setStyleSheet("color: #0F766E; font-size: 11px; font-weight: bold;")
+        api_layout.addWidget(self.lbl_gladia_key_count)
         
         # ElevenLabs API Keys
-        api_layout.addWidget(QLabel("🔑 ElevenLabs API Keys (每行一个，自动轮询):"))
+        lbl_eleven_hdr = QLabel("🔑 ElevenLabs API Keys (每行一个，自动轮询):")
+        lbl_eleven_hdr.setWordWrap(True)
+        api_layout.addWidget(lbl_eleven_hdr)
         self.txt_elevenlabs_keys = QTextEdit()
         self.txt_elevenlabs_keys.setMaximumHeight(72)
         self.txt_elevenlabs_keys.setPlaceholderText("粘贴 ElevenLabs API Key，每行一个...\n例: sk_xxxxxxxxxxxxxxxxxxxx\nsk_yyyyyyyyyyyyyyyyyyyy")
@@ -300,9 +353,38 @@ class SettingsDialog(QDialog):
         """)
         api_layout.addWidget(self.txt_elevenlabs_keys)
         
-        lbl_api_hint = QLabel("💡 提示: 支持多个 Key 轮询，当一个 Key 用量超限时自动切换下一个")
+        lbl_api_hint = QLabel("💡 提示: 支持多个 Key 并行核对（每个 Key ≤3 个并发请求，N 个 Key 最多同时 3N 个请求）；某个 Key 失效或超限时自动切换其他 Key 重试")
+        lbl_api_hint.setWordWrap(True)
         lbl_api_hint.setStyleSheet("color: #0284C7; font-style: italic; font-size: 11px; font-weight: normal;")
         api_layout.addWidget(lbl_api_hint)
+
+        # Auto breath-trimming default padding (前留白 / 后留白)
+        pad_layout = QHBoxLayout()
+        pad_layout.setContentsMargins(0, 6, 0, 0)
+        pad_layout.addWidget(QLabel("✂️ 自动切气口默认留白:  前留白"))
+        self.spin_breath_pad_before = NoWheelDoubleSpinBox()
+        self.spin_breath_pad_before.setRange(0.0, 2.0)
+        self.spin_breath_pad_before.setSingleStep(0.05)
+        self.spin_breath_pad_before.setDecimals(2)
+        self.spin_breath_pad_before.setSuffix(" 秒")
+        self.spin_breath_pad_before.setFixedWidth(90)
+        self.spin_breath_pad_before.setToolTip("每个视频片段第一句发音前保留的气口缓冲时间（默认 0.10 秒）")
+        pad_layout.addWidget(self.spin_breath_pad_before)
+        pad_layout.addSpacing(10)
+        pad_layout.addWidget(QLabel("后留白"))
+        self.spin_breath_pad_after = NoWheelDoubleSpinBox()
+        self.spin_breath_pad_after.setRange(0.0, 2.0)
+        self.spin_breath_pad_after.setSingleStep(0.05)
+        self.spin_breath_pad_after.setDecimals(2)
+        self.spin_breath_pad_after.setSuffix(" 秒")
+        self.spin_breath_pad_after.setFixedWidth(90)
+        self.spin_breath_pad_after.setToolTip("每个视频片段最后发音结束后保留的气口缓冲时间（默认 0.15 秒）")
+        pad_layout.addWidget(self.spin_breath_pad_after)
+        lbl_pad_hint = QLabel("(* 「🎬 视频与文案比对」及批量核对自动切气口的默认值)")
+        lbl_pad_hint.setWordWrap(True)
+        lbl_pad_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
+        pad_layout.addWidget(lbl_pad_hint, stretch=1)
+        api_layout.addLayout(pad_layout)
         
         main_layout.addWidget(group_api)
         
@@ -355,6 +437,9 @@ class SettingsDialog(QDialog):
         row1_layout.addWidget(QLabel("🎬 默认生成模式:"))
         self.combo_default_mode = NoWheelComboBox()
         self.combo_default_mode.setStyleSheet(combo_style)
+        self.combo_default_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_default_mode.setMinimumContentsLength(6)
+        self.combo_default_mode.setMinimumWidth(110)
         for mode_code, mode_label in ConfigManager.SUPPORTED_GENERATION_MODES:
             self.combo_default_mode.addItem(mode_label, mode_code)
         row1_layout.addWidget(self.combo_default_mode, stretch=1)
@@ -371,7 +456,7 @@ class SettingsDialog(QDialog):
             self.combo_default_aspect.addItem(aspect_label, aspect_code)
         row2_layout.addWidget(self.combo_default_aspect)
         
-        row2_layout.addSpacing(20)
+        row2_layout.addSpacing(12)
         
         # 批量生成尺寸已改为在「🚀 批量生成」中按每个任务单独设置；此处仅保留隐藏控件以兼容旧配置
         self.combo_batch_default_aspect = NoWheelComboBox()
@@ -379,9 +464,9 @@ class SettingsDialog(QDialog):
         for aspect_code, aspect_label in ConfigManager.SUPPORTED_ASPECT_RATIOS:
             self.combo_batch_default_aspect.addItem(aspect_label, aspect_code)
         lbl_batch_aspect_hint = QLabel("💡 批量生成的尺寸请在「🚀 批量生成」中为每个任务单独设置")
+        lbl_batch_aspect_hint.setWordWrap(True)
         lbl_batch_aspect_hint.setStyleSheet("color: #8D6E63; font-size: 12px; font-weight: normal;")
-        row2_layout.addWidget(lbl_batch_aspect_hint)
-        row2_layout.addStretch()
+        row2_layout.addWidget(lbl_batch_aspect_hint, stretch=1)
         gen_rules_layout.addLayout(row2_layout)
 
         # Row 3: Video Model
@@ -389,6 +474,9 @@ class SettingsDialog(QDialog):
         row3_layout.addWidget(QLabel("🤖 默认生成模型:"))
         self.combo_default_model = NoWheelComboBox()
         self.combo_default_model.setStyleSheet(combo_style)
+        self.combo_default_model.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_default_model.setMinimumContentsLength(6)
+        self.combo_default_model.setMinimumWidth(110)
         for model_code, model_label in ConfigManager.SUPPORTED_VIDEO_MODELS:
             self.combo_default_model.addItem(model_label, model_code)
         row3_layout.addWidget(self.combo_default_model, stretch=1)
@@ -401,13 +489,14 @@ class SettingsDialog(QDialog):
         
         main_layout.addWidget(group_gen_rules)
         
-        # Section 7: New Import Columns Mapping
+        # Section 7: New Import Columns Mapping (自适应宽度自动换行 + 下拉框自动缩窄)
         group_import_cols = QGroupBox("7. 新建导入表格列设置 (New Import Columns Mapping)")
         import_cols_layout = QVBoxLayout(group_import_cols)
         import_cols_layout.setContentsMargins(12, 12, 12, 12)
-        import_cols_layout.setSpacing(10)
+        import_cols_layout.setSpacing(8)
 
         top_col_bar = QHBoxLayout()
+        top_col_bar.setSpacing(6)
         top_col_bar.addWidget(QLabel("📊 表格总列数:"))
         self.spin_import_col_count = NoWheelSpinBox()
         self.spin_import_col_count.setRange(4, 20)
@@ -430,19 +519,20 @@ class SettingsDialog(QDialog):
         btn_reset_import_col.setStyleSheet("background-color: #8D6E63; color: white; padding: 4px 10px; font-size: 12px;")
         btn_reset_import_col.clicked.connect(self._reset_import_columns_to_default)
         top_col_bar.addWidget(btn_reset_import_col)
-
         top_col_bar.addStretch()
-        self.lbl_import_col_status = QLabel("")
-        top_col_bar.addWidget(self.lbl_import_col_status)
         import_cols_layout.addLayout(top_col_bar)
 
+        self.lbl_import_col_status = QLabel("")
+        self.lbl_import_col_status.setWordWrap(True)
+        import_cols_layout.addWidget(self.lbl_import_col_status)
+
         self.import_cols_container = QWidget()
+        self.import_cols_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.grid_import_cols = QGridLayout(self.import_cols_container)
         self.grid_import_cols.setContentsMargins(0, 4, 0, 4)
-        self.grid_import_cols.setHorizontalSpacing(14)
+        self.grid_import_cols.setHorizontalSpacing(8)
         self.grid_import_cols.setVerticalSpacing(8)
         import_cols_layout.addWidget(self.import_cols_container)
-        self.import_col_combos = []
 
         lbl_import_cols_hint = QLabel(
             "💡 规则说明：无论设置多少列，必须包含【名字、中文、原文、链接】这 4 项必填列。\n"
@@ -483,8 +573,57 @@ class SettingsDialog(QDialog):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.addWidget(scroll_area)
 
+    def _compute_import_cols_per_row(self) -> int:
+        """根据当前窗口可用宽度自动计算每行放置几列（支持 1 / 2 / 3 / 4 列自动换行）。"""
+        avail_w = 0
+        if hasattr(self, "import_cols_container") and self.import_cols_container is not None:
+            avail_w = self.import_cols_container.width()
+        if avail_w <= 100:
+            avail_w = max(200, self.width() - 68)
+        if avail_w >= 860:
+            return 4
+        if avail_w >= 540:
+            return 3
+        if avail_w >= 350:
+            return 2
+        return 1
+
+    def _relayout_import_col_combos(self, force: bool = False):
+        """当窗口宽度变化时自动重排各列下拉框，实现响应式自动换行且下拉框自动缩窄。"""
+        if not self.import_col_combos or not self.import_col_labels:
+            return
+        cols_per_row = self._compute_import_cols_per_row()
+        if not force and cols_per_row == self._current_import_cols_per_row:
+            return
+        self._current_import_cols_per_row = cols_per_row
+
+        # Clear layout items without deleting widgets
+        while self.grid_import_cols.count():
+            self.grid_import_cols.takeAt(0)
+
+        # Reset stretches on all possible columns (up to 8 grid columns)
+        for c in range(8):
+            self.grid_import_cols.setColumnStretch(c, 0)
+
+        for idx, (lbl, cb) in enumerate(zip(self.import_col_labels, self.import_col_combos)):
+            row = idx // cols_per_row
+            col_group = (idx % cols_per_row) * 2
+            self.grid_import_cols.addWidget(lbl, row, col_group)
+            self.grid_import_cols.addWidget(cb, row, col_group + 1)
+
+        for g in range(cols_per_row):
+            self.grid_import_cols.setColumnStretch(g * 2 + 1, 1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_import_col_combos(force=False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, lambda: self._relayout_import_col_combos(force=True))
+
     def _rebuild_import_col_combos(self, col_types):
-        """Rebuilds the grid of NoWheelComboBox widgets for import columns."""
+        """Rebuilds the responsive grid of NoWheelComboBox widgets for import columns."""
         from models.config_manager import ConfigManager
 
         while self.grid_import_cols.count():
@@ -492,6 +631,7 @@ class SettingsDialog(QDialog):
             w = item.widget()
             if w:
                 w.deleteLater()
+        self.import_col_labels = []
         self.import_col_combos = []
 
         combo_style = """
@@ -499,28 +639,30 @@ class SettingsDialog(QDialog):
                 background-color: white;
                 border: 1px solid #D7CCC8;
                 border-radius: 4px;
-                padding: 4px 8px;
+                padding: 4px 6px;
                 font-size: 12px;
                 color: #5D4037;
             }
         """
         for idx, c_type in enumerate(col_types):
-            row = idx // 3
-            col_group = (idx % 3) * 2
             lbl = QLabel(f"第 {idx + 1} 列:")
             lbl.setStyleSheet("font-weight: bold; font-size: 12px; color: #5D4037;")
+            lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
             cb = NoWheelComboBox()
             cb.setStyleSheet(combo_style)
+            cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(4)
+            cb.setMinimumWidth(75)
+            cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             for code, label in ConfigManager.SUPPORTED_IMPORT_COLUMN_TYPES:
                 cb.addItem(label, code)
             found_idx = cb.findData(c_type)
             cb.setCurrentIndex(found_idx if found_idx >= 0 else cb.findData("empty"))
             cb.currentIndexChanged.connect(self._update_import_cols_status)
-            self.grid_import_cols.addWidget(lbl, row, col_group)
-            self.grid_import_cols.addWidget(cb, row, col_group + 1)
-            self.grid_import_cols.setColumnStretch(col_group + 1, 1)
+            self.import_col_labels.append(lbl)
             self.import_col_combos.append(cb)
 
+        self._relayout_import_col_combos(force=True)
         self._update_import_cols_status()
         try:
             from services.theme_manager import ThemeManager
@@ -586,6 +728,7 @@ class SettingsDialog(QDialog):
             self.combo_theme_mode.blockSignals(False)
 
         self.spin_max_points.setValue(self.cm.max_batch_points)
+        self.spin_max_subtasks.setValue(int(getattr(self.cm, "max_subtasks_per_batch", 10)))
         self.txt_marker.setText(getattr(self.cm, "forced_split_marker", "///"))
         self.spin_min_segment_chars.setValue(getattr(self.cm, "min_segment_chars", 0))
         self.spin_edge_extra_duration.setValue(getattr(self.cm, "edge_extra_duration", 2))
@@ -609,6 +752,16 @@ class SettingsDialog(QDialog):
         # Load API keys
         self.txt_gladia_keys.setPlainText("\n".join(self.cm.gladia_api_keys))
         self.txt_elevenlabs_keys.setPlainText("\n".join(self.cm.elevenlabs_api_keys))
+        self._update_gladia_key_count_label()
+
+        # Load auto breath-trimming default padding (前留白 / 后留白)
+        from models.config_manager import ConfigManager as _CMPad
+        self.spin_breath_pad_before.setValue(
+            float(getattr(self.cm, "breath_pad_before", _CMPad.DEFAULT_BREATH_PAD_BEFORE))
+        )
+        self.spin_breath_pad_after.setValue(
+            float(getattr(self.cm, "breath_pad_after", _CMPad.DEFAULT_BREATH_PAD_AFTER))
+        )
         
         # Load language selection
         lang_code = getattr(self.cm, "speech_language", "es")
@@ -654,6 +807,25 @@ class SettingsDialog(QDialog):
         self.table_char_dur.setItem(row, 0, QTableWidgetItem("200"))
         self.table_char_dur.setItem(row, 1, QTableWidgetItem("12"))
 
+    @staticmethod
+    def _parse_key_lines(text: str) -> list:
+        """Parses one-key-per-line text into a de-duplicated key list (order preserved)."""
+        keys = []
+        for k in str(text or "").splitlines():
+            k = k.strip()
+            if k and k not in keys:
+                keys.append(k)
+        return keys
+
+    def _update_gladia_key_count_label(self):
+        if not hasattr(self, "lbl_gladia_key_count"):
+            return
+        n = len(self._parse_key_lines(self.txt_gladia_keys.toPlainText()))
+        if n <= 0:
+            self.lbl_gladia_key_count.setText("⚠️ 未填写 Gladia Key")
+        else:
+            self.lbl_gladia_key_count.setText(f"✅ 已填写 {n} 个 Gladia Key → 文案核对最多同时 {n * 3} 个请求并行")
+
     def del_char_row(self):
         r = self.table_char_dur.currentRow()
         if r >= 0:
@@ -695,8 +867,9 @@ class SettingsDialog(QDialog):
             )
             return
 
-        # Read max batch points & forced split marker
+        # Read max batch points, max subtasks & forced split marker
         self.cm.max_batch_points = self.spin_max_points.value()
+        self.cm.max_subtasks_per_batch = self.spin_max_subtasks.value()
         self.cm.forced_split_marker = self.txt_marker.text().strip() or "///"
         self.cm.min_segment_chars = self.spin_min_segment_chars.value()
         self.cm.edge_extra_duration = self.spin_edge_extra_duration.value()
@@ -740,12 +913,16 @@ class SettingsDialog(QDialog):
             
         self.cm.duration_points_rules = new_pts_rules
         
-        # Read API keys (filter empty lines)
+        # Read API keys (filter empty lines, de-duplicate while preserving order)
         gladia_text = self.txt_gladia_keys.toPlainText().strip()
-        self.cm.gladia_api_keys = [k.strip() for k in gladia_text.split("\n") if k.strip()]
+        self.cm.gladia_api_keys = self._parse_key_lines(gladia_text)
         
         elevenlabs_text = self.txt_elevenlabs_keys.toPlainText().strip()
-        self.cm.elevenlabs_api_keys = [k.strip() for k in elevenlabs_text.split("\n") if k.strip()]
+        self.cm.elevenlabs_api_keys = self._parse_key_lines(elevenlabs_text)
+
+        # Read auto breath-trimming default padding (前留白 / 后留白)
+        self.cm.breath_pad_before = round(float(self.spin_breath_pad_before.value()), 3)
+        self.cm.breath_pad_after = round(float(self.spin_breath_pad_after.value()), 3)
         
         # Read language
         self.cm.speech_language = self.combo_language.currentData() or "es"

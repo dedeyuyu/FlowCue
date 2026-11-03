@@ -133,7 +133,7 @@ def main():
             app.setWindowIcon(app_icon)
         
         window = MainWindow(data_dir)
-        ThemeManager.refresh_widget_style(window, recursive=True)
+        # 暗色模式下由 ThemeManager 的全局过滤器在窗口 Show 时统一递归适配，亮色模式无需逐控件转换
         window.show()
         
         sys.exit(app.exec())

@@ -116,9 +116,20 @@ class SegmentsTableMixin:
         self.copied_rows.clear()
             
         videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
+        existing_videos = set()
+        try:
+            if videos_dir.is_dir():
+                with os.scandir(videos_dir) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_file() and entry.stat().st_size > 0:
+                                existing_videos.add(entry.name.lower())
+                        except OSError:
+                            pass
+        except OSError:
+            pass
         for idx, seg in enumerate(segments):
-            vid_file = (videos_dir / f"{idx+1:02d}.mp4").resolve()
-            if vid_file.exists() and vid_file.stat().st_size > 0:
+            if f"{idx+1:02d}.mp4" in existing_videos:
                 seg["copied"] = True
                 seg["completed"] = True
                 self.copied_rows.add(idx)

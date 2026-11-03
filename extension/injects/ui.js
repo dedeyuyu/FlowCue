@@ -1669,7 +1669,11 @@
       // 图片查找匹配逻辑：采用多维度智能图名比对 (归一化、中英文括号、序号一致性、关键词交集)
       let matchedImg = null;
       if (imageName || localFileName) {
-        matchedImg = loadedImages.find(img => {
+        // 先找文件名完全一致的素材，找不到再退回多维度模糊比对（防止 "1.jpg" 先模糊命中其它图）
+        matchedImg = loadedImages.find(img =>
+          (imageName && isExactAssetNameMatch(imageName, img.displayName)) ||
+          (localFileName && isExactAssetNameMatch(localFileName, img.displayName))
+        ) || loadedImages.find(img => {
           return (imageName && isImageNameMatch(imageName, img.displayName)) ||
                  (localFileName && isImageNameMatch(localFileName, img.displayName));
         });
@@ -1690,7 +1694,9 @@
           ...matchedImg,
           src: matchedImg.src || incomingSrc,
           displayName: matchedImg.displayName || finalDisplayName,
-          localImagePath: localImagePath
+          localImagePath: localImagePath,
+          // 任务要求的原始文件名（精确选图用；displayName 可能是页面上模糊匹配到的名称）
+          targetName: imageName || localFileName || ""
         };
       } else {
         finalTaskImage = {
@@ -1698,7 +1704,8 @@
           primaryMediaKey: null,
           displayName: finalDisplayName,
           src: incomingSrc,
-          localImagePath: localImagePath
+          localImagePath: localImagePath,
+          targetName: imageName || localFileName || ""
         };
       }
 
@@ -4646,6 +4653,475 @@
   }
 
   // ----------------------------------------------------
+  // 素材选择弹窗（「选择画面图像」/ Choose frame image）精确选图
+  //   问题：Flow 中上传的素材很多时，目标图片不在弹窗可视区域（虚拟滚动 / 懒加载），旧逻辑只在已渲染的
+  //        卡片里做模糊匹配，会选不到或选错（例如整个列表容器的文本 "1.jpg4.jpg2.jpg…" 被当成命中）。
+  //   方案：① 在「搜索资源 / Search assets」框中输入目标文件名过滤，只接受「文件名完全一致」的行；
+  //        ② 没有搜索框或搜索无结果时，逐屏滚动列表查找完全一致的行；
+  //        ③ 同名多张时取列表中第一条（弹窗默认按「最近」排序，即最新上传的那张）；
+  //        ④ 等缩略图加载 → 点击 → 确认已选中 → 点击「添加到提示 / Add to prompt」。
+  // ----------------------------------------------------
+
+  // <fc-asset-name-match> 纯函数（tests/test_asset_name_match.js 会抽取此段做单元测试，请勿删除标记）
+  const FC_ASSET_IMG_EXT_RE = /\.(jpe?g|png|webp|gif|bmp|heic|heif|avif)$/i;
+
+  // 文件名归一化：全角转半角 (NFKC)、去零宽字符、合并空白、转小写
+  function normalizeAssetName(name) {
+    if (name === null || name === undefined) return "";
+    let s = String(name);
+    try { s = s.normalize("NFKC"); } catch (_) {}
+    return s
+      .replace(/[\u200B-\u200F\u2060\uFEFF]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function splitAssetExt(normName) {
+    const m = normName.match(FC_ASSET_IMG_EXT_RE);
+    if (!m) return { stem: normName, ext: "" };
+    let ext = m[1].toLowerCase();
+    if (ext === "jpeg") ext = "jpg";
+    if (ext === "heif") ext = "heic";
+    return { stem: normName.slice(0, normName.length - m[0].length).trim(), ext };
+  }
+
+  // 文件名「完全一致」判定（严禁子串匹配："1.jpg" 绝不会匹配 "21.jpg" / "11.jpg" / "FC0001.jpg"）
+  function isExactAssetNameMatch(targetName, pageName) {
+    const t = normalizeAssetName(targetName);
+    const p = normalizeAssetName(pageName);
+    if (!t || !p) return false;
+    if (t === p) return true;
+    const a = splitAssetExt(t), b = splitAssetExt(p);
+    if (!a.stem || a.stem !== b.stem) return false;
+    if (a.ext && b.ext) return a.ext === b.ext; // 仅 jpg ≡ jpeg 视为相同
+    // 某一方未显示扩展名：只有主文件名足够独特（≥4 字符且不是纯数字，如 FC0001）才认可，
+    // 防止弹窗里的计数文字 "1" 误命中 "1.jpg"
+    return a.stem.length >= 4 && !/^\d+$/.test(a.stem);
+  }
+
+  // 是否像一个图片文件名（用于判断弹窗是否显示了文件名）
+  function looksLikeAssetFileName(text) {
+    const n = normalizeAssetName(text);
+    return !!n && n.length <= 160 && FC_ASSET_IMG_EXT_RE.test(n);
+  }
+
+  // 搜索关键词：先用完整文件名，再退回不含扩展名的主文件名（部分搜索实现不索引扩展名）
+  function buildAssetSearchQueries(targetName) {
+    const raw = String(targetName || "").trim();
+    if (!raw) return [];
+    const stem = raw.replace(FC_ASSET_IMG_EXT_RE, "").trim();
+    return [...new Set([raw, stem].filter(Boolean))];
+  }
+
+  // 从候选列表（已按列表顺序排列）中挑出第一条完全一致的项；同名多张时即「最近」排序下最新的一张
+  function pickExactAssetCandidate(candidates, targetName) {
+    for (const c of candidates || []) {
+      if (!c) continue;
+      const names = Array.isArray(c.names) ? c.names : [c.name];
+      if (names.some(n => isExactAssetNameMatch(targetName, n))) return c;
+    }
+    return null;
+  }
+  // </fc-asset-name-match>
+
+  function fcIsVisible(el) {
+    if (!el || !el.isConnected || typeof el.getBoundingClientRect !== "function") return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== "hidden" && cs.display !== "none";
+  }
+
+  // 轮询等待：fn 返回真值即结束并返回该值；超时返回 null
+  async function fcWaitFor(fn, timeoutMs = 3000, intervalMs = 200) {
+    const start = Date.now();
+    while (true) {
+      let v = null;
+      try { v = fn(); } catch (_) { v = null; }
+      if (v) return v;
+      if (isStopRequested || Date.now() - start >= timeoutMs) return null;
+      await delay(intervalMs);
+    }
+  }
+
+  // React / Angular 兼容地写入输入框：走原生 value setter 再派发 input/change 事件
+  function setNativeInputValue(input, value) {
+    if (!input) return;
+    const v = String(value ?? "");
+    try { input.focus(); } catch (_) {}
+    try {
+      const proto = (typeof HTMLTextAreaElement !== "undefined" && input instanceof HTMLTextAreaElement)
+        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (setter) setter.call(input, v); else input.value = v;
+    } catch (_) {
+      input.value = v;
+    }
+    try {
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: false, inputType: v ? "insertText" : "deleteContentBackward", data: v || null }));
+    } catch (_) {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    try { input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: v ? v.slice(-1) : "Backspace" })); } catch (_) {}
+  }
+
+  // 弹窗中的「搜索资源 / Search assets」输入框
+  function findAssetSearchInput(root) {
+    if (!root || typeof root.querySelectorAll !== "function") return null;
+    const inputs = Array.from(root.querySelectorAll("input, textarea")).filter(i => {
+      const type = String(i.getAttribute("type") || "text").toLowerCase();
+      return (type === "text" || type === "search") && !i.disabled && !i.readOnly && fcIsVisible(i);
+    });
+    const re = /(搜索|搜尋|检索|檢索|查找|search|find|filter)/i;
+    const hint = i => [
+      i.getAttribute("placeholder"), i.getAttribute("aria-label"), i.getAttribute("title"),
+      i.getAttribute("type") === "search" ? "search" : "",
+      i.getAttribute("role") === "searchbox" ? "search" : "",
+      i.closest("[role='search']") ? "search" : ""
+    ].join(" ");
+    return inputs.find(i => re.test(hint(i))) || null;
+  }
+
+  function fcButtonLabel(b) {
+    return ((b.textContent || "") + " " + (b.getAttribute("aria-label") || "") + " " + (b.getAttribute("title") || "")).replace(/\s+/g, " ").trim();
+  }
+
+  function fcIsButtonEnabled(b) {
+    return !!b && !b.disabled && !b.hasAttribute("disabled") && b.getAttribute("aria-disabled") !== "true" &&
+      !b.classList.contains("mat-mdc-button-disabled") && !b.classList.contains("flow-button-disabled");
+  }
+
+  // 「添加到提示 / Add to prompt」按钮（strictOnly=true 时只认明确文案）
+  function findAddToPromptButton(root, strictOnly = false) {
+    if (!root || typeof root.querySelectorAll !== "function") return null;
+    const btns = Array.from(root.querySelectorAll("button, [role='button']")).filter(fcIsVisible);
+    const strong = /(添加到提示|新增到提示|加入提示|添加至提示|新增至提示|加到提示|新增至提示詞|加入提示詞|add to prompt|insert into prompt|add to the prompt)/i;
+    const hit = btns.filter(b => strong.test(fcButtonLabel(b)));
+    if (hit.length) return hit[hit.length - 1];
+    if (strictOnly) return null;
+    const cancel = /(取消|关闭|關閉|返回|上传|上傳|cancel|close|dismiss|back|upload)/i;
+    const weak = /(添加|新增|加入|插入|使用|选择|選擇|選取|确认|確認|确定|確定|完成|add|insert|use|select|confirm|done|apply)/i;
+    const weakHits = btns.filter(b => {
+      const t = fcButtonLabel(b);
+      return t && t.length <= 40 && !cancel.test(t) && weak.test(t) && !b.querySelector("img") && !looksLikeAssetFileName(t);
+    });
+    return weakHits.length ? weakHits[weakHits.length - 1] : null;
+  }
+
+  // 定位素材选择弹窗：优先含搜索框 / 图片 / 「添加到提示」按钮的最上层弹窗
+  function findAssetPickerDialog(hintPanel) {
+    const cands = Array.from(document.querySelectorAll("mat-dialog-container, [role='dialog'], .cdk-overlay-pane"))
+      .filter(p => fcIsVisible(p) && !p.closest("#flow-batch-overlay, #flow-import-dialog, #flow-alarm-dialog"));
+    if (hintPanel && fcIsVisible(hintPanel) && !cands.includes(hintPanel)) cands.push(hintPanel);
+    let best = null, bestScore = 0;
+    cands.forEach((p, i) => {
+      let score = 0;
+      if (findAssetSearchInput(p)) score += 4;
+      if (p.querySelector("img")) score += 2;
+      if (findAddToPromptButton(p, true)) score += 3;
+      const heading = p.querySelector("h1, h2, h3, [role='heading'], .mat-mdc-dialog-title, [mat-dialog-title]");
+      if (heading && /(选择画面|選擇畫面|画面图像|畫面圖像|选择图片|選擇圖片|choose.*(frame|image)|select.*(frame|image)|frame image)/i.test(heading.textContent || "")) score += 2;
+      score += i * 0.001; // 同分时取 DOM 中更靠后的（更上层 / 更内层）弹窗
+      if (score > bestScore) { best = p; bestScore = score; }
+    });
+    return bestScore >= 2 ? best : null;
+  }
+
+  // 收集容器内所有「可能承载文件名」的元素：自身直接文本 / 短的完整文本 / aria-label / title / alt
+  function collectAssetNameEntries(root) {
+    const out = [];
+    if (!root || typeof root.querySelectorAll !== "function") return out;
+    const skipTags = new Set(["INPUT", "TEXTAREA", "SCRIPT", "STYLE", "MAT-ICON", "SVG", "PATH"]);
+    for (const el of root.querySelectorAll("*")) {
+      if (skipTags.has(String(el.tagName).toUpperCase())) continue;
+      const cls = typeof el.className === "string" ? el.className : "";
+      if (/(google-symbols|material-icons|material-symbols)/.test(cls)) continue;
+      const names = [];
+      let own = "";
+      for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue;
+      own = own.trim();
+      if (own) names.push(own);
+      if (el.children && el.children.length) {
+        const full = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (full && full.length <= 160 && full !== own) names.push(full);
+      }
+      for (const a of ["aria-label", "title", "alt", "data-name", "data-file-name", "data-filename"]) {
+        const v = el.getAttribute && el.getAttribute(a);
+        if (v && v.trim()) names.push(v.trim());
+      }
+      if (names.length) out.push({ el, names });
+    }
+    return out;
+  }
+
+  // 从「文件名元素」向上找到可点击的列表行（不能是整个弹窗 / 预览区 / 含搜索框的大容器）
+  function resolveAssetRow(el, dialog) {
+    if (!el || !dialog) return null;
+    const dRect = dialog.getBoundingClientRect();
+    const dArea = Math.max(1, dRect.width * dRect.height);
+    const searchInput = findAssetSearchInput(dialog);
+    const okRow = (n) => {
+      if (!n || n === dialog || !dialog.contains(n)) return false;
+      if (searchInput && n.contains(searchInput)) return false;
+      if (findAddToPromptButton(n, true)) return false; // 含「添加到提示」按钮的是预览区 / 整体容器
+      const r = n.getBoundingClientRect();
+      return r.width * r.height <= dArea * 0.6;
+    };
+    const ROW_SEL = "[role='option'], [role='listitem'], [role='row'], [role='gridcell'], [role='menuitem'], [role='radio'], " +
+      "[role='checkbox'], [role='button'], button, li, a[href], flow-grid-tile-container, [data-tile-id], [data-media-id], [tabindex]";
+    for (let cur = el; cur && cur !== dialog; cur = cur.parentElement) {
+      if (typeof cur.matches === "function" && cur.matches(ROW_SEL) && okRow(cur)) return cur;
+    }
+    // 无语义标记时：向上找到「与兄弟节点同结构、且含缩略图 / 加载圈」的那一层
+    for (let cur = el; cur && cur.parentElement && cur.parentElement !== dialog && dialog.contains(cur.parentElement); cur = cur.parentElement) {
+      const parent = cur.parentElement;
+      const sameSibs = Array.from(parent.children).filter(c => c.tagName === cur.tagName).length;
+      if (sameSibs >= 2 && okRow(cur) &&
+          cur.querySelector("img, [role='progressbar'], mat-progress-spinner, mat-spinner, [style*='background-image']")) {
+        return cur;
+      }
+    }
+    return okRow(el) ? el : null;
+  }
+
+  // 扫描弹窗：返回完全匹配目标文件名的行（按列表视觉顺序），以及弹窗中「像文件名」的元素数量
+  function findExactAssetRows(dialog, targetName, imgKey) {
+    const entries = collectAssetNameEntries(dialog);
+    const rows = [];
+    const seen = new Set();
+    const sampleNames = [];
+    let nameLike = 0;
+    const matched = [];
+    for (const e of entries) {
+      const fileNames = e.names.filter(looksLikeAssetFileName);
+      if (fileNames.length) {
+        nameLike++;
+        if (sampleNames.length < 12 && !sampleNames.includes(fileNames[0])) sampleNames.push(fileNames[0]);
+      }
+      if (pickExactAssetCandidate([e], targetName)) matched.push(e);
+    }
+    // 只保留最内层的命中元素（列表只剩一行时，外层容器的完整文本也会等于文件名，不能把容器当成行）
+    const deepest = matched.filter(e => !matched.some(o => o !== e && e.el.contains(o.el)));
+    for (const e of deepest) {
+      const row = resolveAssetRow(e.el, dialog);
+      if (!row || seen.has(row)) continue;
+      if (rows.some(r => r !== row && row.contains(r))) continue; // 已有更内层的行
+      for (let k = rows.length - 1; k >= 0; k--) {
+        if (rows[k] !== row && rows[k].contains(row)) { seen.delete(rows[k]); rows.splice(k, 1); }
+      }
+      seen.add(row);
+      rows.push(row);
+    }
+    // 媒体 ID 全等（部分版本行上带 data-media-id / data-tile-id）
+    if (imgKey && !rows.length) {
+      dialog.querySelectorAll("[data-media-id], [data-tile-id]").forEach(n => {
+        const id = n.getAttribute("data-media-id") || n.getAttribute("data-tile-id") || "";
+        if (id && id === imgKey) {
+          const row = resolveAssetRow(n, dialog) || n;
+          if (!seen.has(row)) { seen.add(row); rows.push(row); }
+        }
+      });
+    }
+    // 带缩略图（或加载圈）的列表行优先于只显示文字的元素（如预览区标题），其余按视觉顺序（从上到下、从左到右）
+    const hasThumb = r => !!r.querySelector("img, [role='progressbar'], mat-progress-spinner, mat-spinner, [style*='background-image']");
+    rows.sort((a, b) => {
+      const ta = hasThumb(a), tb = hasThumb(b);
+      if (ta !== tb) return ta ? -1 : 1;
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      if (Math.abs(ra.top - rb.top) > 4) return ra.top - rb.top;
+      return ra.left - rb.left;
+    });
+    return { rows, nameLike, sampleNames };
+  }
+
+  function findAssetScrollContainer(dialog, sampleEl) {
+    const isScrollable = n => {
+      if (!n || n.nodeType !== 1) return false;
+      if (n.scrollHeight <= n.clientHeight + 4) return false;
+      if (String(n.tagName).toUpperCase() === "CDK-VIRTUAL-SCROLL-VIEWPORT") return true;
+      return /(auto|scroll|overlay)/.test(getComputedStyle(n).overflowY || "");
+    };
+    for (let cur = sampleEl; cur && cur !== document.body; cur = cur.parentElement) {
+      if (isScrollable(cur)) return cur;
+      if (cur === dialog) break;
+    }
+    let best = null, bestScore = 0;
+    dialog.querySelectorAll("*").forEach(n => {
+      if (!isScrollable(n)) return;
+      const score = n.querySelectorAll("img, [role='progressbar'], mat-progress-spinner").length + 1;
+      if (score > bestScore) { best = n; bestScore = score; }
+    });
+    return best;
+  }
+
+  // 逐屏滚动列表查找目标行（兼容虚拟滚动 / 懒加载），到底且不再增长即结束
+  async function scrollAssetListForTarget(dialog, scan, maxSteps = 160) {
+    let s = scan();
+    if (s.rows.length) return s.rows[0];
+    const sample = collectAssetNameEntries(dialog).find(e => e.names.some(looksLikeAssetFileName))?.el || dialog.querySelector("img");
+    const sc = findAssetScrollContainer(dialog, sample);
+    if (!sc) return null;
+    try { sc.scrollTop = 0; sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (_) {}
+    await delay(350);
+    let stall = 0;
+    for (let i = 0; i < maxSteps; i++) {
+      if (isStopRequested) return null;
+      s = scan();
+      if (s.rows.length) return s.rows[0];
+      const atEnd = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
+      if (atEnd) {
+        const h = sc.scrollHeight;
+        await delay(700); // 等待懒加载追加下一页
+        if (sc.scrollHeight <= h + 1) {
+          if (++stall >= 2) { s = scan(); return s.rows[0] || null; }
+        } else {
+          stall = 0;
+        }
+        continue;
+      }
+      sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + Math.max(40, Math.round(sc.clientHeight * 0.8)));
+      try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (_) {}
+      await delay(350);
+    }
+    return null;
+  }
+
+  function isAssetRowThumbReady(row) {
+    if (!row) return false;
+    if (row.querySelector("mat-progress-spinner, mat-spinner, [role='progressbar'], .mat-mdc-progress-spinner")) return false;
+    const imgs = Array.from(row.querySelectorAll("img"));
+    if (!imgs.length) return true; // 背景图或纯文字行
+    return imgs.some(i => i.complete && i.naturalWidth > 0);
+  }
+
+  function isAssetRowSelected(row) {
+    const check = n => {
+      if (!n || typeof n.getAttribute !== "function") return false;
+      if (n.getAttribute("aria-selected") === "true" || n.getAttribute("aria-checked") === "true" || n.getAttribute("aria-pressed") === "true") return true;
+      const cur = n.getAttribute("aria-current");
+      if (cur && cur !== "false") return true;
+      const cls = typeof n.className === "string" ? n.className : "";
+      return /(^|[\s_-])(selected|is-selected|checked|mdc-list-item--selected|mat-mdc-list-item-selected)($|[\s_-])/i.test(cls);
+    };
+    return check(row) || !!Array.from(row.querySelectorAll("[aria-selected='true'], [aria-checked='true'], [aria-pressed='true']")).length;
+  }
+
+  // 统计目标文件名在「该行以外」出现的次数（选中后右侧预览区通常会显示文件名）
+  function countExactNameOutsideRow(dialog, row, targetName) {
+    return collectAssetNameEntries(dialog).filter(e => !row.contains(e.el) && pickExactAssetCandidate([e], targetName)).length;
+  }
+
+  /**
+   * 在素材选择弹窗中按「完全一致的文件名」选中图片并点击「添加到提示」。
+   * @returns {Promise<{status:string, detail?:string, confirmed?:boolean, sampleNames?:string[]}>}
+   *   status: selected | not_found | unrecognized | no_dialog | no_add_button
+   */
+  async function selectAssetInPickerDialog(panelHint, targetName, { imgKey = "", slotLabel = "首帧" } = {}) {
+    const tag = `[FlowUI][精确选图·${slotLabel}]`;
+    const dialog = findAssetPickerDialog(panelHint);
+    if (!dialog) return { status: "no_dialog", detail: "未检测到素材选择弹窗" };
+    const searchInput = findAssetSearchInput(dialog);
+    let sawNames = false;
+    let sampleNames = [];
+    const scan = () => {
+      const s = findExactAssetRows(dialog, targetName, imgKey);
+      if (s.nameLike > 0) { sawNames = true; if (s.sampleNames.length) sampleNames = s.sampleNames; }
+      return s;
+    };
+
+    // 等待列表初次渲染（缩略图可能仍在转圈，但文件名通常先出现）
+    await fcWaitFor(() => { const s = scan(); return (s.nameLike > 0 || s.rows.length) ? s : null; }, 4000, 200);
+
+    let found = null;
+    let usedSearch = false;
+    // ① 搜索框过滤
+    if (searchInput) {
+      for (const q of buildAssetSearchQueries(targetName)) {
+        if (isStopRequested) break;
+        usedSearch = true;
+        console.log(`${tag} 在「搜索资源」输入: "${q}"`);
+        setNativeInputValue(searchInput, q);
+        await delay(400);
+        const hit = await fcWaitFor(() => { const s = scan(); return s.rows.length ? s : null; }, 6000, 250);
+        if (hit) {
+          await delay(300); // 过滤结果可能还在重绘，稍等后重新扫描拿最新 DOM 引用
+          const again = scan();
+          found = (again.rows.length ? again.rows : hit.rows)[0];
+          break;
+        }
+        // 过滤后的结果仍较多（如搜 "1" 命中 1/11/21…）时，目标可能不在可视区：滚动过滤后的列表
+        found = await scrollAssetListForTarget(dialog, scan);
+        if (found) break;
+      }
+    }
+    // ② 无搜索框或搜索无果：清空搜索，逐屏滚动整个列表
+    if (!found) {
+      if (usedSearch && searchInput && searchInput.isConnected) {
+        setNativeInputValue(searchInput, "");
+        await delay(700);
+      }
+      found = await scrollAssetListForTarget(dialog, scan);
+    }
+    if (!found) {
+      const status = sawNames ? "not_found" : "unrecognized";
+      console.warn(`${tag} 未找到文件名完全一致的素材 "${targetName}" (status=${status})，弹窗中的文件名示例:`, sampleNames);
+      return { status, detail: sampleNames.length ? `弹窗中可见的文件名示例：${sampleNames.slice(0, 8).join("、")}` : "", sampleNames };
+    }
+
+    // ③ 等缩略图加载 → 点击 → 确认选中
+    try { found.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {}
+    await fcWaitFor(() => !found.isConnected || isAssetRowThumbReady(found), 5000, 200);
+    if (!found.isConnected) {
+      const again = scan();
+      if (again.rows.length) found = again.rows[0];
+    }
+    const before = countExactNameOutsideRow(dialog, found, targetName);
+    console.log(`${tag} 🎯 命中文件名完全一致的素材 "${targetName}"，点击选中:`, found);
+    simulateClick(found);
+    const confirmed = !!(await fcWaitFor(() =>
+      !dialog.isConnected || !fcIsVisible(dialog) || isAssetRowSelected(found) || countExactNameOutsideRow(dialog, found, targetName) > before,
+      2000, 150));
+    if (!confirmed) console.warn(`${tag} ⚠️ 未能确认预览区已显示 "${targetName}"（可能是界面结构变化），继续点击「添加到提示」`);
+
+    // 单击行就直接关闭弹窗（直接添加）的情况
+    if (!dialog.isConnected || !fcIsVisible(dialog)) {
+      return { status: "selected", confirmed: true };
+    }
+
+    // ④ 点击「添加到提示 / Add to prompt」
+    let addBtn = null;
+    await fcWaitFor(() => {
+      addBtn = findAddToPromptButton(dialog) ||
+        findAddToPromptButton(document.querySelector(".cdk-overlay-container"), true);
+      return addBtn && fcIsButtonEnabled(addBtn) ? addBtn : null;
+    }, 3000, 150);
+    if (!addBtn) {
+      console.warn(`${tag} 已选中 "${targetName}"，但未找到「添加到提示」按钮`);
+      return { status: "no_add_button", detail: "已选中图片，但未找到「添加到提示 / Add to prompt」按钮" };
+    }
+    console.log(`${tag} 点击「${fcButtonLabel(addBtn)}」`);
+    simulateClick(addBtn);
+    await fcWaitFor(() => !dialog.isConnected || !fcIsVisible(dialog), 3000, 150);
+    return { status: "selected", confirmed };
+  }
+
+  // 关闭素材弹窗前清空搜索框，避免残留关键词影响下一次打开
+  async function closeAssetPickerDialog(panelHint) {
+    const dialog = findAssetPickerDialog(panelHint);
+    const input = dialog ? findAssetSearchInput(dialog) : null;
+    if (input && input.value) {
+      setNativeInputValue(input, "");
+      await delay(200);
+    }
+    if (dialog && fcIsVisible(dialog)) {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+      await delay(250);
+    }
+  }
+
+  // ----------------------------------------------------
   // 自动化关联素材原料：首帧注入 (帧模式) 或素材模式
   // ----------------------------------------------------
   async function attachImageToPage(image, footageType) {
@@ -4717,6 +5193,38 @@
 
           if (overlayPanel) {
             console.log("[FlowUI] 成功检测到素材选择弹层面板，开始匹配素材...");
+
+            // ★ 新版精确选图：搜索框过滤 / 逐屏滚动 + 文件名完全一致（素材很多时也不会选不到或选错）
+            const exactTarget = getFilenameFromPath(image.localImagePath || "") || image.targetName || imgName;
+            if (exactTarget) {
+              // 媒体 ID 只有在它确实属于目标文件名时才可信（导入时可能是模糊匹配到的其它图片的 ID）
+              const pickKey = (image.displayName && isExactAssetNameMatch(exactTarget, image.displayName)) ? imgKey : "";
+              const pick = await selectAssetInPickerDialog(overlayPanel, exactTarget, { imgKey: pickKey, slotLabel: "首帧" });
+              if (pick.status === "selected") {
+                await delay(300);
+                if (verifyImageAttached(image, footageType)) {
+                  console.log(`[FlowUI] ✅ 首帧素材 [${exactTarget}] 已精确选中并挂载成功！`);
+                } else {
+                  console.warn(`[FlowUI] ⚠️ 已在弹窗中精确选中 [${exactTarget}]，暂未检测到挂载芯片，交由提交前复核处理`);
+                }
+                return;
+              }
+              // 弹窗显示了文件名但确实找不到该图 / 找到了却无法添加：明确报错，绝不退回模糊匹配去选一张错误的图
+              const isRealFileName = looksLikeAssetFileName(exactTarget);
+              if (isRealFileName && (pick.status === "not_found" || pick.status === "no_add_button")) {
+                await closeAssetPickerDialog(overlayPanel);
+                const reason = pick.status === "not_found"
+                  ? `首帧图片「${exactTarget}」在 Flow 素材选择弹窗中未找到（已用「搜索资源」搜索并滚动整个列表）。请确认该图片已上传到当前浏览器的 Flow 项目且文件名未改变。`
+                  : `首帧图片「${exactTarget}」已找到，但无法点击「添加到提示」。`;
+                const err = new Error(reason + (pick.detail ? `（${pick.detail}）` : ""));
+                err.imageSelectionError = true;
+                throw err;
+              }
+              console.warn(`[FlowUI] 精确选图未完成 (status=${pick.status})，退回旧版匹配逻辑`);
+              if (!overlayPanel.isConnected || !fcIsVisible(overlayPanel)) {
+                overlayPanel = findAssetPickerDialog(null) || overlayPanel;
+              }
+            }
 
             // 在弹层中查找匹配的图片素材卡片
             const candidateItems = Array.from(overlayPanel.querySelectorAll(
@@ -5048,6 +5556,9 @@
       try {
         await attachImageToPage(image, targetFootage);
       } catch (imgErr) {
+        // 精确选图明确失败（素材库中确实找不到该文件名）：中止提交并把原因上报（托管模式经 hostedStatusHook 回传 FlowCue），
+        // 避免不带首帧或带错首帧去生成、白白消耗积分
+        if (imgErr && imgErr.imageSelectionError) throw imgErr;
         console.warn("[FlowUI] 注入图片原料异常 (继续执行):", imgErr);
       }
     }

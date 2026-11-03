@@ -114,22 +114,29 @@ class TableButtonDelegate(QStyledItemDelegate):
             if et == QEvent.Type.MouseMove:
                 new_hover = (index.row(), hit) if hit >= 0 else (-1, -1)
                 if new_hover != self._hover:
+                    old_row = self._hover[0]
                     self._hover = new_hover
                     if view is not None:
-                        view.viewport().update()
+                        vp = view.viewport()
+                        vp.update(option.rect)
+                        if old_row >= 0 and old_row != index.row():
+                            try:
+                                vp.update(view.visualRect(model.index(old_row, index.column())))
+                            except Exception:
+                                vp.update()
                 return False
             if hit < 0:
                 return False
             if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self._pressed = (index.row(), hit)
                 if view is not None:
-                    view.viewport().update()
+                    view.viewport().update(option.rect)
                 return True
             if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
                 was = self._pressed
                 self._pressed = (-1, -1)
                 if view is not None:
-                    view.viewport().update()
+                    view.viewport().update(option.rect)
                 if was == (index.row(), hit):
                     self.clicked.emit(index.row(), hit)
                 return True

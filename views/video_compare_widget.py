@@ -268,6 +268,14 @@ class VideoCompareWidget(QWidget):
     videos_deleted = pyqtSignal()
     send_to_reels_requested = pyqtSignal(dict)  # Emits {"video_path", "srt_path", "manifest_path", "project_name", "words"}
 
+    # Short button labels (top bar)
+    BTN_TEXT_EXTRACT_ALL = "🚀 极速核对（单任务）"
+    BTN_TEXT_SPLICE_EXPORT = "🎬 当前任务一键拼接"
+
+    # Fallback breath padding defaults (used when no config manager is available)
+    DEFAULT_PAD_BEFORE = 0.10
+    DEFAULT_PAD_AFTER = 0.15
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.project_model = None
@@ -277,6 +285,7 @@ class VideoCompareWidget(QWidget):
         self.current_segment_index = -1
         self._continuous_preview_active = False
         self._last_merged_result = None
+        self._applied_cfg_pads = None  # (pad_before, pad_after) last applied from config
         self.init_ui()
 
     def init_ui(self):
@@ -413,7 +422,7 @@ class VideoCompareWidget(QWidget):
         self.combo_engine.setFixedWidth(135)
         row1_layout.addWidget(self.combo_engine)
 
-        self.btn_extract_all = QPushButton("🚀 极速核对本任务文案")
+        self.btn_extract_all = QPushButton(self.BTN_TEXT_EXTRACT_ALL)
         self.btn_extract_all.setStyleSheet("""
             QPushButton {
                 background-color: #0284C7;
@@ -426,15 +435,15 @@ class VideoCompareWidget(QWidget):
             QPushButton:disabled { background-color: #D7CCC8; color: #A1887F; }
         """)
         self.btn_extract_all.setToolTip(
-            "采用 VideoKit 极速并发架构：\n"
+            "极速核对当前任务的全部片段文案（自动归位新视频后重新核对）：\n"
             "• FFmpeg 毫秒级提取 16kHz 轻量音频上传（提速 10 倍）\n"
-            "• 多线程并发轮询 + 本地缓存秒读\n"
+            "• 多 Key 分段并行（分段并行数见「全任务一键核对」设置，每个 Key 最多 3 个并发）+ 本地缓存秒读\n"
             "• 逐句核对已知字幕并自动切除片头/片尾多余气口"
         )
         self.btn_extract_all.clicked.connect(self.extract_all_texts)
         row1_layout.addWidget(self.btn_extract_all)
 
-        self.btn_batch_verify_all_tasks = QPushButton("📚 批量核对所有任务 (并行≤4)")
+        self.btn_batch_verify_all_tasks = QPushButton("📚 全任务一键核对")
         self.btn_batch_verify_all_tasks.setStyleSheet("""
             QPushButton {
                 background-color: #7C3AED;
@@ -448,30 +457,12 @@ class VideoCompareWidget(QWidget):
         """)
         self.btn_batch_verify_all_tasks.setToolTip(
             "批量核对所有 FlowCue 任务的文案与自动气口剪切\n"
-            "• 支持多任务并列同时执行（可设置 1~4 个任务并发，最大为 4）\n"
+            "• 任务并行数 1~4 × 分段并行数 1~40（理论最大 160 并发）\n"
+            "• 实际并发受 Gladia Key 数量限制：每个 Key 最多 3 个并发请求，不足时自动降低并行度\n"
             "• 自动归位待归位视频、识别西语数字与单词等价匹配、自动切除气口"
         )
         self.btn_batch_verify_all_tasks.clicked.connect(self.open_batch_all_tasks_verify_dialog)
         row1_layout.addWidget(self.btn_batch_verify_all_tasks)
-
-        self.btn_replace_all_new = QPushButton("🔄 替换新视频并重跑核对")
-        self.btn_replace_all_new.setStyleSheet("""
-            QPushButton {
-                background-color: #0D9488;
-                color: white;
-                font-weight: bold;
-                padding: 5px 12px;
-                border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #0F766E; }
-            QPushButton:disabled { background-color: #D7CCC8; color: #A1887F; }
-        """)
-        self.btn_replace_all_new.setToolTip(
-            "当您删除了错误视频并重新用 JSON 生成完新视频后，\n"
-            "点击此按钮将自动把新视频归位替换，并立即对新视频重新跑一遍核对与切气口！"
-        )
-        self.btn_replace_all_new.clicked.connect(self.replace_and_reverify_pending_videos)
-        row1_layout.addWidget(self.btn_replace_all_new)
 
         self.btn_delete_marked = QPushButton("🗑️ 一键删除标记视频")
         self.btn_delete_marked.setObjectName("btn_delete_marked")
@@ -505,10 +496,10 @@ class VideoCompareWidget(QWidget):
         self.spin_pad_before.setRange(0.0, 2.0)
         self.spin_pad_before.setSingleStep(0.05)
         self.spin_pad_before.setDecimals(2)
-        self.spin_pad_before.setValue(0.10)
+        self.spin_pad_before.setValue(self.DEFAULT_PAD_BEFORE)
         self.spin_pad_before.setSuffix(" s")
         self.spin_pad_before.setFixedWidth(72)
-        self.spin_pad_before.setToolTip("每个视频片段第一句发音前保留的气口缓冲时间（默认 0.10 秒）")
+        self.spin_pad_before.setToolTip("每个视频片段第一句发音前保留的气口缓冲时间（默认值可在「⚙️ 规则设置」中修改，出厂 0.10 秒）")
         row2_layout.addWidget(self.spin_pad_before)
 
         row2_layout.addWidget(QLabel("后留白:"))
@@ -516,10 +507,10 @@ class VideoCompareWidget(QWidget):
         self.spin_pad_after.setRange(0.0, 2.0)
         self.spin_pad_after.setSingleStep(0.05)
         self.spin_pad_after.setDecimals(2)
-        self.spin_pad_after.setValue(0.15)
+        self.spin_pad_after.setValue(self.DEFAULT_PAD_AFTER)
         self.spin_pad_after.setSuffix(" s")
         self.spin_pad_after.setFixedWidth(72)
-        self.spin_pad_after.setToolTip("每个视频片段最后发音结束后保留的气口缓冲时间（默认 0.15 秒）")
+        self.spin_pad_after.setToolTip("每个视频片段最后发音结束后保留的气口缓冲时间（默认值可在「⚙️ 规则设置」中修改，出厂 0.15 秒）")
         row2_layout.addWidget(self.spin_pad_after)
 
         self.btn_recalc_breath = QPushButton("⚡ 应用留白重算全部切点")
@@ -536,7 +527,7 @@ class VideoCompareWidget(QWidget):
         self.btn_preview_all_timeline.clicked.connect(self.toggle_continuous_timeline_preview)
         row2_layout.addWidget(self.btn_preview_all_timeline)
 
-        self.btn_splice_export = QPushButton("🎬 一键合并拼接成片 (+SRT)")
+        self.btn_splice_export = QPushButton(self.BTN_TEXT_SPLICE_EXPORT)
         self.btn_splice_export.setStyleSheet("""
             QPushButton {
                 background-color: #10B981;
@@ -555,7 +546,7 @@ class VideoCompareWidget(QWidget):
         self.btn_splice_export.clicked.connect(self.export_spliced_video)
         row2_layout.addWidget(self.btn_splice_export)
 
-        self.btn_batch_splice_all = QPushButton("📚 批量拼接所有任务并送入Reels")
+        self.btn_batch_splice_all = QPushButton("📚 所有任务一键拼接")
         self.btn_batch_splice_all.setStyleSheet("""
             QPushButton {
                 background-color: #0D9488;
@@ -568,27 +559,11 @@ class VideoCompareWidget(QWidget):
             QPushButton:disabled { background-color: #D7CCC8; color: #A1887F; }
         """)
         self.btn_batch_splice_all.setToolTip(
-            "弹窗勾选需要拼接的多个（或全部）任务，逐个完成合并拼接（+SRT与逐词时间轴），\n"
+            "弹窗勾选需要拼接的多个（或全部）任务，最多 4 个任务并行完成合并拼接（+SRT与逐词时间轴），\n"
             "并全部一键送入【🎬 批量Reels】批量设置字幕与覆层预设"
         )
         self.btn_batch_splice_all.clicked.connect(self.open_batch_all_tasks_splice_dialog)
         row2_layout.addWidget(self.btn_batch_splice_all)
-
-        self.btn_send_to_reels = QPushButton("🚀 送入批量Reels加字幕/卡片")
-        self.btn_send_to_reels.setStyleSheet("""
-            QPushButton {
-                background-color: #EC4899;
-                color: white;
-                font-weight: bold;
-                padding: 5px 12px;
-                border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #DB2777; }
-            QPushButton:disabled { background-color: #D7CCC8; color: #A1887F; }
-        """)
-        self.btn_send_to_reels.setToolTip("将合并拼接好的成片与同步逐词字幕一键送入【🎬 批量Reels】设置字幕样式与添加媒体卡片")
-        self.btn_send_to_reels.clicked.connect(self.send_current_project_to_reels)
-        row2_layout.addWidget(self.btn_send_to_reels)
 
         summary_vbox.addLayout(row2_layout)
         root_layout.addWidget(summary_frame)
@@ -836,7 +811,7 @@ class VideoCompareWidget(QWidget):
 
         self.txt_extracted = QTextEdit()
         self.txt_extracted.setReadOnly(True)
-        self.txt_extracted.setPlaceholderText("AI 提取的文案将显示在这里...\n\n点击上方「🚀 极速核对本任务文案」或「📚 批量核对所有任务」即可并发核对并自动切除首尾气口。")
+        self.txt_extracted.setPlaceholderText("AI 提取的文案将显示在这里...\n\n点击上方「🚀 极速核对（单任务）」或「📚 全任务一键核对」即可并发核对并自动切除首尾气口。")
         self.txt_extracted.setStyleSheet("""
             QTextEdit {
                 background-color: #FAFAFA;
@@ -943,8 +918,40 @@ class VideoCompareWidget(QWidget):
         self.current_segment_index = -1
         self._current_video_path = None
         self._last_merged_result = None
+        self._sync_pad_defaults_from_config()
 
         self.refresh_data()
+
+    def _get_cfg_pad_defaults(self):
+        """Returns (pad_before, pad_after) defaults from 规则设置 (config), or built-in fallbacks."""
+        cfg = self.config_manager
+        if cfg is None:
+            main_win = self.window()
+            cfg = getattr(main_win, "config_manager", None) if main_win is not self else None
+        pb = getattr(cfg, "breath_pad_before", self.DEFAULT_PAD_BEFORE) if cfg is not None else self.DEFAULT_PAD_BEFORE
+        pa = getattr(cfg, "breath_pad_after", self.DEFAULT_PAD_AFTER) if cfg is not None else self.DEFAULT_PAD_AFTER
+        try:
+            return round(float(pb), 3), round(float(pa), 3)
+        except (TypeError, ValueError):
+            return self.DEFAULT_PAD_BEFORE, self.DEFAULT_PAD_AFTER
+
+    def _sync_pad_defaults_from_config(self):
+        """Applies the 规则设置 前留白/后留白 defaults to the spinboxes when they changed in config.
+        Session tweaks made directly in this tab are kept until the configured defaults change."""
+        if not hasattr(self, "spin_pad_before") or not hasattr(self, "spin_pad_after"):
+            return
+        pads = self._get_cfg_pad_defaults()
+        if pads != self._applied_cfg_pads:
+            self.spin_pad_before.setValue(pads[0])
+            self.spin_pad_after.setValue(pads[1])
+            self._applied_cfg_pads = pads
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        try:
+            self._sync_pad_defaults_from_config()
+        except Exception:
+            pass
 
     def cleanup(self):
         """Stops media player and active background worker threads cleanly."""
@@ -1202,12 +1209,6 @@ class VideoCompareWidget(QWidget):
                 self.btn_delete_marked.setText(f"🗑️ 一键删除标记 ({marked_delete_count})")
             else:
                 self.btn_delete_marked.setText("🗑️ 一键删除标记视频")
-
-        if hasattr(self, "btn_replace_all_new") and self.btn_replace_all_new:
-            if pending_relocate_count > 0:
-                self.btn_replace_all_new.setText(f"🔄 替换新视频并重跑核对 ({pending_relocate_count}个新视频)")
-            else:
-                self.btn_replace_all_new.setText("🔄 替换新视频并重跑核对")
 
         pct = int(checked_count / total * 100) if total > 0 else 0
         self.progress_bar.setValue(pct)
@@ -2018,13 +2019,48 @@ class VideoCompareWidget(QWidget):
                 "未配置 ElevenLabs API Key！\n\n请点击主界面的「⚙️ 规则设置」按钮，\n在第 4 区域添加至少一个 ElevenLabs API Key。")
             return
 
-        # Automatically relocate any pending videos before extracting
-        if self.video_report.get("pending_count", 0) > 0:
-            from services.video_checker import VideoChecker
-            VideoChecker.relocate_found_videos(self.video_report)
-            self.video_report = VideoChecker.check_project_videos(
-                self.project_model, self.project_path, base_storage_path=self._get_base_storage_path()
-            )
+        # Automatically relocate any pending or replacement videos from Flow/ before extracting
+        from services.video_checker import VideoChecker
+        from services.speech_extractor import SpeechExtractor
+
+        if hasattr(self, "media_player") and self.media_player:
+            try:
+                self.media_player.stop()
+                self.media_player.setSource(QUrl())
+            except Exception:
+                pass
+
+        base_storage_path = self._get_base_storage_path()
+        fresh_report = VideoChecker.check_project_videos(
+            self.project_model, self.project_path, base_storage_path=base_storage_path
+        )
+        pre_dir = fresh_report.get("pre_relocate_dir", "")
+        post_dir = Path(fresh_report.get("post_relocate_dir", str(self.project_path / "downloads" / "videos")))
+        replaced_indices = set()
+
+        if pre_dir and Path(pre_dir).exists():
+            import shutil
+            post_dir.mkdir(parents=True, exist_ok=True)
+            for i, d in enumerate(fresh_report.get("segments_detail", [])):
+                exp_name = d.get("download_name", f"{i + 1:02d}.mp4")
+                cand = Path(pre_dir) / exp_name
+                if cand.exists():
+                    target = post_dir / exp_name
+                    try:
+                        if target.exists():
+                            target.unlink()
+                        shutil.move(str(cand), str(target))
+                        SpeechExtractor.invalidate_cache(target)
+                        replaced_indices.add(i)
+                    except Exception:
+                        pass
+
+        if fresh_report.get("pending_count", 0) > 0:
+            VideoChecker.relocate_found_videos(fresh_report)
+
+        self.video_report = VideoChecker.check_project_videos(
+            self.project_model, self.project_path, base_storage_path=base_storage_path
+        )
 
         segments = self.project_model.spanish_segments
         details = self.video_report.get("segments_detail", [])
@@ -2033,11 +2069,14 @@ class VideoCompareWidget(QWidget):
         for i, detail in enumerate(details):
             if detail.get("found", False) and detail.get("source_path"):
                 video_path = str(detail["source_path"])
+                if i in replaced_indices:
+                    SpeechExtractor.invalidate_cache(video_path)
                 original_text = segments[i].get("text", "") if i < len(segments) else ""
                 segments_to_process.append({
                     "segment_index": i,
                     "video_path": video_path,
                     "original_text": original_text,
+                    "force_refresh": (i in replaced_indices),
                 })
 
         if not segments_to_process:
@@ -2066,6 +2105,8 @@ class VideoCompareWidget(QWidget):
         language = getattr(self.config_manager, "speech_language", "es")
         pad_b = self.spin_pad_before.value()
         pad_a = self.spin_pad_after.value()
+        # 分段并行数 (shared with 全任务一键核对 setting); actual concurrency capped by keys * 3 in the worker
+        seg_parallel = int(getattr(self.config_manager, "verify_parallel_segments", 10) or 10)
 
         self._extraction_worker = ExtractionWorker(
             segments_to_process,
@@ -2075,7 +2116,7 @@ class VideoCompareWidget(QWidget):
             pad_before=pad_b,
             pad_after=pad_a,
             use_cache=True,
-            max_workers=8,
+            max_workers=seg_parallel,
         )
         self._extraction_worker.progress.connect(self._on_extraction_progress)
         self._extraction_worker.segment_detail_done.connect(self._on_segment_detail_extracted)
@@ -2138,7 +2179,7 @@ class VideoCompareWidget(QWidget):
 
     def _on_extraction_finished(self, success_count, total_count, errors):
         self.btn_extract_all.setEnabled(True)
-        self.btn_extract_all.setText("🚀 极速核对本任务文案")
+        self.btn_extract_all.setText(self.BTN_TEXT_EXTRACT_ALL)
         self.btn_extract_single.setEnabled(True)
         self.btn_refresh.setEnabled(True)
 
@@ -2288,7 +2329,6 @@ class VideoCompareWidget(QWidget):
 
         self.btn_splice_export.setEnabled(False)
         self.btn_splice_export.setText("⏳ 正在合并拼接...")
-        self.btn_send_to_reels.setEnabled(False)
         self._send_to_reels_after_splice = bool(send_to_reels_after)
 
         from services.video_splice_service import VideoSpliceWorker
@@ -2310,8 +2350,7 @@ class VideoCompareWidget(QWidget):
 
     def _on_splice_finished(self, success: bool, result: dict):
         self.btn_splice_export.setEnabled(True)
-        self.btn_splice_export.setText("🎬 一键合并拼接成片 (+SRT)")
-        self.btn_send_to_reels.setEnabled(True)
+        self.btn_splice_export.setText(self.BTN_TEXT_SPLICE_EXPORT)
         self._splice_worker = None
 
         if not success:
@@ -2388,6 +2427,7 @@ class VideoCompareWidget(QWidget):
             storage_manager=storage_mgr,
             main_window=main_win,
             parent=self,
+            config_manager=self.config_manager or getattr(main_win, "config_manager", None),
         )
         dlg.exec()
 
@@ -2449,29 +2489,44 @@ class VideoCompareWidget(QWidget):
 
 
 class BatchAllTasksVerifyDialog(QDialog):
-    """Dialog for batch verifying subtitles & breath cut points across all FlowCue tasks in parallel (max 4)."""
+    """Dialog for batch verifying subtitles & breath cut points across all FlowCue tasks in parallel.
+
+    任务并行数 (1..4) × 分段并行数 (1..40) → theoretical max 160 concurrent requests,
+    automatically capped by the number of API keys (each key ≤ 3 concurrent requests).
+    """
 
     def __init__(
         self,
         storage_manager,
         config_manager,
         default_engine="gladia",
-        default_pad_before=0.10,
-        default_pad_after=0.15,
+        default_pad_before=None,
+        default_pad_after=None,
         parent=None,
     ):
         super().__init__(parent)
         self.storage_manager = storage_manager
         self.config_manager = config_manager
         self.default_engine = default_engine
-        self.default_pad_before = default_pad_before
-        self.default_pad_after = default_pad_after
+        # Fall back to 规则设置 (config) 前留白/后留白 defaults when not explicitly provided
+        if default_pad_before is None:
+            default_pad_before = getattr(config_manager, "breath_pad_before", 0.10)
+        if default_pad_after is None:
+            default_pad_after = getattr(config_manager, "breath_pad_after", 0.15)
+        try:
+            self.default_pad_before = float(default_pad_before)
+        except (TypeError, ValueError):
+            self.default_pad_before = 0.10
+        try:
+            self.default_pad_after = float(default_pad_after)
+        except (TypeError, ValueError):
+            self.default_pad_after = 0.15
         self._worker = None
         self._projects_data = []
         self._row_by_proj_id = {}
 
-        self.setWindowTitle("📚 批量核对所有任务文案 (多任务并列执行 · 最大并发 4)")
-        self.resize(920, 620)
+        self.setWindowTitle("📚 全任务一键核对 (任务并行 × 分段并行 · 多 Key 自动限流)")
+        self.resize(980, 640)
         self.init_ui()
         self.load_projects_table()
 
@@ -2543,30 +2598,58 @@ class BatchAllTasksVerifyDialog(QDialog):
         row1 = QHBoxLayout()
         row1.setSpacing(10)
 
-        lbl_parallel = QLabel("🔀 并列执行任务数 (最大 4):")
+        lbl_parallel = QLabel("🔀 任务并行数:")
         lbl_parallel.setStyleSheet("color: #6D28D9; font-weight: bold; font-size: 13px;")
         row1.addWidget(lbl_parallel)
 
         self.spin_parallel_tasks = QSpinBox()
         self.spin_parallel_tasks.setRange(1, 4)
-        self.spin_parallel_tasks.setValue(4)
-        self.spin_parallel_tasks.setSuffix(" 个任务并发")
-        self.spin_parallel_tasks.setFixedWidth(125)
+        self.spin_parallel_tasks.setValue(
+            max(1, min(4, int(getattr(self.config_manager, "verify_parallel_tasks", 4) or 4)))
+        )
+        self.spin_parallel_tasks.setSuffix(" 个任务")
+        self.spin_parallel_tasks.setFixedWidth(100)
         self.spin_parallel_tasks.setToolTip("同时并列核对的任务数量（范围 1 ~ 4，最大为 4）")
         row1.addWidget(self.spin_parallel_tasks)
 
-        row1.addSpacing(8)
-        row1.addWidget(QLabel("🔊 语音引擎:"))
+        lbl_seg_parallel = QLabel("🧩 分段并行数:")
+        lbl_seg_parallel.setStyleSheet("color: #6D28D9; font-weight: bold; font-size: 13px;")
+        row1.addWidget(lbl_seg_parallel)
+
+        self.spin_parallel_segments = QSpinBox()
+        self.spin_parallel_segments.setRange(1, 40)
+        self.spin_parallel_segments.setValue(
+            max(1, min(40, int(getattr(self.config_manager, "verify_parallel_segments", 10) or 10)))
+        )
+        self.spin_parallel_segments.setSuffix(" 段/任务")
+        self.spin_parallel_segments.setFixedWidth(100)
+        self.spin_parallel_segments.setToolTip(
+            "每个任务内同时核对的片段数量（范围 1 ~ 40）\n"
+            "理论最大并发 = 任务并行数 × 分段并行数（最大 4 × 40 = 160）\n"
+            "实际并发受 Key 数量限制：每个 Key 最多 3 个并发请求（N 个 Key 最多 3N）\n"
+            "「🚀 极速核对（单任务）」也使用此分段并行数"
+        )
+        row1.addWidget(self.spin_parallel_segments)
+
+        self.lbl_concurrency_info = QLabel("")
+        self.lbl_concurrency_info.setWordWrap(True)
+        self.lbl_concurrency_info.setStyleSheet("color: #0F766E; font-size: 12px; font-weight: bold;")
+        row1.addWidget(self.lbl_concurrency_info, stretch=1)
+        cfg_vbox.addLayout(row1)
+
+        row1b = QHBoxLayout()
+        row1b.setSpacing(10)
+        row1b.addWidget(QLabel("🔊 语音引擎:"))
         self.combo_engine = QComboBox()
         self.combo_engine.addItem("Gladia 极速并发", "gladia")
         self.combo_engine.addItem("ElevenLabs", "elevenlabs")
         if self.default_engine == "elevenlabs":
             self.combo_engine.setCurrentIndex(1)
         self.combo_engine.setFixedWidth(140)
-        row1.addWidget(self.combo_engine)
+        row1b.addWidget(self.combo_engine)
 
-        row1.addSpacing(8)
-        row1.addWidget(QLabel("✂️ 前留白:"))
+        row1b.addSpacing(8)
+        row1b.addWidget(QLabel("✂️ 前留白:"))
         self.spin_pad_before = QDoubleSpinBox()
         self.spin_pad_before.setRange(0.0, 2.0)
         self.spin_pad_before.setSingleStep(0.05)
@@ -2574,9 +2657,9 @@ class BatchAllTasksVerifyDialog(QDialog):
         self.spin_pad_before.setValue(self.default_pad_before)
         self.spin_pad_before.setSuffix("s")
         self.spin_pad_before.setFixedWidth(70)
-        row1.addWidget(self.spin_pad_before)
+        row1b.addWidget(self.spin_pad_before)
 
-        row1.addWidget(QLabel("后留白:"))
+        row1b.addWidget(QLabel("后留白:"))
         self.spin_pad_after = QDoubleSpinBox()
         self.spin_pad_after.setRange(0.0, 2.0)
         self.spin_pad_after.setSingleStep(0.05)
@@ -2584,10 +2667,15 @@ class BatchAllTasksVerifyDialog(QDialog):
         self.spin_pad_after.setValue(self.default_pad_after)
         self.spin_pad_after.setSuffix("s")
         self.spin_pad_after.setFixedWidth(70)
-        row1.addWidget(self.spin_pad_after)
+        row1b.addWidget(self.spin_pad_after)
 
-        row1.addStretch()
-        cfg_vbox.addLayout(row1)
+        row1b.addStretch()
+        cfg_vbox.addLayout(row1b)
+
+        self.spin_parallel_tasks.valueChanged.connect(self._update_concurrency_info)
+        self.spin_parallel_segments.valueChanged.connect(self._update_concurrency_info)
+        self.combo_engine.currentIndexChanged.connect(self._update_concurrency_info)
+        self._update_concurrency_info()
 
         row2 = QHBoxLayout()
         row2.setSpacing(12)
@@ -2796,6 +2884,52 @@ class BatchAllTasksVerifyDialog(QDialog):
             if it:
                 it.setCheckState(Qt.CheckState.Checked if p_data.get("has_work") else Qt.CheckState.Unchecked)
 
+    def _current_engine_keys(self) -> list:
+        engine = self.combo_engine.currentData() if hasattr(self, "combo_engine") else "gladia"
+        if self.config_manager is None:
+            return []
+        if hasattr(self.config_manager, "get_speech_keys"):
+            return self.config_manager.get_speech_keys(engine)
+        if engine == "elevenlabs":
+            return list(getattr(self.config_manager, "elevenlabs_api_keys", []) or [])
+        return list(getattr(self.config_manager, "gladia_api_keys", []) or [])
+
+    def _compute_concurrency_plan(self) -> dict:
+        from services.speech_extractor import compute_concurrency_plan
+        per_key = int(getattr(self.config_manager, "SPEECH_MAX_CONCURRENT_PER_KEY", 3) or 3)
+        return compute_concurrency_plan(
+            len(self._current_engine_keys()),
+            self.spin_parallel_tasks.value(),
+            self.spin_parallel_segments.value(),
+            per_key_limit=per_key,
+        )
+
+    def _update_concurrency_info(self, *args):
+        if not hasattr(self, "lbl_concurrency_info"):
+            return
+        try:
+            plan = self._compute_concurrency_plan()
+        except Exception as exc:
+            self.lbl_concurrency_info.setText(f"⚠️ 无法计算并发: {exc}")
+            return
+        icon = "⚠️" if plan.get("adjusted") else "✅"
+        color = "#B45309" if plan.get("adjusted") else "#0F766E"
+        self.lbl_concurrency_info.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: bold;")
+        self.lbl_concurrency_info.setText(f"{icon} {plan.get('note', '')}")
+
+    def _persist_parallel_settings(self):
+        """Saves 任务并行数 / 分段并行数 to config so they are remembered next time."""
+        cfg = self.config_manager
+        if cfg is None:
+            return
+        try:
+            cfg.verify_parallel_tasks = int(self.spin_parallel_tasks.value())
+            cfg.verify_parallel_segments = int(self.spin_parallel_segments.value())
+            if hasattr(cfg, "save"):
+                cfg.save()
+        except Exception as exc:
+            print(f"Error saving verify parallel settings: {exc}")
+
     def start_batch_verify(self):
         engine = self.combo_engine.currentData()
         if engine == "gladia" and not self.config_manager.gladia_api_keys:
@@ -2816,11 +2950,17 @@ class BatchAllTasksVerifyDialog(QDialog):
             return
 
         parallel_cnt = min(4, max(1, self.spin_parallel_tasks.value()))
+        seg_parallel_cnt = min(40, max(1, self.spin_parallel_segments.value()))
+        self._persist_parallel_settings()
+        plan = self._compute_concurrency_plan()
+        self._update_concurrency_info()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.spin_parallel_tasks.setEnabled(False)
+        self.spin_parallel_segments.setEnabled(False)
         self.combo_engine.setEnabled(False)
         self.overall_bar.setValue(0)
+        self.lbl_overall_status.setText(f"🚀 正在启动… {plan.get('note', '')}")
 
         from services.speech_extractor import BatchMultiProjectVerifyWorker
         base_dir = self.storage_manager.get_base_path() if self.storage_manager else None
@@ -2836,13 +2976,19 @@ class BatchAllTasksVerifyDialog(QDialog):
             skip_already_checked=self.chk_skip_checked.isChecked(),
             force_no_cache=self.chk_force_no_cache.isChecked(),
             parent=self,
+            max_parallel_segments=seg_parallel_cnt,
         )
         self._worker.task_started.connect(self._on_task_started)
         self._worker.task_progress.connect(self._on_task_progress)
         self._worker.task_finished.connect(self._on_task_finished)
         self._worker.overall_progress.connect(self._on_overall_progress)
         self._worker.all_finished.connect(self._on_all_finished)
+        self._worker.concurrency_note.connect(self._on_concurrency_note)
         self._worker.start()
+
+    def _on_concurrency_note(self, note: str):
+        if hasattr(self, "lbl_concurrency_info") and note:
+            self.lbl_concurrency_info.setText(f"⚙️ 运行中: {note}")
 
     def stop_batch_verify(self):
         if self._worker and self._worker.isRunning():
@@ -2902,8 +3048,10 @@ class BatchAllTasksVerifyDialog(QDialog):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.spin_parallel_tasks.setEnabled(True)
+        self.spin_parallel_segments.setEnabled(True)
         self.combo_engine.setEnabled(True)
         self.overall_bar.setValue(100)
+        self._update_concurrency_info()
 
         total_checked = sum(r.get("auto_checked_count", 0) for r in all_results if isinstance(r, dict))
         total_flagged = sum(r.get("flagged_count", 0) for r in all_results if isinstance(r, dict))
@@ -2912,7 +3060,7 @@ class BatchAllTasksVerifyDialog(QDialog):
         )
         QMessageBox.information(
             self,
-            "批量核对所有任务完成",
+            "全任务一键核对完成",
             f"🎉 已完成 {total_tasks} 个任务的批量并列核对！\n\n"
             f"• 完全成功任务: {success_tasks} / {total_tasks}\n"
             f"• 累计核对通过句段 (≥90%): {total_checked} 段\n"
@@ -2927,17 +3075,18 @@ class BatchAllTasksVerifyDialog(QDialog):
 
 
 class BatchAllTasksSpliceDialog(QDialog):
-    """Dialog for selecting multiple/all FlowCue tasks, splicing them one-by-one, and sending all to Batch Reels."""
+    """Dialog for selecting multiple/all FlowCue tasks, splicing them (up to 4 in parallel), and sending all to Batch Reels."""
 
-    def __init__(self, storage_manager, main_window=None, parent=None):
+    def __init__(self, storage_manager, main_window=None, parent=None, config_manager=None):
         super().__init__(parent)
         self.storage_manager = storage_manager
         self.main_window = main_window
+        self.config_manager = config_manager or getattr(main_window, "config_manager", None)
         self._worker = None
         self._projects_data = []
         self._row_by_proj_id = {}
 
-        self.setWindowTitle("📚 批量合并拼接所有任务成片 (+SRT) 并全部送入批量Reels")
+        self.setWindowTitle("📚 所有任务一键拼接成片 (+SRT) 并全部送入批量Reels")
         self.resize(940, 620)
         self.init_ui()
         self.load_projects_table()
@@ -3026,7 +3175,21 @@ class BatchAllTasksSpliceDialog(QDialog):
         row2 = QHBoxLayout()
         row2.setSpacing(10)
 
-        lbl_hint = QLabel("💡 请勾选需要合并拼接的任务（支持任意多选或全选，按顺序逐个无缝拼接导出 MP4 + SRT）：")
+        lbl_splice_parallel = QLabel("🔀 并行线程数:")
+        lbl_splice_parallel.setStyleSheet("color: #6D28D9; font-weight: bold; font-size: 13px;")
+        row2.addWidget(lbl_splice_parallel)
+
+        self.spin_parallel_splice = QSpinBox()
+        self.spin_parallel_splice.setRange(1, 4)
+        self.spin_parallel_splice.setValue(
+            max(1, min(4, int(getattr(self.config_manager, "splice_parallel_tasks", 4) or 4)))
+        )
+        self.spin_parallel_splice.setSuffix(" 个任务")
+        self.spin_parallel_splice.setFixedWidth(100)
+        self.spin_parallel_splice.setToolTip("同时并行合并拼接的任务数量（范围 1 ~ 4；1 = 逐个拼接）")
+        row2.addWidget(self.spin_parallel_splice)
+
+        lbl_hint = QLabel("💡 请勾选需要合并拼接的任务（支持任意多选或全选，多任务并行无缝拼接导出 MP4 + SRT）：")
         lbl_hint.setStyleSheet("font-size: 12px; color: #5D4037;")
         row2.addWidget(lbl_hint)
 
@@ -3073,7 +3236,7 @@ class BatchAllTasksSpliceDialog(QDialog):
 
         # Progress & Bottom Buttons
         prog_row = QHBoxLayout()
-        self.lbl_overall_status = QLabel("就绪：请勾选需要拼接的任务，点击右下角【🎬 开始逐个拼接并送入批量Reels】")
+        self.lbl_overall_status = QLabel("就绪：请勾选需要拼接的任务，点击右下角【🎬 开始拼接并送入批量Reels】")
         self.lbl_overall_status.setStyleSheet("font-size: 12px; color: #5D4037;")
         prog_row.addWidget(self.lbl_overall_status, stretch=1)
 
@@ -3087,7 +3250,7 @@ class BatchAllTasksSpliceDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
 
-        self.btn_start = QPushButton("🎬 开始逐个拼接并送入批量Reels")
+        self.btn_start = QPushButton("🎬 开始拼接并送入批量Reels")
         self.btn_start.setStyleSheet("""
             QPushButton {
                 background-color: #10B981;
@@ -3210,8 +3373,19 @@ class BatchAllTasksSpliceDialog(QDialog):
             QMessageBox.information(self, "提示", "请至少勾选一个要合并拼接的任务。")
             return
 
+        parallel_cnt = max(1, min(4, int(self.spin_parallel_splice.value())))
+        # Persist 并行线程数 so it is remembered next time
+        if self.config_manager is not None:
+            try:
+                self.config_manager.splice_parallel_tasks = parallel_cnt
+                if hasattr(self.config_manager, "save"):
+                    self.config_manager.save()
+            except Exception as exc:
+                print(f"Error saving splice parallel setting: {exc}")
+
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.spin_parallel_splice.setEnabled(False)
         self.overall_bar.setValue(0)
 
         from services.video_splice_service import BatchMultiProjectSpliceWorker
@@ -3222,6 +3396,7 @@ class BatchAllTasksSpliceDialog(QDialog):
             base_storage_path=base_dir,
             skip_already_merged=self.chk_reuse_existing.isChecked(),
             parent=self,
+            max_parallel_tasks=parallel_cnt,
         )
         self._worker.task_started.connect(self._on_task_started)
         self._worker.task_progress.connect(self._on_task_progress)
@@ -3232,7 +3407,7 @@ class BatchAllTasksSpliceDialog(QDialog):
 
     def stop_batch_splice(self):
         if self._worker and self._worker.isRunning():
-            self.lbl_overall_status.setText("⏳ 正在停止批量拼接任务...")
+            self.lbl_overall_status.setText("⏳ 正在停止批量拼接任务（终止所有运行中的 FFmpeg 进程）...")
             self._worker.cancel()
 
     def _on_task_started(self, proj_id: str):
@@ -3279,6 +3454,8 @@ class BatchAllTasksSpliceDialog(QDialog):
     def _on_all_finished(self, success_tasks: int, total_tasks: int, completed_payloads: list):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        if hasattr(self, "spin_parallel_splice"):
+            self.spin_parallel_splice.setEnabled(True)
         self.overall_bar.setValue(100)
 
         self.lbl_overall_status.setText(
@@ -3306,7 +3483,7 @@ class BatchAllTasksSpliceDialog(QDialog):
     def closeEvent(self, event):
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
-            self._worker.wait(2000)
+            self._worker.wait(5000)
         super().closeEvent(event)
 
 

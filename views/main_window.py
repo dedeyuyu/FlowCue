@@ -295,12 +295,13 @@ class MainWindow(QMainWindow):
             }
         """
 
-        top_row1.addWidget(QLabel("存储路径 (Storage Path):"))
+        top_row1.addWidget(QLabel("存储路径"))
 
         self.txt_base_path = QLineEdit()
         self.txt_base_path.setReadOnly(True)
         self.txt_base_path.setPlaceholderText("请选择项目数据存放的总目录...")
-        top_row1.addWidget(self.txt_base_path, stretch=1)
+        self.txt_base_path.setFixedWidth(280)
+        top_row1.addWidget(self.txt_base_path)
 
         self.btn_select_path = QPushButton("选择路径")
         self.btn_select_path.setStyleSheet(row1_blue_qss)
@@ -347,6 +348,8 @@ class MainWindow(QMainWindow):
         top_row1.addWidget(self.btn_theme_toggle)
         self._update_theme_toggle_btn()
 
+        top_row1.addStretch(1)
+
         top_container_layout.addLayout(top_row1)
 
         # ── 第二行：归位 + 核对文案 + 批量拼接 + 批量选择预设 + 快速审核 (统一绿色，字号稍小) + 打开文件夹 (保留原色) ──
@@ -381,14 +384,14 @@ class MainWindow(QMainWindow):
         self.btn_batch_verify_all = QPushButton("📚 核对文案")
         self.btn_batch_verify_all.setObjectName("btn_batch_verify_all")
         self.btn_batch_verify_all.setStyleSheet(row2_green_qss)
-        self.btn_batch_verify_all.setToolTip("批量并列核对所有任务的文案与自动气口剪切（最大支持 4 任务并发）")
+        self.btn_batch_verify_all.setToolTip("全任务一键多Key并行核对文案与自动气口剪切（最大支持 4任务×40分段=160并发，按Key数自动限流）")
         self.btn_batch_verify_all.clicked.connect(self.open_batch_verify_all_dialog)
         top_row2.addWidget(self.btn_batch_verify_all)
 
         self.btn_batch_splice_all = QPushButton("🎬 批量拼接")
         self.btn_batch_splice_all.setObjectName("btn_batch_splice_all")
         self.btn_batch_splice_all.setStyleSheet(row2_green_qss)
-        self.btn_batch_splice_all.setToolTip("勾选多个或全部任务，逐个完成合并拼接成片 (+SRT) 并全部送入【🎬 批量Reels】")
+        self.btn_batch_splice_all.setToolTip("所有任务一键拼接（支持 4 线程并行合成 MP4 + SRT，并自动送入【🎬 批量Reels】）")
         self.btn_batch_splice_all.clicked.connect(self.open_batch_splice_all_dialog)
         top_row2.addWidget(self.btn_batch_splice_all)
 
@@ -539,6 +542,24 @@ class MainWindow(QMainWindow):
         self.main_tab_widget.currentChanged.connect(self._on_main_tab_changed)
         self.account_monitor = None
         main_layout.addWidget(self.main_tab_widget, stretch=1)
+
+        # 后台静默预热「👁️ 素材快速审核」与「🎬 批量Reels」引擎（隐藏窗口启动，切换到标签页时秒开不等待）
+        QTimer.singleShot(1800, self._prewarm_visual_review_engine)
+        QTimer.singleShot(3800, self._prewarm_batch_reels_engine)
+
+    def _prewarm_visual_review_engine(self):
+        try:
+            if hasattr(self, "visual_review_tab") and self.visual_review_tab:
+                self.visual_review_tab.ensure_engine_started()
+        except Exception as e:
+            print(f"[MainWindow] prewarm visual_review_tab warning: {e}")
+
+    def _prewarm_batch_reels_engine(self):
+        try:
+            if hasattr(self, "batch_reels_tab") and self.batch_reels_tab:
+                self.batch_reels_tab.ensure_engine_started()
+        except Exception as e:
+            print(f"[MainWindow] prewarm batch_reels_tab warning: {e}")
 
     def load_initial_state(self):
         """Displays saved base path if it exists and loads projects list."""
@@ -732,6 +753,8 @@ class MainWindow(QMainWindow):
             if hasattr(self, "detail_widget"):
                 self.detail_widget.set_config_manager(self.config_manager)
                 self.detail_widget.populate_segments_table()
+            if hasattr(self, "hosted_mode") and self.hosted_mode and hasattr(self.hosted_mode, "sync_from_config_manager"):
+                self.hosted_mode.sync_from_config_manager()
 
     def on_project_clicked(self, item):
         """Triggers detail load when sidebar item is clicked."""
@@ -1110,7 +1133,7 @@ class MainWindow(QMainWindow):
             
         reply = QMessageBox.question(
             self, "确认批量重命名",
-            "是否要为所有项目自动重命名里面的图片？\n\n(规则：将所有项目视为一个整体，依次命名为 1.jpg, 2.jpg...)",
+            "是否要为所有项目自动重命名里面的图片？\n\n(规则：将所有项目视为一个整体，依次命名为 FC0001.jpg, FC0002.jpg... 避免搜索重名冲突)",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )

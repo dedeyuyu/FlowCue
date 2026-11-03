@@ -362,12 +362,44 @@
             }
         }
         // 情况 C: 同级容器内的 input[type="range"]
+        // ⚠️ 仅当父容器是「1 个滑块 + 1 个数字框」的小组合（如 .rop-slider-combo / #rop-opacity-wrap）时才配对。
+        // 旧逻辑直接 parent.querySelector('input[type="range"]')：覆层面板「变换」区的 .rop-grid 同时包含
+        // 位置X / 位置Y / 宽高 / 旋转 等数字框以及嵌套在 #rop-opacity-wrap 内的「不透明」滑块，
+        // 导致在 位置X/位置Y 上滚动滚轮时把「不透明」滑块当成了配对滑块，一起被修改（且 X/Y 被错误夹到 0~100）。
         const parent = numInput.parentElement;
         if (parent) {
-            const sibRange = parent.querySelector('input[type="range"]');
+            const sibRange = findUniqueRangeNumberPairRange(parent, numInput);
             if (sibRange) return sibRange;
         }
         return null;
+    }
+
+    // 判断一个 input 是否属于「可填数字/文本」的输入框（排除滑块、勾选框、按钮等）
+    function isTextLikeNumberBox(el) {
+        if (!el || (el.tagName || '').toUpperCase() !== 'INPUT') return false;
+        const type = (el.type || 'text').toLowerCase();
+        return type === 'number' || type === 'text';
+    }
+
+    // 若 container 内恰好只有 1 个滑块与 1 个数字框（且该数字框就是 numInput，或 numInput 未指定），返回该滑块
+    function findUniqueRangeNumberPairRange(container, numInput = null) {
+        if (!container || !container.querySelectorAll) return null;
+        const ranges = container.querySelectorAll('input[type="range"]');
+        if (ranges.length !== 1) return null;
+        const boxes = Array.from(container.querySelectorAll('input')).filter(isTextLikeNumberBox);
+        if (boxes.length !== 1) return null;
+        if (numInput && boxes[0] !== numInput) return null;
+        return ranges[0];
+    }
+
+    // 若滑块的父容器内恰好只有该滑块与 1 个数字框，返回该数字框（用于复用原生数字框，避免误配其他字段）
+    function findUniqueSiblingNumberInputForRange(range) {
+        const parent = range && range.parentElement;
+        if (!parent) return null;
+        const ranges = parent.querySelectorAll('input[type="range"]');
+        if (ranges.length !== 1 || ranges[0] !== range) return null;
+        const boxes = Array.from(parent.querySelectorAll('input[type="number"]'));
+        return boxes.length === 1 ? boxes[0] : null;
     }
 
     function ensureAllRangeSlidersHaveNumberInput(root = document) {
@@ -399,7 +431,8 @@
             }
             const parent = range.parentElement;
             if (!parent) return;
-            const existingNum = parent.querySelector('input[type="number"]');
+            // 仅复用「同一小组合容器内唯一」的数字框，防止把相邻其他参数（如 位置X）误当成该滑块的数字框
+            const existingNum = findUniqueSiblingNumberInputForRange(range);
             if (existingNum) {
                 existingNum._pairedRange = range;
                 range._pairedNum = existingNum;
@@ -412,7 +445,7 @@
             if (id) {
                 valSpan = document.getElementById(id + '-val') || parent.querySelector(`#${CSS.escape(id)}-val`);
             }
-            if (!valSpan) {
+            if (!valSpan && parent.querySelectorAll('input[type="range"]').length === 1) {
                 valSpan = parent.querySelector('.rbt-voicevol-label, span[id$="-val"]');
             }
 
@@ -495,27 +528,30 @@
     }
 
     // 核心功能：
-    // 1. 进度条 (input[type="range"]) 禁用鼠标滚轮调整（只能通过鼠标拉拽进度条）；
+    // 1. 进度条 (input[type="range"]) 禁用鼠标滚轮调整（只能通过鼠标拉拽进度条），在其上滚动时面板正常滚动；
     // 2. 数字框（含进度条后面的数字框、字幕/覆层/内容视频数字框）在鼠标单击确认聚焦后，滚动鼠标滚轮直接上下调整数值！
+    // 3. 只调整「已聚焦 且 鼠标正悬停在其上」的那个数字框：鼠标在其他位置（包括其他未聚焦的数字框）滚动时
+    //    不拦截滚轮，面板正常滚动，绝不改动任何其他字段（修复：位置X/位置Y 上滚动时「不透明」也跟着变）。
     window.addEventListener('wheel', (e) => {
         const target = e.target;
-        // 规则 1：如果鼠标在进度条 (input[type="range"]) 上滚动，或者当前焦点在进度条上，严禁滚轮改变进度条数值
+        const active = document.activeElement;
+        // 规则 1：如果鼠标在进度条 (input[type="range"]) 上滚动，严禁滚轮改变进度条数值（不阻止默认滚动，面板照常滚动）
         if (target && ((target.tagName === 'INPUT' && target.type === 'range') || (target.closest && target.closest('input[type="range"]')))) {
-            if (document.activeElement && document.activeElement.type === 'range') {
-                try { document.activeElement.blur(); } catch (_) {}
+            if (active && active.tagName === 'INPUT' && active.type === 'range') {
+                try { active.blur(); } catch (_) {}
             }
-            e.preventDefault();
             e.stopPropagation();
             return;
         }
-        const active = document.activeElement;
         if (active && active.tagName === 'INPUT' && active.type === 'range') {
             try { active.blur(); } catch (_) {}
             return;
         }
 
-        // 规则 2：当数字输入框处于点击确认聚焦状态时，滚轮直接上下调节数字
+        // 规则 2：当数字输入框处于点击确认聚焦状态、且鼠标正悬停在它上面时，滚轮直接上下调节数字
         if (!active || !isNumericParameterInput(active)) return;
+        const hoveringActive = target === active || (target && target.closest && target.closest('input') === active);
+        if (!hoveringActive) return;
         e.preventDefault();
         e.stopPropagation();
 
@@ -1511,6 +1547,635 @@
     };
 
     // ═══════════════════════════════════════════════════════════════════════
+    // 6. 批量Reels 批量导出标题和覆层预设名称 (支持复制两列 TSV / 单独整列 / 保存文件)
+    // ═══════════════════════════════════════════════════════════════════════
+    function extractTaskExportRow(task, idx) {
+        if (!task) {
+            return { index: idx + 1, exportTitle: '', overlayTitle: '', bestTitle: '', overlayPreset: '', subtitlePreset: '' };
+        }
+        const rawExportName = String(
+            task.customExportName ||
+            task.baseName ||
+            (task.fileName ? String(task.fileName).replace(/\.[^.]+$/, '') : '') ||
+            `任务_${idx + 1}`
+        ).trim();
+
+        let overlayTitle = '';
+        if (Array.isArray(task.overlays)) {
+            for (const ov of task.overlays) {
+                if (!ov || ov.fixed_text) continue;
+                if ((ov.type === 'textcard' || !ov.type || ov.type === '') && String(ov.title_text || '').trim()) {
+                    overlayTitle = String(ov.title_text || '').replace(/\r?\n/g, ' ').trim();
+                    break;
+                }
+                if (ov.type === 'scroll' && String(ov.scroll_title || '').trim()) {
+                    overlayTitle = String(ov.scroll_title || '').replace(/\r?\n/g, ' ').trim();
+                    break;
+                }
+            }
+        }
+        const bestTitle = overlayTitle || rawExportName;
+        const overlayPreset = String(task._overlayPresetName || '').trim();
+        const subtitlePreset = String(task._subtitlePreset || '').trim();
+        return {
+            index: idx + 1,
+            exportTitle: rawExportName,
+            overlayTitle,
+            bestTitle,
+            overlayPreset,
+            subtitlePreset,
+        };
+    }
+
+    function openExportTitlesAndPresetsModal() {
+        try {
+            if (typeof window._applyBatchTableChanges === 'function') {
+                window._applyBatchTableChanges();
+            }
+        } catch (_) {}
+
+        const existing = document.getElementById('flowcue-export-titles-presets-modal');
+        if (existing) existing.remove();
+
+        const allTasks = Array.isArray(window._reelsState?.tasks) ? window._reelsState.tasks : [];
+        if (allTasks.length === 0) {
+            if (typeof showToast === 'function') {
+                showToast('⚠️ 当前批量Reels中没有任务可导出！', 'warning', 2600);
+            }
+            return;
+        }
+
+        const selectedIndices = (typeof window._getSelectedIndices === 'function') ? window._getSelectedIndices() : [];
+        const hasSelection = Array.isArray(selectedIndices) && selectedIndices.length > 0;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'flowcue-export-titles-presets-modal';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:100020;background:rgba(0,0,0,0.72);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px;';
+
+        const modal = document.createElement('div');
+        modal.style.cssText = 'width:760px;max-width:95vw;max-height:88vh;background:#16192b;border:1px solid rgba(129,140,248,0.45);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.75);display:flex;flex-direction:column;color:#e2e8f0;font-family:"Microsoft YaHei",system-ui,sans-serif;overflow:hidden;';
+
+        modal.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:linear-gradient(90deg,rgba(79,70,229,0.28),rgba(30,41,59,0.6));border-bottom:1px solid rgba(255,255,255,0.1);">
+                <div style="display:flex;align-items:center;gap:8px;font-size:15px;font-weight:800;color:#c7d2fe;">
+                    <span>📤 批量导出标题与覆层预设名称</span>
+                    <span id="fc-exp-count-badge" style="font-size:12px;font-weight:600;padding:2px 8px;border-radius:10px;background:rgba(99,102,241,0.25);color:#a5b4fc;">共 ${allTasks.length} 条</span>
+                </div>
+                <button type="button" id="fc-exp-close-top" style="background:none;border:none;color:#94a3b8;font-size:18px;cursor:pointer;padding:2px 6px;">✕</button>
+            </div>
+            <div style="padding:14px 18px;display:flex;flex-direction:column;gap:10px;flex:1;min-height:0;overflow:auto;">
+                <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;background:rgba(15,23,42,0.65);padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.08);font-size:12px;">
+                    <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
+                        <span style="color:#94a3b8;font-weight:600;">导出范围：</span>
+                        <select id="fc-exp-scope" style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:5px;padding:4px 8px;font-size:12px;">
+                            <option value="all">全部任务 (${allTasks.length} 条)</option>
+                            ${hasSelection ? `<option value="selected" selected>仅勾选任务 (${selectedIndices.length} 条)</option>` : ''}
+                        </select>
+                    </label>
+                    <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
+                        <span style="color:#94a3b8;font-weight:600;">标题来源：</span>
+                        <select id="fc-exp-title-src" style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:5px;padding:4px 8px;font-size:12px;">
+                            <option value="auto">智能优先 (有覆层标题用覆层标题，否则用导出命名)</option>
+                            <option value="export">导出命名 / 任务文件名</option>
+                            <option value="overlay">仅覆层卡片标题 (title)</option>
+                        </select>
+                    </label>
+                    <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
+                        <span style="color:#94a3b8;font-weight:600;">导出列格式：</span>
+                        <select id="fc-exp-cols" style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:5px;padding:4px 8px;font-size:12px;">
+                            <option value="title_overlay">标题 + 覆层预设名称 (两列，可直贴 Excel)</option>
+                            <option value="full">导出命名 + 覆层标题 + 覆层预设 + 字幕模版 (四列)</option>
+                            <option value="only_title">仅标题 (单列)</option>
+                            <option value="only_overlay">仅覆层预设名称 (单列)</option>
+                        </select>
+                    </label>
+                    <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;user-select:none;">
+                        <input type="checkbox" id="fc-exp-header" style="width:14px;height:14px;accent-color:#6366f1;cursor:pointer;" />
+                        <span>包含表头行</span>
+                    </label>
+                </div>
+                <textarea id="fc-exp-textarea" spellcheck="false" style="width:100%;height:300px;flex:1;resize:vertical;background:#0b0f19;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px 12px;font-family:Consolas,Monaco,'Microsoft YaHei',monospace;font-size:12px;line-height:1.55;box-sizing:border-box;white-space:pre;overflow:auto;"></textarea>
+                <div style="font-size:11px;color:#94a3b8;">
+                    💡 提示：两列模式使用 Tab 分隔，复制后可在 Excel / 飞书表格 / Google Sheets 中直接粘贴成两列；单列模式可直接粘贴回批量表格对应列。
+                </div>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:12px 18px;background:#0f172a;border-top:1px solid rgba(255,255,255,0.08);">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                    <button type="button" id="fc-exp-copy-both" style="padding:7px 14px;border-radius:6px;border:none;background:linear-gradient(135deg,#4f46e5,#4338ca);color:#fff;font-weight:700;font-size:12px;cursor:pointer;">📋 复制当前预览内容</button>
+                    <button type="button" id="fc-exp-copy-titles" style="padding:7px 12px;border-radius:6px;border:1px solid rgba(56,189,248,0.45);background:rgba(14,165,233,0.18);color:#7dd3fc;font-weight:700;font-size:12px;cursor:pointer;">📋 仅复制标题整列</button>
+                    <button type="button" id="fc-exp-copy-presets" style="padding:7px 12px;border-radius:6px;border:1px solid rgba(245,158,11,0.45);background:rgba(245,158,11,0.18);color:#fde68a;font-weight:700;font-size:12px;cursor:pointer;">📋 仅复制覆层预设整列</button>
+                    <button type="button" id="fc-exp-save-file" style="padding:7px 14px;border-radius:6px;border:1px solid rgba(34,197,94,0.45);background:rgba(22,163,74,0.22);color:#86efac;font-weight:700;font-size:12px;cursor:pointer;">💾 保存为文件 (.tsv/.txt/.csv)</button>
+                </div>
+                <button type="button" id="fc-exp-close-btn" style="padding:7px 16px;border-radius:6px;border:1px solid #475569;background:#1e293b;color:#cbd5e1;font-size:12px;cursor:pointer;">关闭</button>
+            </div>
+        `;
+
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        const scopeSel = modal.querySelector('#fc-exp-scope');
+        const titleSrcSel = modal.querySelector('#fc-exp-title-src');
+        const colsSel = modal.querySelector('#fc-exp-cols');
+        const headerCb = modal.querySelector('#fc-exp-header');
+        const textarea = modal.querySelector('#fc-exp-textarea');
+        const countBadge = modal.querySelector('#fc-exp-count-badge');
+
+        function getRowsData() {
+            const scope = scopeSel ? scopeSel.value : 'all';
+            const idxs = (scope === 'selected' && hasSelection)
+                ? selectedIndices
+                : allTasks.map((_, i) => i);
+            return idxs.map(i => extractTaskExportRow(allTasks[i], i));
+        }
+
+        function resolveRowTitle(row) {
+            const src = titleSrcSel ? titleSrcSel.value : 'auto';
+            if (src === 'export') return row.exportTitle;
+            if (src === 'overlay') return row.overlayTitle;
+            return row.bestTitle;
+        }
+
+        function refreshPreview() {
+            const rows = getRowsData();
+            if (countBadge) countBadge.textContent = `共 ${rows.length} 条`;
+            const mode = colsSel ? colsSel.value : 'title_overlay';
+            const withHeader = !!(headerCb && headerCb.checked);
+            const lines = [];
+            if (withHeader) {
+                if (mode === 'title_overlay') lines.push('标题\t覆层预设');
+                else if (mode === 'full') lines.push('导出命名\t覆层标题\t覆层预设\t动态字幕模版');
+                else if (mode === 'only_title') lines.push('标题');
+                else if (mode === 'only_overlay') lines.push('覆层预设');
+            }
+            for (const r of rows) {
+                const t = resolveRowTitle(r);
+                if (mode === 'title_overlay') {
+                    lines.push(`${t}\t${r.overlayPreset}`);
+                } else if (mode === 'full') {
+                    lines.push(`${r.exportTitle}\t${r.overlayTitle}\t${r.overlayPreset}\t${r.subtitlePreset}`);
+                } else if (mode === 'only_title') {
+                    lines.push(t);
+                } else if (mode === 'only_overlay') {
+                    lines.push(r.overlayPreset);
+                }
+            }
+            textarea.value = lines.join('\n');
+        }
+
+        scopeSel?.addEventListener('change', refreshPreview);
+        titleSrcSel?.addEventListener('change', refreshPreview);
+        colsSel?.addEventListener('change', refreshPreview);
+        headerCb?.addEventListener('change', refreshPreview);
+        refreshPreview();
+
+        const closeModal = () => overlay.remove();
+        modal.querySelector('#fc-exp-close-top')?.addEventListener('click', closeModal);
+        modal.querySelector('#fc-exp-close-btn')?.addEventListener('click', closeModal);
+        overlay.addEventListener('click', (ev) => {
+            if (ev.target === overlay) closeModal();
+        });
+
+        modal.querySelector('#fc-exp-copy-both')?.addEventListener('click', async () => {
+            const txt = textarea.value || '';
+            await writeClipboardTextSyncOrAsync(txt);
+            if (typeof showToast === 'function') {
+                showToast(`✅ 已复制 ${getRowsData().length} 条标题与预设数据到剪贴板！`, 'success', 2600);
+            }
+        });
+
+        modal.querySelector('#fc-exp-copy-titles')?.addEventListener('click', async () => {
+            const rows = getRowsData();
+            const txt = rows.map(r => resolveRowTitle(r)).join('\n');
+            await writeClipboardTextSyncOrAsync(txt);
+            if (typeof showToast === 'function') {
+                showToast(`✅ 已复制 ${rows.length} 条【标题】整列到剪贴板！`, 'success', 2600);
+            }
+        });
+
+        modal.querySelector('#fc-exp-copy-presets')?.addEventListener('click', async () => {
+            const rows = getRowsData();
+            const txt = rows.map(r => r.overlayPreset).join('\n');
+            await writeClipboardTextSyncOrAsync(txt);
+            if (typeof showToast === 'function') {
+                showToast(`✅ 已复制 ${rows.length} 条【覆层预设名称】整列到剪贴板！`, 'success', 2600);
+            }
+        });
+
+        modal.querySelector('#fc-exp-save-file')?.addEventListener('click', async () => {
+            const content = textarea.value || '';
+            if (CTRL_PORT > 0) {
+                try {
+                    const resp = await fetch(`http://127.0.0.1:${CTRL_PORT}/save-export-titles-presets`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            content,
+                            defaultName: '批量Reels_标题与覆层预设导出.tsv',
+                        }),
+                    });
+                    const data = await resp.json();
+                    if (data && data.ok && data.filePath) {
+                        if (typeof showToast === 'function') {
+                            showToast(`💾 已导出保存到: ${data.filePath}`, 'success', 3500);
+                        }
+                        return;
+                    }
+                    if (data && data.canceled) return;
+                } catch (err) {
+                    console.warn('[FlowCue] save-export-titles-presets failed:', err);
+                }
+            }
+            // 浏览器下载兜底
+            const blob = new Blob(['\uFEFF' + content], { type: 'text/tab-separated-values;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = '批量Reels_标题与覆层预设导出.tsv';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        });
+    }
+
+    window.flowcueOpenExportTitlesAndPresetsModal = openExportTitlesAndPresetsModal;
+
+    function ensureExportTitlesAndPresetsButtons() {
+        // 1. 批量表格底部栏按钮（紧邻「自动调速/时长≤3分钟」左侧）
+        const rbtFooter = document.querySelector('#reels-batch-table-overlay .rbt-footer');
+        if (rbtFooter && !document.getElementById('flowcue-rbt-export-titles-presets-btn')) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.id = 'flowcue-rbt-export-titles-presets-btn';
+            btn.className = 'rbt-btn';
+            btn.textContent = '📤 批量导出标题与预设';
+            btn.title = '一键批量导出所有任务的标题（导出命名/覆层标题）和覆层预设名称（支持复制两列到Excel或保存文件）';
+            btn.style.cssText = 'padding:0 12px;height:28px;border-radius:6px;background:rgba(79,70,229,0.24);border:1px solid rgba(129,140,248,0.55);color:#c7d2fe;font-size:12px;font-weight:700;cursor:pointer;flex-shrink:0;';
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openExportTitlesAndPresetsModal();
+            });
+            const applyBtn = rbtFooter.querySelector('#rbt-apply-btn');
+            if (applyBtn) {
+                rbtFooter.insertBefore(btn, applyBtn);
+            } else {
+                rbtFooter.appendChild(btn);
+            }
+        }
+
+        // 2. 批量Reels 主界面顶部工具栏按钮（紧邻「📊 批量表格」按钮右侧）
+        const openTableBtn = document.getElementById('reels-open-batch-table-btn');
+        if (openTableBtn && openTableBtn.parentElement && !document.getElementById('flowcue-top-export-titles-presets-btn')) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.id = 'flowcue-top-export-titles-presets-btn';
+            btn.className = 'btn btn-secondary btn-sm';
+            btn.textContent = '📤 导出标题与预设';
+            btn.title = '批量导出各任务的标题和覆层预设名称（支持一键复制成表格列或保存文件）';
+            btn.style.cssText = 'padding:3px 9px;font-size:11px;font-weight:700;border-radius:5px;background:rgba(79,70,229,0.22);border:1px solid rgba(129,140,248,0.5);color:#c7d2fe;cursor:pointer;white-space:nowrap;';
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openExportTitlesAndPresetsModal();
+            });
+            openTableBtn.insertAdjacentElement('afterend', btn);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 7. 素材快速审核：仅保留「🗑️ 删除」和「⏸️ 暂缓」按钮（移除合格/勉强）
+    //    - 删除：直接删除磁盘上的素材文件，并从审核网格中移除
+    //    - 暂缓：在该素材所在目录下创建「暂缓」文件夹并将素材挪进去，从当前网格中移除
+    // ═══════════════════════════════════════════════════════════════════════
+    function decodeReviewPath(rawOrEncoded) {
+        let p = String(rawOrEncoded || '');
+        try {
+            if (p.includes('%')) p = decodeURIComponent(p);
+        } catch (_) {}
+        return p;
+    }
+
+    function releaseMediaHandlesForPath(filePath) {
+        if (!filePath) return;
+        const encoded = encodeURIComponent(filePath);
+        const card = document.querySelector(`[data-review-card="${encoded}"]`);
+        if (card) {
+            card.querySelectorAll('video').forEach((v) => {
+                try {
+                    v.pause();
+                    v.removeAttribute('src');
+                    v.removeAttribute('data-src');
+                    v.load();
+                } catch (_) {}
+            });
+            card.querySelectorAll('img').forEach((img) => {
+                try { img.removeAttribute('src'); } catch (_) {}
+            });
+        }
+        const modal = document.getElementById('visual-review-image-modal');
+        if (modal) {
+            modal.querySelectorAll('img, video').forEach((el) => {
+                try { el.removeAttribute('src'); } catch (_) {}
+            });
+        }
+    }
+
+    function removeFileFromVisualReviewState(filePath) {
+        if (!filePath || typeof visualReviewState === 'undefined' || !visualReviewState) return;
+        const encoded = encodeURIComponent(filePath);
+        const card = document.querySelector(`[data-review-card="${encoded}"]`);
+        if (card) {
+            card.style.transition = 'opacity 0.14s ease, transform 0.14s ease';
+            card.style.opacity = '0';
+            card.style.transform = 'scale(0.92)';
+        }
+
+        let needFullRender = false;
+        if (Array.isArray(visualReviewState.suites)) {
+            visualReviewState.suites.forEach((suite) => {
+                if (!suite || !Array.isArray(suite.groups)) return;
+                suite.groups.forEach((group) => {
+                    if (!group || !Array.isArray(group.files)) return;
+                    const beforeLen = group.files.length;
+                    group.files = group.files.filter((f) => f && f.path !== filePath);
+                    if (group.files.length !== beforeLen && group.files.length === 0) {
+                        needFullRender = true;
+                    }
+                });
+                suite.groups = suite.groups.filter((g) => g && Array.isArray(g.files) && g.files.length > 0);
+            });
+        }
+        if (visualReviewState.statuses && filePath in visualReviewState.statuses) {
+            delete visualReviewState.statuses[filePath];
+        }
+        if (Array.isArray(visualReviewState.newlyAddedPaths)) {
+            visualReviewState.newlyAddedPaths = visualReviewState.newlyAddedPaths.filter((p) => p !== filePath);
+        }
+        if (visualReviewState.activePath === filePath) {
+            visualReviewState.activePath = '';
+        }
+        if (typeof visualReviewPersist === 'function') {
+            try { visualReviewPersist(); } catch (_) {}
+        }
+
+        setTimeout(() => {
+            if (needFullRender && typeof visualReviewRender === 'function') {
+                visualReviewRender();
+            } else if (card && card.isConnected) {
+                const section = card.closest('section[id^="visual-review-group-"]');
+                card.remove();
+                if (section) {
+                    const remaining = section.querySelectorAll('article[data-review-card]').length;
+                    const hintEl = section.querySelector('.hint');
+                    if (hintEl) hintEl.textContent = `${remaining} 个候选`;
+                }
+            }
+        }, 140);
+    }
+
+    async function flowcueVisualReviewDelete(rawOrEncodedPath) {
+        const filePath = decodeReviewPath(rawOrEncodedPath);
+        if (!filePath) return;
+        const fileName = filePath.split(/[\\/]/).pop() || filePath;
+        releaseMediaHandlesForPath(filePath);
+
+        try {
+            let ok = false;
+            let errMsg = '';
+            if (CTRL_PORT > 0) {
+                const resp = await fetch(`http://127.0.0.1:${CTRL_PORT}/visual-review-delete-file`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filePath }),
+                });
+                const data = await resp.json();
+                ok = !!(data && data.ok);
+                errMsg = data?.error || '';
+            } else if (window.electronAPI?.trashFiles) {
+                const res = await window.electronAPI.trashFiles([filePath]);
+                ok = !!(res && res.success !== false);
+                errMsg = res?.error || '';
+            }
+            if (!ok) {
+                if (typeof showToast === 'function') {
+                    showToast(`❌ 删除失败: ${errMsg || fileName}`, 'error', 3500);
+                }
+                return;
+            }
+            const modal = document.getElementById('visual-review-image-modal');
+            if (modal) modal.remove();
+            removeFileFromVisualReviewState(filePath);
+            if (typeof showToast === 'function') {
+                showToast(`🗑️ 已删除素材: ${fileName}`, 'info', 2200);
+            }
+        } catch (err) {
+            if (typeof showToast === 'function') {
+                showToast(`❌ 删除异常: ${err.message || err}`, 'error', 3500);
+            }
+        }
+    }
+
+    async function flowcueVisualReviewDefer(rawOrEncodedPath) {
+        const filePath = decodeReviewPath(rawOrEncodedPath);
+        if (!filePath) return;
+        const fileName = filePath.split(/[\\/]/).pop() || filePath;
+        releaseMediaHandlesForPath(filePath);
+
+        try {
+            let ok = false;
+            let errMsg = '';
+            if (CTRL_PORT > 0) {
+                const resp = await fetch(`http://127.0.0.1:${CTRL_PORT}/visual-review-defer-file`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filePath }),
+                });
+                const data = await resp.json();
+                ok = !!(data && data.ok);
+                errMsg = data?.error || '';
+            } else if (window.electronAPI?.moveToFolder) {
+                const parentDir = filePath.replace(/[\\/][^\\/]+$/, '');
+                const sep = filePath.includes('\\') ? '\\' : '/';
+                const deferDir = `${parentDir}${sep}暂缓`;
+                const res = await window.electronAPI.moveToFolder(filePath, deferDir);
+                ok = !!(res && res.success !== false);
+                errMsg = res?.error || '';
+            }
+            if (!ok) {
+                if (typeof showToast === 'function') {
+                    showToast(`❌ 移入暂缓失败: ${errMsg || fileName}`, 'error', 3500);
+                }
+                return;
+            }
+            const modal = document.getElementById('visual-review-image-modal');
+            if (modal) modal.remove();
+            removeFileFromVisualReviewState(filePath);
+            if (typeof showToast === 'function') {
+                showToast(`⏸️ 已移入「暂缓」文件夹: ${fileName}`, 'success', 2400);
+            }
+        } catch (err) {
+            if (typeof showToast === 'function') {
+                showToast(`❌ 移入暂缓异常: ${err.message || err}`, 'error', 3500);
+            }
+        }
+    }
+
+    window.flowcueVisualReviewDelete = flowcueVisualReviewDelete;
+    window.flowcueVisualReviewDefer = flowcueVisualReviewDefer;
+
+    function buildDeleteDeferButtonsHtml(encoded) {
+        const delStyle = 'min-height:40px;border:0;border-right:1px solid var(--border-color);cursor:pointer;font-size:13px;font-weight:800;letter-spacing:0.5px;transition:all .15s;background:rgba(185,28,28,0.26);color:#fca5a5;';
+        const deferStyle = 'min-height:40px;border:0;cursor:pointer;font-size:13px;font-weight:800;letter-spacing:0.5px;transition:all .15s;background:rgba(217,119,6,0.26);color:#fde68a;';
+        return `
+            <button type="button" data-flowcue-vr-btn="delete" onclick="event.stopPropagation();window.flowcueVisualReviewDelete('${encoded}')" onmouseenter="this.style.background='linear-gradient(180deg,#dc2626,#b91c1c)';this.style.color='#fff';" onmouseleave="this.style.background='rgba(185,28,28,0.26)';this.style.color='#fca5a5';" style="${delStyle}" title="直接从磁盘删除该素材文件">🗑️ 删除</button>
+            <button type="button" data-flowcue-vr-btn="defer" onclick="event.stopPropagation();window.flowcueVisualReviewDefer('${encoded}')" onmouseenter="this.style.background='linear-gradient(180deg,#d97706,#b45309)';this.style.color='#fff';" onmouseleave="this.style.background='rgba(217,119,6,0.26)';this.style.color='#fde68a';" style="${deferStyle}" title="在当前目录下创建「暂缓」文件夹并将素材挪进去">⏸️ 暂缓</button>
+        `;
+    }
+
+    function patchVisualReviewDom() {
+        const vrRoot = document.getElementById('media-visual-review') || document.getElementById('mtb-visual-review');
+        if (vrRoot) {
+            // 1. 替换所有卡片底部的「✓ 合格 / △ 勉强」按钮为「🗑️ 删除 / ⏸️ 暂缓」
+            vrRoot.querySelectorAll('article[data-review-card]').forEach((card) => {
+                if (card.dataset.flowcueVrPatched === '1') return;
+                const passBtn = card.querySelector('[data-review-status="pass"]');
+                const btnContainer = passBtn ? passBtn.parentElement : null;
+                const encoded = card.getAttribute('data-review-card') || '';
+                if (btnContainer && encoded) {
+                    btnContainer.innerHTML = buildDeleteDeferButtonsHtml(encoded);
+                    card.dataset.flowcueVrPatched = '1';
+                }
+            });
+
+            // 2. 隐藏不再需要的「合格/勉强」徽章、筛选项与底部汇总按钮
+            vrRoot.querySelectorAll('[data-group-badge], [data-suite-chosen-count], [data-suite-unselected-count]').forEach((el) => {
+                el.style.display = 'none';
+            });
+            vrRoot.querySelectorAll('input[onchange*="NeedsReviewOnly"]').forEach((inp) => {
+                const lbl = inp.closest('label');
+                if (lbl) lbl.style.display = 'none';
+            });
+            vrRoot.querySelectorAll('button[onclick*="visualReviewSetView"], button[onclick*="visualReviewCollectSelected"], button[onclick*="visualReviewMoveRejects"], button[onclick*="visualReviewSave"]').forEach((btn) => {
+                btn.style.display = 'none';
+            });
+            vrRoot.querySelectorAll('[data-review-count]').forEach((el) => {
+                const span = el.closest('span.hint');
+                if (span) span.style.display = 'none';
+            });
+            vrRoot.querySelectorAll('button').forEach((btn) => {
+                if ((btn.textContent || '').includes('当前审核报告')) {
+                    btn.style.display = 'none';
+                }
+            });
+        }
+
+        // 3. 替换大图预览弹窗底部的「合格 / 勉强 / 淘汰」按钮为「🗑️ 删除 / ⏸️ 暂缓」
+        const imgModal = document.getElementById('visual-review-image-modal');
+        if (imgModal && imgModal.dataset.flowcueVrModalPatched !== '1') {
+            const passBtn = imgModal.querySelector('#vr-status-pass-btn');
+            const bar = passBtn ? passBtn.parentElement : null;
+            const folderBtn = imgModal.querySelector('button[onclick*="visualReviewOpenVideoFolder"]');
+            const m = folderBtn ? (folderBtn.getAttribute('onclick') || '').match(/'([^']+)'/) : null;
+            const encoded = m ? m[1] : '';
+            if (bar && encoded) {
+                imgModal.dataset.flowcueVrModalPatched = '1';
+                bar.innerHTML = `
+                    <button type="button" class="btn" onclick="window.flowcueVisualReviewDelete('${encoded}')" style="background:linear-gradient(180deg,#dc2626,#b91c1c);color:#ffffff;font-weight:800;border-radius:20px;padding:7px 22px;border:1px solid #f87171;cursor:pointer;" title="直接删除该素材文件">🗑️ 删除</button>
+                    <button type="button" class="btn" onclick="window.flowcueVisualReviewDefer('${encoded}')" style="background:linear-gradient(180deg,#d97706,#b45309);color:#ffffff;font-weight:800;border-radius:20px;padding:7px 22px;border:1px solid #fbbf24;cursor:pointer;" title="移入当前目录下的「暂缓」文件夹">⏸️ 暂缓</button>
+                `;
+            }
+        }
+
+        // 4. 替换右键菜单中的「快捷标记 (合格/勉强/淘汰)」为「🗑️ 删除 / ⏸️ 暂缓」
+        const ctxMenu = document.getElementById('visual-review-context-menu');
+        if (ctxMenu && ctxMenu.dataset.flowcueVrMenuPatched !== '1') {
+            const passItem = ctxMenu.querySelector('[data-action="status-pass"]');
+            if (passItem) {
+                ctxMenu.dataset.flowcueVrMenuPatched = '1';
+                const usableItem = ctxMenu.querySelector('[data-action="status-usable"]');
+                const rejectItem = ctxMenu.querySelector('[data-action="status-reject"]');
+                const clearItem = ctxMenu.querySelector('[data-action="status-clear"]');
+                if (usableItem) usableItem.remove();
+                if (rejectItem) rejectItem.remove();
+                if (clearItem) clearItem.remove();
+
+                const activePath = window.visualReviewState?.activePath || '';
+                const encoded = encodeURIComponent(activePath);
+                const itemStyle = passItem.getAttribute('style') || '';
+
+                const delDiv = document.createElement('div');
+                delDiv.className = 'vr-menu-item';
+                delDiv.style.cssText = itemStyle + ';color:#f87171;font-weight:700;';
+                delDiv.innerHTML = '<span>🗑️</span><span>删除该素材 (直接删除文件)</span>';
+                delDiv.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    ctxMenu.remove();
+                    if (encoded) flowcueVisualReviewDelete(encoded);
+                });
+
+                const deferDiv = document.createElement('div');
+                deferDiv.className = 'vr-menu-item';
+                deferDiv.style.cssText = itemStyle + ';color:#fbbf24;font-weight:700;';
+                deferDiv.innerHTML = '<span>⏸️</span><span>暂缓该素材 (移入「暂缓」文件夹)</span>';
+                deferDiv.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    ctxMenu.remove();
+                    if (encoded) flowcueVisualReviewDefer(encoded);
+                });
+
+                passItem.replaceWith(delDiv, deferDiv);
+            }
+        }
+    }
+
+    function installVisualReviewHooks() {
+        // 扫描文件夹时自动排除「暂缓」子文件夹中的素材
+        if (typeof window.visualReviewIsSupportedMedia === 'function' && !window.visualReviewIsSupportedMedia._flowcueWrapped) {
+            const origSupported = window.visualReviewIsSupportedMedia;
+            const wrappedSupported = function (item) {
+                const p = String(item?.path || item?.name || '');
+                if (/[\\/]暂缓([\\/]|$)/u.test(p)) return false;
+                return origSupported.apply(this, arguments);
+            };
+            wrappedSupported._flowcueWrapped = true;
+            window.visualReviewIsSupportedMedia = wrappedSupported;
+            try { visualReviewIsSupportedMedia = wrappedSupported; } catch (_) {}
+        }
+
+        // 钩住卡片生成函数，直接输出「🗑️ 删除」与「⏸️ 暂缓」按钮
+        if (typeof window.visualReviewCard === 'function' && !window.visualReviewCard._flowcueWrapped) {
+            const origCard = window.visualReviewCard;
+            const wrappedCard = function (file) {
+                const html = origCard.apply(this, arguments);
+                const encoded = encodeURIComponent(file?.path || '');
+                return html.replace(
+                    /<div style="display:grid;grid-template-columns:repeat\(2,minmax\(0,1fr\)\);border-top:1px solid var\(--border-color\);">[\s\S]*?<\/div>\s*<\/article>/,
+                    `<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--border-color);">${buildDeleteDeferButtonsHtml(encoded)}</div></article>`
+                );
+            };
+            wrappedCard._flowcueWrapped = true;
+            window.visualReviewCard = wrappedCard;
+            try { visualReviewCard = wrappedCard; } catch (_) {}
+        }
+
+        // 钩住 visualReviewRender，渲染完成后立即清理合格/勉强元素
+        if (typeof window.visualReviewRender === 'function' && !window.visualReviewRender._flowcueWrapped) {
+            const origVrRender = window.visualReviewRender;
+            const wrappedVrRender = function () {
+                const res = origVrRender.apply(this, arguments);
+                try { patchVisualReviewDom(); } catch (_) {}
+                return res;
+            };
+            wrappedVrRender._flowcueWrapped = true;
+            window.visualReviewRender = wrappedVrRender;
+            try { visualReviewRender = wrappedVrRender; } catch (_) {}
+        }
+
+        patchVisualReviewDom();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // 初始化与 DOM 动态监听
     // ═══════════════════════════════════════════════════════════════════════
     let _isRunningEnhancements = false;
@@ -1523,6 +2188,8 @@
             installUnder3MinSpeedScalingOverride();
             hookBatchTableRender();
             enhanceBatchTablePresetColumns();
+            ensureExportTitlesAndPresetsButtons();
+            installVisualReviewHooks();
             schedulePresetBackupToDisk();
         } catch (err) {
             console.warn('[FlowCue] initAllEnhancements error:', err);

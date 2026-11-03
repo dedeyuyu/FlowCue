@@ -145,55 +145,72 @@ class VideoChecker:
         pending_count = 0
         missing_count = 0
 
+        # Pre-scan post_relocate_dir and pre_relocate_search_dirs once to avoid O(N_segments * N_files) disk I/O
+        post_files_by_lower = {}
+        post_entries = []
+        try:
+            if post_relocate_dir.is_dir():
+                for entry in post_relocate_dir.iterdir():
+                    try:
+                        if entry.is_file():
+                            post_files_by_lower[entry.name.lower()] = entry
+                            post_entries.append(entry)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        pre_dir_caches = []
+        for p_dir in pre_relocate_search_dirs:
+            try:
+                if p_dir.is_dir():
+                    by_lower = {}
+                    entries = []
+                    for entry in p_dir.iterdir():
+                        try:
+                            if entry.is_file():
+                                by_lower[entry.name.lower()] = entry
+                                entries.append(entry)
+                        except OSError:
+                            pass
+                    pre_dir_caches.append((p_dir, by_lower, entries))
+            except OSError:
+                pass
+
         for idx, seg in enumerate(segments):
             seq_num = idx + 1
             idx_str = f"{seq_num:02d}"
             text = seg.get("text", "")
             download_name = f"{idx_str}.mp4"
+            download_name_lower = download_name.lower()
             target_path = post_relocate_dir / download_name
 
             found_file = None
             is_already_in_target = False
 
             # A. Check Post-relocation directory ({project_path}/downloads/videos/)
-            if target_path.exists() and target_path.is_file():
-                found_file = target_path
+            if download_name_lower in post_files_by_lower:
+                found_file = post_files_by_lower[download_name_lower]
                 is_already_in_target = True
             else:
-                # Scan files in post_relocate_dir for matching filename (e.g. 01.mp4, 01_foo.mp4)
-                if post_relocate_dir.exists():
-                    try:
-                        for entry in post_relocate_dir.iterdir():
-                            if entry.is_file() and VideoChecker.is_matching_video_file(entry.name, seq_num):
-                                found_file = entry
-                                is_already_in_target = True
-                                break
-                    except Exception:
-                        pass
+                for entry in post_entries:
+                    if VideoChecker.is_matching_video_file(entry.name, seq_num):
+                        found_file = entry
+                        is_already_in_target = True
+                        break
 
             # B. If not in Post-relocation directory, check Pre-relocation directories
             if not found_file:
-                for p_dir in pre_relocate_search_dirs:
-                    if not p_dir.exists() or not p_dir.is_dir():
-                        continue
-                    
-                    # Direct check 01.mp4
-                    direct_file = p_dir / download_name
-                    if direct_file.exists() and direct_file.is_file():
-                        found_file = direct_file
+                for _p_dir, by_lower, entries in pre_dir_caches:
+                    if download_name_lower in by_lower:
+                        found_file = by_lower[download_name_lower]
                         is_already_in_target = False
                         break
-
-                    # Scan files inside Pre-relocation directory
-                    try:
-                        for entry in p_dir.iterdir():
-                            if entry.is_file() and VideoChecker.is_matching_video_file(entry.name, seq_num):
-                                found_file = entry
-                                is_already_in_target = False
-                                break
-                    except Exception:
-                        pass
-
+                    for entry in entries:
+                        if VideoChecker.is_matching_video_file(entry.name, seq_num):
+                            found_file = entry
+                            is_already_in_target = False
+                            break
                     if found_file:
                         break
 

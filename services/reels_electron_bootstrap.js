@@ -23,6 +23,11 @@ const CTRL_PORT = Number(process.env.FLOWCUE_CTRL_PORT) || 5180;
 const PY_FOCUS_UDP_PORT = Number(process.env.FLOWCUE_FOCUS_UDP_PORT) || 0;
 const WORKBENCH_MODE = (process.env.FLOWCUE_WORKBENCH_MODE || 'batch-reels').trim();
 const ENHANCEMENTS_JS_PATH = path.join(__dirname, 'reels_flowcue_enhancements.js');
+// FlowCue 后台预热/嵌入前隐藏：主窗口创建后（显示前）立即移到屏幕外并隐藏任务栏按钮，嵌入 PyQt 后才真正可见，杜绝窗口外露浮动
+const HIDE_UNTIL_EMBED = process.env.FLOWCUE_HIDE_UNTIL_EMBED === '1';
+const OFFSCREEN_POS = -32000;
+const BOOT_T0 = Date.now();
+function bootElapsed() { return `${Date.now() - BOOT_T0}ms`; }
 
 process.env.VITE_PORT = String(VITE_PORT);
 // 禁用 main.js 开发态 fs.watch 自动重启
@@ -128,13 +133,32 @@ function syncAndBackupPresetFiles(extraEntries = null) {
     }
 }
 
-// 启动时立即合并同步一次预设文件
-syncAndBackupPresetFiles();
+// 启动时立即合并同步一次预设文件（结果缓存供首次页面激活直接复用，避免重复读写磁盘）
+let _startupMergedPresets = syncAndBackupPresetFiles();
 
 let capturedMainWindow = null;
+// rendererReady: 已拿到主窗口 HWND，可供 PyQt 嵌入；pageActivated: 页面脚本加载完成且已切入工作台，可安全注入任务
 let rendererReady = false;
+let pageActivated = false;
+let activationPromise = null;
+let activationLoadSeq = -1;
+let pageLoadSeq = 0;
 const pendingTasks = [];
 const udpClient = dgram.createSocket('udp4');
+
+// 增强补丁脚本缓存：仅在文件 mtime 变化时重新读取（避免每次激活都读 80KB 文件）
+let _enhancementsCache = { mtimeMs: -1, code: '' };
+function getEnhancementsCode() {
+    try {
+        const st = fs.statSync(ENHANCEMENTS_JS_PATH);
+        if (st.mtimeMs !== _enhancementsCache.mtimeMs) {
+            _enhancementsCache = { mtimeMs: st.mtimeMs, code: fs.readFileSync(ENHANCEMENTS_JS_PATH, 'utf8') };
+        }
+    } catch (e) {
+        console.warn('[FlowCue-Reels] Failed to read enhancements JS:', e.message);
+    }
+    return _enhancementsCache.code;
+}
 
 function notifyPythonFocusHwnd() {
     if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
@@ -250,17 +274,11 @@ function getWindowHwndNumber(win) {
 
 async function activateBatchReelsInRenderer(win) {
     if (!win || win.isDestroyed()) return;
-    const mergedPresets = syncAndBackupPresetFiles();
+    // 首次激活直接复用启动时已合并好的预设；之后（页面重载/手动重新激活）再重新合并磁盘最新快照
+    const mergedPresets = _startupMergedPresets || syncAndBackupPresetFiles();
+    _startupMergedPresets = null;
     const presetsJson = JSON.stringify(mergedPresets);
-    let enhancementsCode = '';
-    try {
-        if (fs.existsSync(ENHANCEMENTS_JS_PATH)) {
-            enhancementsCode = fs.readFileSync(ENHANCEMENTS_JS_PATH, 'utf8');
-        }
-    } catch (e) {
-        console.warn('[FlowCue-Reels] Failed to read enhancements JS:', e.message);
-    }
-
+    const enhancementsCode = getEnhancementsCode();
     const script = `
     (function() {
         try {
@@ -343,14 +361,7 @@ async function activateBatchReelsInRenderer(win) {
 
 async function activateVisualReviewInRenderer(win) {
     if (!win || win.isDestroyed()) return;
-    let enhancementsCode = '';
-    try {
-        if (fs.existsSync(ENHANCEMENTS_JS_PATH)) {
-            enhancementsCode = fs.readFileSync(ENHANCEMENTS_JS_PATH, 'utf8');
-        }
-    } catch (e) {
-        console.warn('[FlowCue-VisualReview] Failed to read enhancements JS:', e.message);
-    }
+    const enhancementsCode = getEnhancementsCode();
 
     const script = `
     (function() {
@@ -545,6 +556,81 @@ function execJsWithTimeout(win, jsCode, timeoutMs = 1500) {
     ]);
 }
 
+function isMainRendererUrl(url) {
+    return !!url && url.includes(`:${VITE_PORT}`) && !url.includes('template=');
+}
+
+// 每次页面加载只执行一次完整激活（dom-ready 时），did-finish-load 时仅做轻量确认 + 排空待注入队列
+function runFullActivation(win) {
+    if (activationPromise && activationLoadSeq === pageLoadSeq) return activationPromise;
+    activationLoadSeq = pageLoadSeq;
+    const t0 = Date.now();
+    const runner = WORKBENCH_MODE === 'visual-review' ? activateVisualReviewInRenderer : activateBatchReelsInRenderer;
+    activationPromise = Promise.resolve()
+        .then(() => runner(win))
+        .catch((e) => console.warn('[FlowCue-Reels] activation failed:', e && e.message))
+        .then(() => console.log(`[FlowCue-Reels] 工作台激活完成 (${WORKBENCH_MODE}, 耗时 ${Date.now() - t0}ms, 启动后 ${bootElapsed()})`));
+    return activationPromise;
+}
+
+async function ensureWorkbenchAfterLoad(win) {
+    if (!win || win.isDestroyed()) return;
+    const js = WORKBENCH_MODE === 'visual-review'
+        ? `(function() {
+            try {
+                document.body.classList.add('flowcue-embedded');
+                const mediaTabBtn = document.querySelector('button.tab[data-tab="media"]');
+                if (mediaTabBtn && !mediaTabBtn.classList.contains('active')) mediaTabBtn.click();
+                const vrSubBtn = document.querySelector('button.sidebar-item[data-subtab="media-visualreview"]');
+                if (vrSubBtn && !vrSubBtn.classList.contains('active')) vrSubBtn.click();
+                return true;
+            } catch (_) { return false; }
+        })();`
+        : `(function() {
+            try {
+                document.body.classList.add('flowcue-embedded');
+                const reelsTabBtn = document.querySelector('button.tab[data-tab="batch-reels"]');
+                if (reelsTabBtn && !reelsTabBtn.classList.contains('active')) reelsTabBtn.click();
+                if (typeof _loadSavedPresets === 'function') {
+                    try { _loadSavedPresets(); } catch (_) {}
+                }
+                setTimeout(() => {
+                    if (typeof reelsPreviewZoom === 'function') reelsPreviewZoom('fit');
+                }, 250);
+                return true;
+            } catch (_) { return false; }
+        })();`;
+    try {
+        await win.webContents.executeJavaScript(js, true);
+    } catch (e) {
+        console.warn('[FlowCue-Reels] ensureWorkbenchAfterLoad failed:', e.message);
+    }
+}
+
+let _drainingPending = false;
+async function drainPendingTasks(win) {
+    if (_drainingPending) return;
+    _drainingPending = true;
+    try {
+        while (pendingTasks.length > 0 && pageActivated && win && !win.isDestroyed()) {
+            const nextPayload = pendingTasks.shift();
+            try {
+                if (nextPayload && nextPayload._batchItems) {
+                    await injectTaskBatchIntoRenderer(win, nextPayload._batchItems);
+                } else if (WORKBENCH_MODE === 'visual-review' && nextPayload?.folder_path) {
+                    await injectVisualReviewFolderIntoRenderer(win, nextPayload.folder_path);
+                } else {
+                    await injectFlowCueTaskIntoRenderer(win, nextPayload);
+                }
+            } catch (e) {
+                console.error('[FlowCue-Reels] Pending task inject failed:', e);
+            }
+        }
+    } finally {
+        _drainingPending = false;
+    }
+}
+
 // 2. 拦截主窗口创建，禁掉自动 DevTools 并在加载后自动进入批量Reels/素材快速审核
 app.on('browser-window-created', (_event, win) => {
     const origOpenDevTools = win.webContents.openDevTools.bind(win.webContents);
@@ -565,57 +651,61 @@ app.on('browser-window-created', (_event, win) => {
         win.setAutoHideMenuBar(true);
     } catch (_) {}
 
-    // 如果创建的是主可见窗口（非隐藏的存储迁移小窗口），立即记录句柄供 PyQt6 嵌入，防止窗口外露浮动
+    // 如果创建的是主窗口（非隐藏的存储迁移小窗口 / 非模板窗口），立即记录句柄供 PyQt6 嵌入；
+    // browser-window-created 在窗口真正 show 之前触发，此时移到屏幕外 + 隐藏任务栏按钮，嵌入前绝不外露浮动
     try {
         const bounds = win.getBounds ? win.getBounds() : { width: 0 };
-        if (!capturedMainWindow && win.isVisible() && (bounds.width >= 900)) {
+        const title = String(win.getTitle ? win.getTitle() : '');
+        const looksLikeMain = !capturedMainWindow && bounds.width >= 900 && !title.startsWith('模板');
+        if (looksLikeMain) {
             capturedMainWindow = win;
             rendererReady = true;
+            if (HIDE_UNTIL_EMBED) {
+                win._flowcueHiddenUntilEmbed = true;
+                try { win.setPosition(OFFSCREEN_POS, OFFSCREEN_POS); } catch (_) {}
+                try { win.setSkipTaskbar(true); } catch (_) {}
+                win.once('show', () => {
+                    if (!win.isDestroyed() && win._flowcueHiddenUntilEmbed) {
+                        try { win.setSkipTaskbar(true); } catch (_) {}
+                    }
+                });
+            }
+            console.log(`[FlowCue-Reels] 主窗口已创建 hwnd=${getWindowHwndNumber(win)} (启动后 ${bootElapsed()})`);
         }
     } catch (_) {}
 
-    win.webContents.on('did-start-navigation', (_ev, url) => {
-        if (url && url.includes(`:${VITE_PORT}`) && !url.includes('template=')) {
+    win.webContents.on('did-start-navigation', (_ev, url, isInPlace, isMainFrame) => {
+        if (isMainFrame === false || isInPlace) return;
+        if (isMainRendererUrl(url)) {
             capturedMainWindow = win;
             rendererReady = true;
+            // 新的主框架导航（首次加载 / 重载）：重置激活状态，期间的注入请求进入待注入队列
+            pageLoadSeq += 1;
+            pageActivated = false;
         }
     });
 
-    win.webContents.on('dom-ready', async () => {
+    win.webContents.on('dom-ready', () => {
         const url = win.webContents.getURL() || '';
-        if (url.includes(`:${VITE_PORT}`) && !url.includes('template=')) {
+        if (isMainRendererUrl(url)) {
             capturedMainWindow = win;
             rendererReady = true;
-            if (WORKBENCH_MODE === 'visual-review') {
-                await activateVisualReviewInRenderer(win);
-            } else {
-                await activateBatchReelsInRenderer(win);
-            }
+            runFullActivation(win);
         }
     });
 
     win.webContents.on('did-finish-load', async () => {
         const url = win.webContents.getURL() || '';
-        if (url.includes(`:${VITE_PORT}`) && !url.includes('template=')) {
+        if (isMainRendererUrl(url)) {
             capturedMainWindow = win;
             rendererReady = true;
-            if (WORKBENCH_MODE === 'visual-review') {
-                await activateVisualReviewInRenderer(win);
-            } else {
-                await activateBatchReelsInRenderer(win);
-            }
-            while (pendingTasks.length > 0) {
-                const nextPayload = pendingTasks.shift();
-                try {
-                    if (WORKBENCH_MODE === 'visual-review' && nextPayload?.folder_path) {
-                        await injectVisualReviewFolderIntoRenderer(win, nextPayload.folder_path);
-                    } else {
-                        await injectFlowCueTaskIntoRenderer(win, nextPayload);
-                    }
-                } catch (e) {
-                    console.error('[FlowCue-Reels] Pending task inject failed:', e);
-                }
-            }
+            const seqAtLoad = pageLoadSeq;
+            await runFullActivation(win);
+            await ensureWorkbenchAfterLoad(win);
+            if (seqAtLoad !== pageLoadSeq) return;
+            pageActivated = true;
+            console.log(`[FlowCue-Reels] 页面加载完成，可接收任务 (启动后 ${bootElapsed()})`);
+            await drainPendingTasks(win);
         }
     });
 });
@@ -722,6 +812,128 @@ const ctrlServer = http.createServer(async (req, res) => {
             return sendJson(res, 200, result);
         }
 
+        if (req.method === 'POST' && pathname === '/visual-review-delete-file') {
+            const body = await readJsonBody(req);
+            const rawPath = String(body?.filePath || body?.file_path || '').trim();
+            if (!rawPath) {
+                return sendJson(res, 400, { ok: false, error: '缺少文件路径 filePath' });
+            }
+            const targetPath = path.resolve(rawPath);
+            if (!fs.existsSync(targetPath)) {
+                return sendJson(res, 200, { ok: true, alreadyGone: true, deletedPath: targetPath });
+            }
+            let lastErr = null;
+            let deleted = false;
+            for (let attempt = 0; attempt < 5; attempt++) {
+                try {
+                    fs.unlinkSync(targetPath);
+                    deleted = true;
+                    break;
+                } catch (err) {
+                    lastErr = err;
+                    await new Promise((r) => setTimeout(r, 120));
+                }
+            }
+            if (!deleted && electron.shell && typeof electron.shell.trashItem === 'function') {
+                try {
+                    await electron.shell.trashItem(targetPath);
+                    deleted = true;
+                } catch (err) {
+                    lastErr = err;
+                }
+            }
+            if (!deleted) {
+                return sendJson(res, 500, {
+                    ok: false,
+                    error: `删除文件失败: ${lastErr ? (lastErr.message || String(lastErr)) : '未知错误'}`,
+                });
+            }
+            return sendJson(res, 200, { ok: true, deletedPath: targetPath });
+        }
+
+        if (req.method === 'POST' && pathname === '/visual-review-defer-file') {
+            const body = await readJsonBody(req);
+            const rawPath = String(body?.filePath || body?.file_path || '').trim();
+            if (!rawPath) {
+                return sendJson(res, 400, { ok: false, error: '缺少文件路径 filePath' });
+            }
+            const targetPath = path.resolve(rawPath);
+            if (!fs.existsSync(targetPath)) {
+                return sendJson(res, 404, { ok: false, error: `文件不存在: ${targetPath}` });
+            }
+            const parentDir = path.dirname(targetPath);
+            const deferDir = path.join(parentDir, '暂缓');
+            fs.mkdirSync(deferDir, { recursive: true });
+
+            const ext = path.extname(targetPath);
+            const baseStem = path.basename(targetPath, ext);
+            let destPath = path.join(deferDir, path.basename(targetPath));
+            let suffix = 1;
+            while (fs.existsSync(destPath) && path.resolve(destPath) !== targetPath) {
+                destPath = path.join(deferDir, `${baseStem}_${suffix}${ext}`);
+                suffix += 1;
+            }
+
+            let moved = false;
+            let lastErr = null;
+            for (let attempt = 0; attempt < 5; attempt++) {
+                try {
+                    fs.renameSync(targetPath, destPath);
+                    moved = true;
+                    break;
+                } catch (err) {
+                    lastErr = err;
+                    await new Promise((r) => setTimeout(r, 120));
+                }
+            }
+            if (!moved) {
+                try {
+                    fs.copyFileSync(targetPath, destPath);
+                    fs.unlinkSync(targetPath);
+                    moved = true;
+                } catch (err) {
+                    lastErr = err;
+                }
+            }
+            if (!moved) {
+                return sendJson(res, 500, {
+                    ok: false,
+                    error: `移动到暂缓文件夹失败: ${lastErr ? (lastErr.message || String(lastErr)) : '未知错误'}`,
+                });
+            }
+            return sendJson(res, 200, { ok: true, srcPath: targetPath, destPath, deferDir });
+        }
+
+        if (req.method === 'POST' && pathname === '/save-export-titles-presets') {
+            const body = await readJsonBody(req);
+            const content = String(body?.content ?? '');
+            const defaultName = String(body?.defaultName || '批量Reels_标题与覆层预设导出.tsv');
+            if (!electron.dialog || typeof electron.dialog.showSaveDialog !== 'function') {
+                return sendJson(res, 500, { ok: false, error: '当前环境不支持保存对话框' });
+            }
+            const dialogOpts = {
+                title: '导出批量Reels标题与覆层预设名称',
+                defaultPath: defaultName,
+                filters: [
+                    { name: '制表符分隔表格 (*.tsv)', extensions: ['tsv'] },
+                    { name: '文本文件 (*.txt)', extensions: ['txt'] },
+                    { name: 'CSV 表格 (*.csv)', extensions: ['csv'] },
+                ],
+            };
+            const saveRes = (capturedMainWindow && !capturedMainWindow.isDestroyed())
+                ? await electron.dialog.showSaveDialog(capturedMainWindow, dialogOpts)
+                : await electron.dialog.showSaveDialog(dialogOpts);
+            if (saveRes.canceled || !saveRes.filePath) {
+                return sendJson(res, 200, { ok: false, canceled: true });
+            }
+            let outText = content;
+            if (saveRes.filePath.toLowerCase().endsWith('.csv') && !outText.startsWith('\uFEFF')) {
+                outText = '\uFEFF' + outText;
+            }
+            fs.writeFileSync(saveRes.filePath, outText, 'utf8');
+            return sendJson(res, 200, { ok: true, filePath: saveRes.filePath });
+        }
+
         if (req.method === 'POST' && pathname === '/focus-hwnd') {
             notifyPythonFocusHwnd();
             return sendJson(res, 200, { ok: true });
@@ -761,6 +973,22 @@ const ctrlServer = http.createServer(async (req, res) => {
             if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
                 await capturedMainWindow.webContents.executeJavaScript(
                     `(() => { if (typeof reelsPreviewZoom === 'function') reelsPreviewZoom('fit'); return true; })()`,
+                    true
+                );
+            }
+            return sendJson(res, 200, { ok: true });
+        }
+
+        if (req.method === 'POST' && pathname === '/open-export-titles-presets') {
+            if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+                await capturedMainWindow.webContents.executeJavaScript(
+                    `(() => {
+                        if (typeof window.flowcueOpenExportTitlesAndPresetsModal === 'function') {
+                            window.flowcueOpenExportTitlesAndPresetsModal();
+                            return true;
+                        }
+                        return false;
+                    })()`,
                     true
                 );
             }
