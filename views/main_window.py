@@ -251,101 +251,191 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(12)
         
-        # 1. Top Bar (Storage path & Import)
-        top_layout = QHBoxLayout()
-        top_layout.setSpacing(8)
-        
-        top_layout.addWidget(QLabel("存储路径 (Storage Path):"))
-        
+        # 1. Top Bar (分成上下两行：第一行主配置与导入，第二行项目与批量快捷工作流)
+        top_container_layout = QVBoxLayout()
+        top_container_layout.setContentsMargins(0, 0, 0, 0)
+        top_container_layout.setSpacing(8)
+
+        # ── 第一行：存储路径 + 选择路径(蓝) + 新建导入(蓝) + 描述词预设(黄) + 规则设置(黄) + 检查更新(小字原色) + 亮/暗模式(小字原色) ──
+        top_row1 = QHBoxLayout()
+        top_row1.setSpacing(8)
+
+        row1_blue_qss = """
+            QPushButton {
+                background-color: #2563EB;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 6px 14px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+            QPushButton:pressed {
+                background-color: #1E40AF;
+            }
+        """
+        row1_yellow_qss = """
+            QPushButton {
+                background-color: #E0A96D;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 6px 14px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #D2904C;
+            }
+            QPushButton:pressed {
+                background-color: #B87635;
+            }
+        """
+
+        top_row1.addWidget(QLabel("存储路径 (Storage Path):"))
+
         self.txt_base_path = QLineEdit()
         self.txt_base_path.setReadOnly(True)
         self.txt_base_path.setPlaceholderText("请选择项目数据存放的总目录...")
-        top_layout.addWidget(self.txt_base_path, stretch=1)
-        
+        top_row1.addWidget(self.txt_base_path, stretch=1)
+
         self.btn_select_path = QPushButton("选择路径")
+        self.btn_select_path.setStyleSheet(row1_blue_qss)
         self.btn_select_path.clicked.connect(self.select_base_path)
-        top_layout.addWidget(self.btn_select_path)
-        
-        top_layout.addSpacing(20)
-        
+        top_row1.addWidget(self.btn_select_path)
+
         self.btn_import = QPushButton("＋ 新建导入 (Import)")
         self.btn_import.setObjectName("btn_import")
+        self.btn_import.setStyleSheet(row1_blue_qss)
         self.btn_import.clicked.connect(self.open_import_dialog)
-        top_layout.addWidget(self.btn_import)
-        
-        top_layout.addSpacing(8)
-        
-        self.btn_template_config = QPushButton("⚙️ 模板配置")
+        top_row1.addWidget(self.btn_import)
+
+        self.btn_template_config = QPushButton("⚙️ 描述词预设")
         self.btn_template_config.setObjectName("btn_template_config")
+        self.btn_template_config.setStyleSheet(row1_yellow_qss)
+        self.btn_template_config.setToolTip("配置提示词模板与运镜预设")
         self.btn_template_config.clicked.connect(self.open_template_config_dialog)
-        top_layout.addWidget(self.btn_template_config)
-        
-        top_layout.addSpacing(8)
-        
+        top_row1.addWidget(self.btn_template_config)
+
         self.btn_rules_config = QPushButton("⚙️ 规则设置")
         self.btn_rules_config.setObjectName("btn_rules_config")
+        self.btn_rules_config.setStyleSheet(row1_yellow_qss)
+        self.btn_rules_config.setToolTip("配置全局生成规则、API Key 与系统参数")
         self.btn_rules_config.clicked.connect(self.open_settings_dialog)
-        top_layout.addWidget(self.btn_rules_config)
-        
-        top_layout.addSpacing(8)
-        
-        self.btn_batch_check_video = QPushButton("🔍 批量检查视频")
-        self.btn_batch_check_video.setObjectName("btn_batch_check_video")
-        self.btn_batch_check_video.setStyleSheet("background-color: #0284C7; color: white; font-weight: bold;")
-        self.btn_batch_check_video.clicked.connect(self.open_batch_video_check_dialog)
-        top_layout.addWidget(self.btn_batch_check_video)
-        
-        top_layout.addSpacing(8)
-        
-        self.btn_batch_rename_images = QPushButton("🔄 命名所有图片")
-        self.btn_batch_rename_images.setObjectName("btn_batch_rename_images")
-        self.btn_batch_rename_images.setStyleSheet("background-color: #6366F1; color: white; font-weight: bold;")
-        self.btn_batch_rename_images.setToolTip("为所有项目里的图片按照规则（前7位字符+序号）自动重命名")
-        self.btn_batch_rename_images.clicked.connect(self.batch_rename_all_images)
-        top_layout.addWidget(self.btn_batch_rename_images)
-        
-        top_layout.addSpacing(8)
-        
-        self.btn_refresh_points = QPushButton("🔄 刷新点数")
-        self.btn_refresh_points.setObjectName("btn_refresh_points")
-        self.btn_refresh_points.setStyleSheet("""
-            QPushButton#btn_refresh_points {
-                background-color: #059669;
-                color: white;
-                font-size: 12px;
-                font-weight: bold;
-                padding: 4px 10px;
-                border-radius: 4px;
-            }
-            QPushButton#btn_refresh_points:hover {
-                background-color: #047857;
-            }
-        """)
-        self.btn_refresh_points.setToolTip("向所有已连接的浏览器插件发送指令，模拟点击头像以获取最新真实点数")
-        self.btn_refresh_points.clicked.connect(self.manual_refresh_plugin_points)
-        top_layout.addWidget(self.btn_refresh_points)
+        top_row1.addWidget(self.btn_rules_config)
+
+        top_row1.addSpacing(8)
 
         self.btn_check_update = QPushButton("⬆️ 检查更新")
         self.btn_check_update.setStyleSheet("""
             QPushButton { background-color: #2563EB; color: white; font-size: 12px;
-                          font-weight: bold; padding: 4px 10px; border-radius: 4px; }
+                          font-weight: bold; padding: 5px 11px; border-radius: 5px; }
             QPushButton:hover { background-color: #1D4ED8; }
         """)
         self.btn_check_update.setToolTip("检查 GitHub 上是否有新版本，并可一键下载安装")
         self.btn_check_update.clicked.connect(self.open_update_dialog)
-        top_layout.addWidget(self.btn_check_update)
+        top_row1.addWidget(self.btn_check_update)
         QTimer.singleShot(6000, self._silent_update_check)
-
-        top_layout.addSpacing(4)
 
         self.btn_theme_toggle = QPushButton("🌙 暗色模式")
         self.btn_theme_toggle.setObjectName("btn_theme_toggle")
         self.btn_theme_toggle.setToolTip("一键切换【☀️ 亮色模式】与【🌙 暗色模式】")
         self.btn_theme_toggle.clicked.connect(self.toggle_theme_mode)
-        top_layout.addWidget(self.btn_theme_toggle)
+        top_row1.addWidget(self.btn_theme_toggle)
         self._update_theme_toggle_btn()
 
-        main_layout.addLayout(top_layout)
+        top_container_layout.addLayout(top_row1)
+
+        # ── 第二行：归位 + 核对文案 + 批量拼接 + 批量选择预设 + 快速审核 (统一绿色，字号稍小) + 打开文件夹 (保留原色) ──
+        top_row2 = QHBoxLayout()
+        top_row2.setSpacing(8)
+
+        row2_green_qss = """
+            QPushButton {
+                background-color: #10B981;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 5px 13px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+            QPushButton:pressed {
+                background-color: #047857;
+            }
+        """
+
+        self.btn_batch_check_video = QPushButton("🔍 归位")
+        self.btn_batch_check_video.setObjectName("btn_batch_check_video")
+        self.btn_batch_check_video.setStyleSheet(row2_green_qss)
+        self.btn_batch_check_video.setToolTip("全项目视频完整性核查与一键批量归位")
+        self.btn_batch_check_video.clicked.connect(self.open_batch_video_check_dialog)
+        top_row2.addWidget(self.btn_batch_check_video)
+
+        self.btn_batch_verify_all = QPushButton("📚 核对文案")
+        self.btn_batch_verify_all.setObjectName("btn_batch_verify_all")
+        self.btn_batch_verify_all.setStyleSheet(row2_green_qss)
+        self.btn_batch_verify_all.setToolTip("批量并列核对所有任务的文案与自动气口剪切（最大支持 4 任务并发）")
+        self.btn_batch_verify_all.clicked.connect(self.open_batch_verify_all_dialog)
+        top_row2.addWidget(self.btn_batch_verify_all)
+
+        self.btn_batch_splice_all = QPushButton("🎬 批量拼接")
+        self.btn_batch_splice_all.setObjectName("btn_batch_splice_all")
+        self.btn_batch_splice_all.setStyleSheet(row2_green_qss)
+        self.btn_batch_splice_all.setToolTip("勾选多个或全部任务，逐个完成合并拼接成片 (+SRT) 并全部送入【🎬 批量Reels】")
+        self.btn_batch_splice_all.clicked.connect(self.open_batch_splice_all_dialog)
+        top_row2.addWidget(self.btn_batch_splice_all)
+
+        self.btn_top_multi_select = QPushButton("🖼️ 批量选择预设")
+        self.btn_top_multi_select.setObjectName("btn_top_multi_select")
+        self.btn_top_multi_select.setStyleSheet(row2_green_qss)
+        self.btn_top_multi_select.setToolTip(
+            "打开多选与图片预设可视化管理大窗：\n"
+            "• 一目了然展示所有断句图片（支持 Ctrl+鼠标滚轮无级缩放）\n"
+            "• 支持 Ctrl / Shift / 鼠标直接框选多个图片，在上方选项卡直接指定各种预设\n"
+            "• 自带可折叠/展开的「任务资源图库」，多选断句后点击资源图即可批量更换\n"
+            "• 支持在窗口内直接切换任务"
+        )
+        self.btn_top_multi_select.clicked.connect(self.open_current_project_bulk_edit)
+        top_row2.addWidget(self.btn_top_multi_select)
+
+        self.btn_top_quick_review = QPushButton("👁️ 快速审核")
+        self.btn_top_quick_review.setObjectName("btn_top_quick_review")
+        self.btn_top_quick_review.setStyleSheet(row2_green_qss)
+        self.btn_top_quick_review.setToolTip("跳转到「👁️ 素材快速审核」标签页并直接加载当前项目的全部视频与图片素材")
+        self.btn_top_quick_review.clicked.connect(self.open_current_project_quick_review)
+        top_row2.addWidget(self.btn_top_quick_review)
+
+        self.btn_top_open_folder = QPushButton("📂 打开文件夹")
+        self.btn_top_open_folder.setObjectName("btn_top_open_folder")
+        self.btn_top_open_folder.setStyleSheet("""
+            QPushButton#btn_top_open_folder {
+                background-color: #D7CCC8;
+                color: #5D4037;
+                border: none;
+                border-radius: 5px;
+                padding: 5px 13px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton#btn_top_open_folder:hover {
+                background-color: #BCAAA4;
+            }
+        """)
+        self.btn_top_open_folder.setToolTip("在系统资源管理器中打开当前项目的文件夹")
+        self.btn_top_open_folder.clicked.connect(self.open_current_project_folder)
+        top_row2.addWidget(self.btn_top_open_folder)
+
+        top_row2.addStretch()
+
+        top_container_layout.addLayout(top_row2)
+        main_layout.addLayout(top_container_layout)
         
         # 2. Main Area (Splitter: Sidebar and Details)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -436,6 +526,17 @@ class MainWindow(QMainWindow):
         from views.hosted_mode_widget import HostedModeWidget
         self.hosted_mode = HostedModeWidget(self.plugin_server, self)
         self.main_tab_widget.addTab(self.hosted_mode, "🤖 全局托管")
+
+        from views.visual_review_tab import VisualReviewTabWidget
+        self.visual_review_tab = VisualReviewTabWidget(self.storage_manager, self.config_manager, self)
+        self.visual_review_tab.project_review_updated.connect(self._on_visual_review_updated)
+        self.main_tab_widget.addTab(self.visual_review_tab, "👁️ 素材快速审核")
+
+        from views.batch_reels_tab import BatchReelsTabWidget
+        self.batch_reels_tab = BatchReelsTabWidget(self.storage_manager, self.config_manager, self)
+        self.main_tab_widget.addTab(self.batch_reels_tab, "🎬 批量Reels")
+
+        self.main_tab_widget.currentChanged.connect(self._on_main_tab_changed)
         self.account_monitor = None
         main_layout.addWidget(self.main_tab_widget, stretch=1)
 
@@ -1032,6 +1133,131 @@ class MainWindow(QMainWindow):
                 self.on_project_clicked(current_item)
             QMessageBox.information(self, "完成", f"批量重命名完成，共重命名了 {total_renamed} 张图片！")
 
+    def _on_main_tab_changed(self, index):
+        """Handles top-level tab switches (refreshing Visual Review tasks or stopping video previews)."""
+        current_w = self.main_tab_widget.widget(index)
+        if hasattr(self, "visual_review_tab") and self.visual_review_tab:
+            if current_w is self.visual_review_tab:
+                self.visual_review_tab.refresh_flowcue_tasks()
+            else:
+                self.visual_review_tab.stop_all_video_previews()
+        if hasattr(self, "batch_reels_tab") and self.batch_reels_tab and current_w is self.batch_reels_tab:
+            self.batch_reels_tab.refresh_merged_projects_list()
+
+    def _on_visual_review_updated(self, project_path_str):
+        """Synchronizes review changes from VisualReviewTabWidget back to ProjectDetailWidget & project list."""
+        try:
+            if hasattr(self, "detail_widget") and self.detail_widget and self.detail_widget.project_path:
+                if str(Path(self.detail_widget.project_path).resolve()) == str(Path(project_path_str).resolve()):
+                    self.detail_widget.set_project(self.detail_widget.project_path)
+            self.reload_projects_list()
+        except Exception as e:
+            print(f"Error syncing visual review update: {e}")
+
+    def open_in_visual_review(self, project_path=None):
+        """Switches to the Visual Review tab and selects the specified project."""
+        if not hasattr(self, "visual_review_tab") or not self.visual_review_tab:
+            return
+        idx = self.main_tab_widget.indexOf(self.visual_review_tab)
+        if idx >= 0:
+            self.main_tab_widget.setCurrentIndex(idx)
+        if project_path:
+            self.visual_review_tab.select_project_by_path(project_path)
+
+    def open_in_batch_reels(self, payload=None):
+        """Switches to the Batch Reels tab and loads the merged video + SRT + word timings."""
+        if not hasattr(self, "batch_reels_tab") or not self.batch_reels_tab:
+            return
+        idx = self.main_tab_widget.indexOf(self.batch_reels_tab)
+        if idx >= 0:
+            self.main_tab_widget.setCurrentIndex(idx)
+        if payload:
+            self.batch_reels_tab.load_flowcue_merged_task(payload)
+
+    def open_batch_in_batch_reels(self, payloads=None):
+        """Switches to the Batch Reels tab and batch-loads multiple merged videos + SRT + word timings."""
+        if not hasattr(self, "batch_reels_tab") or not self.batch_reels_tab:
+            return
+        idx = self.main_tab_widget.indexOf(self.batch_reels_tab)
+        if idx >= 0:
+            self.main_tab_widget.setCurrentIndex(idx)
+        if payloads:
+            self.batch_reels_tab.load_flowcue_merged_tasks_batch(payloads)
+
+    def _ensure_active_project_selected(self) -> bool:
+        """Ensures a project is loaded in detail_widget (auto-selects first project if none selected)."""
+        if hasattr(self, "detail_widget") and self.detail_widget and self.detail_widget.project_path:
+            return True
+        if hasattr(self, "list_projects") and self.list_projects.count() > 0:
+            item = self.list_projects.currentItem() or self.list_projects.item(0)
+            if item:
+                self.list_projects.setCurrentItem(item)
+                self.on_project_clicked(item)
+                return bool(self.detail_widget.project_path)
+        QMessageBox.information(self, "提示", "请先在左侧项目列表中选择一个项目（或先导入项目）！")
+        return False
+
+    def open_current_project_bulk_edit(self):
+        """Opens the visual multi-select & preset batch manager dialog for the current project."""
+        if not self._ensure_active_project_selected():
+            return
+        self.detail_widget.open_bulk_edit_dialog()
+
+    def open_current_project_quick_review(self):
+        """Jumps to Visual Review tab for the current project."""
+        if hasattr(self, "detail_widget") and self.detail_widget and self.detail_widget.project_path:
+            self.detail_widget.jump_to_visual_review()
+            return
+        if hasattr(self, "list_projects") and self.list_projects.count() > 0:
+            item = self.list_projects.currentItem() or self.list_projects.item(0)
+            if item:
+                self.list_projects.setCurrentItem(item)
+                self.on_project_clicked(item)
+                if self.detail_widget.project_path:
+                    self.detail_widget.jump_to_visual_review()
+                    return
+        self.open_in_visual_review()
+
+    def open_current_project_folder(self):
+        """Opens the current project's folder in Explorer (or base storage path if no project selected)."""
+        if hasattr(self, "detail_widget") and self.detail_widget and self.detail_widget.project_path:
+            self.detail_widget.open_project_folder()
+            return
+        if self._ensure_active_project_selected():
+            self.detail_widget.open_project_folder()
+
+    def open_batch_splice_all_dialog(self):
+        """Opens the multi-task batch splice dialog to splice selected tasks one-by-one and send all to Batch Reels."""
+        from views.video_compare_widget import BatchAllTasksSpliceDialog
+        dlg = BatchAllTasksSpliceDialog(
+            storage_manager=self.storage_manager,
+            main_window=self,
+            parent=self,
+        )
+        dlg.exec()
+        try:
+            if hasattr(self, "batch_reels_tab") and self.batch_reels_tab:
+                self.batch_reels_tab.refresh_merged_projects_list()
+        except Exception as e:
+            print(f"Error refreshing after batch splice: {e}")
+
+    def open_batch_verify_all_dialog(self):
+        """Opens the parallel multi-task batch subtitle verification dialog (up to 4 tasks in parallel)."""
+        from views.video_compare_widget import BatchAllTasksVerifyDialog
+        dlg = BatchAllTasksVerifyDialog(
+            storage_manager=self.storage_manager,
+            config_manager=self.config_manager,
+            default_engine="gladia",
+            parent=self,
+        )
+        dlg.exec()
+        try:
+            if hasattr(self, "detail_widget") and self.detail_widget and self.detail_widget.project_path:
+                self.detail_widget.set_project(self.detail_widget.project_path)
+            self.reload_projects_list()
+        except Exception as e:
+            print(f"Error refreshing after batch verify: {e}")
+
     def closeEvent(self, event):
         """Clean up background tasks, plugin server, and media players before quitting."""
         # 停止后台扫描 / 拆批线程，避免退出时线程仍在运行
@@ -1058,6 +1284,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "detail_widget") and self.detail_widget:
             if hasattr(self.detail_widget, "cleanup"):
                 self.detail_widget.cleanup()
+
+        if hasattr(self, "visual_review_tab") and self.visual_review_tab:
+            try:
+                self.visual_review_tab.cleanup()
+            except Exception:
+                pass
+
+        if hasattr(self, "batch_reels_tab") and self.batch_reels_tab:
+            try:
+                self.batch_reels_tab.shutdown()
+            except Exception:
+                pass
                 
         super().closeEvent(event)
 

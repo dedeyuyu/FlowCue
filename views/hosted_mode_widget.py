@@ -697,7 +697,12 @@ class HostedModeWidget(CruiseMixin, BrowserOpsMixin, AllocationMixin, UploadMixi
         if center:
             it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         if color:
-            it.setBackground(QColor(color))
+            from services.theme_manager import ThemeManager
+            orig_hex = str(color).lower()
+            it.setData(int(Qt.ItemDataRole.UserRole) + 998, orig_hex)
+            bg_c, fg_c = ThemeManager.adapt_item_bg_fg(orig_hex)
+            it.setBackground(bg_c)
+            it.setForeground(fg_c)
         if tip:
             it.setToolTip(str(tip))
         table.setItem(row, col, it)

@@ -171,10 +171,31 @@ class ProjectDetailWidget(SegmentsTableMixin, PropertyPanelMixin, BulkEditMixin,
         header_layout.addWidget(self.lbl_proj_title)
         
         header_layout.addStretch()
+
+        self.btn_header_multi_select = QPushButton("🖼️ 批量选择预设")
+        self.btn_header_multi_select.setToolTip(
+            "打开全新的多选与图片预设可视化管理大窗：\n"
+            "• 一目了然展示所有断句图片（支持 Ctrl+鼠标滚轮无级缩放）\n"
+            "• 支持 Ctrl / Shift / 鼠标直接框选多个图片，在上方选项卡直接指定各种预设\n"
+            "• 自带可折叠/展开的「任务资源图库」，多选断句后点击资源图即可批量更换\n"
+            "• 支持在窗口内直接切换任务"
+        )
+        self.btn_header_multi_select.setStyleSheet("background-color: #10B981; color: white; font-weight: bold;")
+        self.btn_header_multi_select.clicked.connect(self.open_bulk_edit_dialog)
+        self.btn_header_multi_select.setVisible(False)
+        header_layout.addWidget(self.btn_header_multi_select)
         
-        self.btn_open_folder = QPushButton("📂 在文件夹中显示")
+        self.btn_quick_review_proj = QPushButton("👁️ 快速审核")
+        self.btn_quick_review_proj.setToolTip("跳转到「👁️ 素材快速审核」标签页并直接加载本项目的全部视频与图片素材")
+        self.btn_quick_review_proj.setStyleSheet("background-color: #10B981; color: white; font-weight: bold;")
+        self.btn_quick_review_proj.clicked.connect(self.jump_to_visual_review)
+        self.btn_quick_review_proj.setVisible(False)
+        header_layout.addWidget(self.btn_quick_review_proj)
+
+        self.btn_open_folder = QPushButton("📂 打开文件夹")
         self.btn_open_folder.setObjectName("btn_open_folder")
         self.btn_open_folder.clicked.connect(self.open_project_folder)
+        self.btn_open_folder.setVisible(False)
         header_layout.addWidget(self.btn_open_folder)
         
         self.content_layout.addLayout(header_layout)
@@ -429,9 +450,15 @@ class ProjectDetailWidget(SegmentsTableMixin, PropertyPanelMixin, BulkEditMixin,
         self.btn_delete_segment.clicked.connect(self.delete_selected_segment)
         table_buttons_layout.addWidget(self.btn_delete_segment)
 
-        self.btn_bulk_edit = QPushButton("🧩 批量设置选中行")
-        self.btn_bulk_edit.setToolTip("按住 Ctrl（或 Shift）在左侧表格中多选分句后点击，可一次性批量设置：\n首帧图片 / 片段专属模板 / 片段专属运镜 / 生成模式")
-        self.btn_bulk_edit.setStyleSheet("background-color: #0EA5E9; color: white; font-weight: bold;")
+        self.btn_bulk_edit = QPushButton("🖼️ 批量选择预设")
+        self.btn_bulk_edit.setToolTip(
+            "打开全新的多选与图片预设可视化管理大窗：\n"
+            "• 一目了然展示所有断句图片（支持 Ctrl+鼠标滚轮无级缩放）\n"
+            "• 支持 Ctrl / Shift / 鼠标直接框选多个图片，在上方选项卡直接指定各种预设\n"
+            "• 自带可折叠/展开的「任务资源图库」，多选断句后点击资源图即可批量更换\n"
+            "• 支持在窗口内直接切换任务"
+        )
+        self.btn_bulk_edit.setStyleSheet("background-color: #10B981; color: white; font-weight: bold;")
         self.btn_bulk_edit.clicked.connect(self.open_bulk_edit_dialog)
         table_buttons_layout.addWidget(self.btn_bulk_edit)
 
@@ -484,7 +511,23 @@ class ProjectDetailWidget(SegmentsTableMixin, PropertyPanelMixin, BulkEditMixin,
         from views.video_compare_widget import VideoCompareWidget
         self.video_compare_widget = VideoCompareWidget()
         self.video_compare_widget.videos_deleted.connect(self.populate_segments_table)
+        if hasattr(self.video_compare_widget, "send_to_batch_reels"):
+            self.video_compare_widget.send_to_batch_reels.connect(self._on_send_to_batch_reels)
         self.tabs.addTab(self.video_compare_widget, "🎬 视频与文案比对")
+
+    def jump_to_visual_review(self):
+        """Switches to the top-level Visual Review tab and selects the current project."""
+        if not self.project_path:
+            return
+        main_win = self.window()
+        if hasattr(main_win, "open_in_visual_review"):
+            main_win.open_in_visual_review(self.project_path)
+
+    def _on_send_to_batch_reels(self, payload: dict):
+        """Forwards merged video + SRT + word timings to the top-level Batch Reels tab."""
+        main_win = self.window()
+        if hasattr(main_win, "open_in_batch_reels"):
+            main_win.open_in_batch_reels(payload)
 
     def set_project(self, project_path, light=False):
         """Loads and binds project data.

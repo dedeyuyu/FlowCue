@@ -253,6 +253,7 @@ class VideoCheckDialog(QDialog):
 
         details = self.report.get("segments_detail", [])
         self.table_details.setRowCount(len(details))
+        from services.theme_manager import ThemeManager
         
         for r, item in enumerate(details):
             # 0. Index
@@ -268,14 +269,14 @@ class VideoCheckDialog(QDialog):
             status_str = item.get("status_text", "❌ 缺失")
             status_item = QTableWidgetItem(status_str)
             if item.get("already_in_target"):
-                status_item.setForeground(QColor("#10B981"))
-                bg = QColor("#D1FAE5")
+                orig_bg_hex = "#d1fae5"
+                status_fg_hex = "#10b981"
             elif item["found"]:
-                status_item.setForeground(QColor("#D97706"))
-                bg = QColor("#FEF3C7")
+                orig_bg_hex = "#fef3c7"
+                status_fg_hex = "#d97706"
             else:
-                status_item.setForeground(QColor("#EF4444"))
-                bg = QColor("#FEE2E2")
+                orig_bg_hex = "#fee2e2"
+                status_fg_hex = "#ef4444"
                 
             status_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.table_details.setItem(r, 3, status_item)
@@ -287,11 +288,18 @@ class VideoCheckDialog(QDialog):
             path_str = str(item["source_path"]) if item.get("source_path") else "未找到文件"
             self.table_details.setItem(r, 5, QTableWidgetItem(path_str))
             
-            # Apply row background color
+            # Apply row background and readable foreground color (supports both light & dark modes)
+            bg_c, fg_c = ThemeManager.adapt_item_bg_fg(orig_bg_hex)
             for c in range(6):
                 it = self.table_details.item(r, c)
                 if it:
-                    it.setBackground(bg)
+                    it.setData(int(Qt.ItemDataRole.UserRole) + 998, orig_bg_hex)
+                    it.setBackground(bg_c)
+                    if c == 3:
+                        _, st_fg = ThemeManager.adapt_item_bg_fg(orig_bg_hex, status_fg_hex)
+                        it.setForeground(st_fg)
+                    else:
+                        it.setForeground(fg_c)
 
     def do_relocate(self):
         res = VideoChecker.relocate_found_videos(self.report)
@@ -476,6 +484,7 @@ class BatchVideoCheckDialog(QDialog):
 
         reports = self.batch_report.get("projects_reports", [])
         self.table_projects.setRowCount(len(reports))
+        from services.theme_manager import ThemeManager
         
         for r, proj_rep in enumerate(reports):
             # 0. ID
@@ -493,19 +502,16 @@ class BatchVideoCheckDialog(QDialog):
             # 3. Already
             already = proj_rep.get("already_count", 0)
             it_already = QTableWidgetItem(str(already))
-            it_already.setForeground(QColor("#10B981"))
             self.table_projects.setItem(r, 3, it_already)
             
             # 4. Pending
             pending = proj_rep.get("pending_count", 0)
             it_pending = QTableWidgetItem(str(pending))
-            it_pending.setForeground(QColor("#D97706") if pending > 0 else QColor("#9CA3AF"))
             self.table_projects.setItem(r, 4, it_pending)
             
             # 5. Missing
             missing = proj_rep.get("missing_count", 0)
             it_missing = QTableWidgetItem(str(missing))
-            it_missing.setForeground(QColor("#EF4444") if missing > 0 else QColor("#9CA3AF"))
             self.table_projects.setItem(r, 5, it_missing)
             
             # 6. Completion rate
@@ -514,18 +520,31 @@ class BatchVideoCheckDialog(QDialog):
             it_rate.setFont(self.font())
             self.table_projects.setItem(r, 6, it_rate)
             
-            # Row highlight color
+            # Row highlight color (with automatic dark-mode high-contrast adaptation)
             if rate >= 100.0 and pending == 0:
-                bg = QColor("#D1FAE5")
+                orig_bg_hex = "#d1fae5"
             elif pending > 0:
-                bg = QColor("#FEF3C7")
+                orig_bg_hex = "#fef3c7"
             else:
-                bg = QColor("#FEE2E2") if missing > 0 else QColor("#FFFFFF")
+                orig_bg_hex = "#fee2e2" if missing > 0 else "#ffffff"
                 
+            bg_c, fg_c = ThemeManager.adapt_item_bg_fg(orig_bg_hex)
             for c in range(7):
                 it = self.table_projects.item(r, c)
                 if it:
-                    it.setBackground(bg)
+                    it.setData(int(Qt.ItemDataRole.UserRole) + 998, orig_bg_hex)
+                    it.setBackground(bg_c)
+                    it.setForeground(fg_c)
+
+            # Column-specific status accents
+            _, fg_ok = ThemeManager.adapt_item_bg_fg(orig_bg_hex, "#059669")
+            it_already.setForeground(fg_ok)
+            if pending > 0:
+                _, fg_pend = ThemeManager.adapt_item_bg_fg(orig_bg_hex, "#d97706")
+                it_pending.setForeground(fg_pend)
+            if missing > 0:
+                _, fg_miss = ThemeManager.adapt_item_bg_fg(orig_bg_hex, "#dc2626")
+                it_missing.setForeground(fg_miss)
                     
             # 7. Operations Widget (View Detail & Relocate Single)
             op_widget = QWidget()

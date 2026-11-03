@@ -9,7 +9,7 @@
 import re
 from PyQt6.QtCore import QObject, QEvent, Qt
 from PyQt6.QtGui import QPalette, QColor
-from PyQt6.QtWidgets import QApplication, QWidget, QComboBox
+from PyQt6.QtWidgets import QApplication, QWidget, QComboBox, QTableWidget, QListWidget
 
 
 class _ThemeEventFilter(QObject):
@@ -43,12 +43,16 @@ class ThemeManager:
         "#ffffff": "#242429",
         "#fff": "#242429",
         "#fffdf9": "#242429",
+        "#fff8f0": "#202025",
         "#fafafa": "#202025",
+        "#f9fafb": "#202025",
         "#f8fafc": "#202025",
         "#f5f5f5": "#202025",
+        "#f1f5f9": "#27272a",
         "#f5ebe6": "#18181b",
         "#faf6f0": "#18181b",
         "#ede0d4": "#27272a",
+        "#e6ccb2": "#323238",
         "#efebe9": "#27272a",
         "#f3f4f6": "#27272a",
         "#d7ccc8": "#3f3f46",
@@ -63,17 +67,30 @@ class ThemeManager:
         "#fff8e1": "#3f3222",
         "#fff3e0": "#3f3222",
         "#fef3c7": "#3f3222",
+        "#fef9c3": "#3b2f14",
+        "#ffecb3": "#3b2f14",
+        "#fed7aa": "#3b2f14",
+        "#ffedd5": "#3b2f14",
         "#ecfdf5": "#143326",
         "#f0fdf4": "#143326",
         "#dcfce7": "#143326",
+        "#d1fae5": "#143326",
         "#d4edda": "#143326",
+        "#c8e6c9": "#143326",
         "#fee2e2": "#3b1818",
         "#fef2f2": "#3b1818",
+        "#ffcdd2": "#3b1818",
         "#e0e7ff": "#1e2540",
+        "#dbeafe": "#172554",
+        "#eff6ff": "#172554",
+        "#e0f2fe": "#172554",
+        "#e3f2fd": "#172554",
     }
 
     _BORDER_MAP_DARK = {
         "#d7ccc8": "#3f3f46",
+        "#e6ccb2": "#3f3f46",
+        "#d4a373": "#52525b",
         "#e0d7d3": "#3f3f46",
         "#efebe9": "#323238",
         "#cfd8dc": "#3f3f46",
@@ -84,14 +101,20 @@ class ThemeManager:
         "#f3f4f6": "#323238",
         "#f5f5f5": "#323238",
         "#bcaaa4": "#52525b",
+        "#93c5fd": "#2563eb",
+        "#bfdbfe": "#1d4ed8",
         "#a7f3d0": "#059669",
         "#fcd34d": "#d97706",
     }
 
     _FG_MAP_DARK = {
         "#5d4037": "#f4f4f5",
+        "#5c3d2e": "#f4f4f5",
         "#3e2723": "#f4f4f5",
         "#1f2937": "#f4f4f5",
+        "#1e293b": "#f4f4f5",
+        "#334155": "#f4f4f5",
+        "#374151": "#f4f4f5",
         "#37474f": "#f4f4f5",
         "#111827": "#f4f4f5",
         "#333333": "#f4f4f5",
@@ -100,22 +123,68 @@ class ThemeManager:
         "black": "#f4f4f5",
         "#795548": "#a1a1aa",
         "#8d6e63": "#a1a1aa",
+        "#7f4f24": "#fde68a",
+        "#78350f": "#fde68a",
+        "#475569": "#d4d4d8",
         "#4b5563": "#a1a1aa",
         "#6b7280": "#a1a1aa",
         "#64748b": "#a1a1aa",
         "#a1887f": "#a1a1aa",
         "#9ca3af": "#a1a1aa",
         "#155724": "#6ee7b7",
+        "#15803d": "#4ade80",
+        "#1b5e20": "#4ade80",
+        "#047857": "#34d399",
+        "#065f46": "#6ee7b7",
+        "#0f766e": "#2dd4bf",
         "#059669": "#34d399",
         "#2e7d32": "#4ade80",
         "#0284c7": "#38bdf8",
+        "#0369a1": "#38bdf8",
+        "#0e7490": "#22d3ee",
+        "#1e3a8a": "#93c5fd",
+        "#1e40af": "#93c5fd",
         "#2563eb": "#60a5fa",
         "#d97706": "#fbbf24",
+        "#b45309": "#fbbf24",
         "#f57f17": "#fbbf24",
         "#e65100": "#fb923c",
+        "#9a3412": "#fb923c",
         "#dc2626": "#f87171",
         "#c62828": "#f87171",
+        "#991b1b": "#f87171",
+        "#b71c1c": "#f87171",
         "#4338ca": "#818cf8",
+    }
+
+    # ── 列表/表格单元格背景色在暗色模式下的高对比映射 (dark_bg, dark_fg) ──
+    _ITEM_BG_DARK_PAIR = {
+        "#dcfce7": ("#143326", "#6EE7B7"),
+        "#d1fae5": ("#143326", "#6EE7B7"),
+        "#d4edda": ("#143326", "#6EE7B7"),
+        "#ecfdf5": ("#143326", "#6EE7B7"),
+        "#f0fdf4": ("#143326", "#6EE7B7"),
+        "#c8e6c9": ("#143326", "#6EE7B7"),
+        "#fee2e2": ("#3B1818", "#FCA5A5"),
+        "#fef2f2": ("#3B1818", "#FCA5A5"),
+        "#ffcdd2": ("#3B1818", "#FCA5A5"),
+        "#fef3c7": ("#3B2F14", "#FDE68A"),
+        "#fef9c3": ("#3B2F14", "#FDE68A"),
+        "#fff8e1": ("#3B2F14", "#FDE68A"),
+        "#ffe0b2": ("#3B2F14", "#FDE68A"),
+        "#fff3e0": ("#3B2F14", "#FDE68A"),
+        "#ffecb3": ("#3B2F14", "#FDE68A"),
+        "#dbeafe": ("#172554", "#93C5FD"),
+        "#eff6ff": ("#172554", "#93C5FD"),
+        "#e0f2fe": ("#172554", "#93C5FD"),
+        "#e3f2fd": ("#172554", "#93C5FD"),
+        "#e0e7ff": ("#1E2540", "#A5B4FC"),
+        "#f3f4f6": ("#27272A", "#D4D4D8"),
+        "#f5f5f5": ("#27272A", "#D4D4D8"),
+        "#f8fafc": ("#27272A", "#F4F4F5"),
+        "#f1f5f9": ("#27272A", "#F4F4F5"),
+        "#ffffff": ("#242429", "#F4F4F5"),
+        "white": ("#242429", "#F4F4F5"),
     }
 
     @classmethod
@@ -707,6 +776,9 @@ class ThemeManager:
                 if view is not None:
                     view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
+            if isinstance(widget, (QTableWidget, QListWidget)):
+                cls.adapt_table_or_list_items(widget)
+
             cur_qss = widget.styleSheet()
             if cur_qss:
                 last_applied = widget.property("_last_applied_theme_qss")
@@ -783,3 +855,102 @@ class ThemeManager:
         if cls.is_dark():
             return QColor("#143A29"), QColor("#6EE7B7")
         return QColor("#D4EDDA"), QColor("#155724")
+
+    @classmethod
+    def adapt_item_bg_fg(cls, bg_color, fg_color=None) -> tuple[QColor, QColor]:
+        """将表格/列表单元格的亮色背景和前景自动转换为当前主题（亮色或暗色）下高对比度的 (bg_qcolor, fg_qcolor)。"""
+        if isinstance(bg_color, QColor):
+            bg_hex = bg_color.name().lower()
+        else:
+            bg_hex = str(bg_color or "").strip().lower()
+
+        if isinstance(fg_color, QColor):
+            fg_hex = fg_color.name().lower()
+        elif fg_color:
+            fg_hex = str(fg_color).strip().lower()
+        else:
+            fg_hex = ""
+
+        if not cls.is_dark():
+            out_bg = QColor(bg_hex) if bg_hex else QColor("#FFFFFF")
+            out_fg = QColor(fg_hex) if fg_hex else QColor("#3E2723")
+            return out_bg, out_fg
+
+        # 暗色模式：防止出现浅色底框 + 白色文字看不见的问题
+        if bg_hex in cls._ITEM_BG_DARK_PAIR:
+            d_bg, d_fg = cls._ITEM_BG_DARK_PAIR[bg_hex]
+            if fg_hex and fg_hex in cls._FG_MAP_DARK:
+                d_fg = cls._FG_MAP_DARK[fg_hex]
+            return QColor(d_bg), QColor(d_fg)
+
+        c_bg = QColor(bg_hex) if bg_hex else QColor("#242429")
+        if c_bg.isValid() and c_bg.lightness() > 125:
+            # 任意未登记的浅色背景自动压暗至深色底框
+            h, s, _l, a = c_bg.getHsl()
+            c_bg.setHsl(h, min(s, 140), 38, a)
+
+        if fg_hex:
+            mapped_fg = cls._FG_MAP_DARK.get(fg_hex, fg_hex)
+            c_fg = QColor(mapped_fg)
+            if c_fg.isValid() and c_fg.lightness() < 130:
+                c_fg = QColor("#F4F4F5")
+        else:
+            c_fg = QColor("#F4F4F5")
+
+        return c_bg, c_fg
+
+    @classmethod
+    def adapt_table_or_list_items(cls, widget):
+        """动态转换已存在于 QTableWidget / QListWidget 中的单元格背景色与文字色，切换亮暗模式立即生效。"""
+        ROLE_ORIG_BG = int(Qt.ItemDataRole.UserRole) + 998
+        ROLE_ORIG_FG = int(Qt.ItemDataRole.UserRole) + 999
+        try:
+            items = []
+            if isinstance(widget, QTableWidget):
+                for r in range(widget.rowCount()):
+                    for c in range(widget.columnCount()):
+                        it = widget.item(r, c)
+                        if it is not None:
+                            items.append(it)
+            elif isinstance(widget, QListWidget):
+                for i in range(widget.count()):
+                    it = widget.item(i)
+                    if it is not None:
+                        items.append(it)
+
+            for it in items:
+                bg_role_val = it.data(Qt.ItemDataRole.BackgroundRole)
+                fg_role_val = it.data(Qt.ItemDataRole.ForegroundRole)
+
+                orig_bg = it.data(ROLE_ORIG_BG)
+                orig_fg = it.data(ROLE_ORIG_FG)
+
+                if bg_role_val is not None:
+                    cur_bg_color = it.background().color()
+                    if cur_bg_color.isValid():
+                        if orig_bg is None or (not cls.is_dark() and cur_bg_color.lightness() > 125):
+                            orig_bg = cur_bg_color.name().lower()
+                            it.setData(ROLE_ORIG_BG, orig_bg)
+
+                if fg_role_val is not None:
+                    cur_fg_color = it.foreground().color()
+                    if cur_fg_color.isValid():
+                        if orig_fg is None:
+                            orig_fg = cur_fg_color.name().lower()
+                            it.setData(ROLE_ORIG_FG, orig_fg)
+
+                if orig_bg:
+                    new_bg, new_fg = cls.adapt_item_bg_fg(orig_bg, orig_fg)
+                    it.setBackground(new_bg)
+                    it.setForeground(new_fg)
+                elif orig_fg:
+                    if cls.is_dark():
+                        mapped = cls._FG_MAP_DARK.get(orig_fg, orig_fg)
+                        c_fg = QColor(mapped)
+                        if c_fg.isValid() and c_fg.lightness() < 120:
+                            c_fg = QColor("#F4F4F5")
+                        it.setForeground(c_fg)
+                    else:
+                        it.setForeground(QColor(orig_fg))
+        except Exception:
+            pass

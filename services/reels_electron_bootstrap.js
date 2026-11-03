@@ -1,0 +1,847 @@
+/**
+ * reels_electron_bootstrap.js
+ * FlowCue 批量Reels 宿主引导层（零侵入加载 D:\Antigravity\videokit）
+ *
+ * 作用：
+ * 1. 固定 userData 到 %APPDATA%\videokit 并启动双保险预设同步备份（%APPDATA%\FlowCue\reels-presets-backup），保证更新软件绝不丢失字幕/覆层预设
+ * 2. 启动本地静态资源服务（映射 VideoKit/src 目录），固定默认端口确保 localStorage Origin 永不改变
+ * 3. 在主窗口加载完成后自动切入「🎬 批量Reels」工作台并注入 reels_flowcue_enhancements.js 增强补丁
+ * 4. 提供本地控制端口 (FLOWCUE_CTRL_PORT) 及毫秒级 UDP 焦点通知，供 FlowCue (PyQt6) 激活 Win32 键盘输入焦点、
+ *    单条/批量推送已合并成片+SRT+逐词时间戳、以及同步 API Keys。
+ */
+
+const { app } = require('electron');
+const http = require('http');
+const dgram = require('dgram');
+const fs = require('fs');
+const path = require('path');
+
+const VIDEOKIT_ROOT = process.env.VIDEOKIT_ROOT || 'D:\\Antigravity\\videokit';
+const VIDEOKIT_SRC = path.join(VIDEOKIT_ROOT, 'src');
+const VITE_PORT = Number(process.env.VITE_PORT) || 5179;
+const CTRL_PORT = Number(process.env.FLOWCUE_CTRL_PORT) || 5180;
+const PY_FOCUS_UDP_PORT = Number(process.env.FLOWCUE_FOCUS_UDP_PORT) || 0;
+const WORKBENCH_MODE = (process.env.FLOWCUE_WORKBENCH_MODE || 'batch-reels').trim();
+const ENHANCEMENTS_JS_PATH = path.join(__dirname, 'reels_flowcue_enhancements.js');
+
+process.env.VITE_PORT = String(VITE_PORT);
+// 禁用 main.js 开发态 fs.watch 自动重启
+global._isWatching = true;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 0. 强制固定 userData 路径到 %APPDATA%\videokit + 字幕/覆层预设多路合并与永久备份
+// ═══════════════════════════════════════════════════════════════════════════
+const appDataDir = app.getPath('appData');
+const videokitUserData = WORKBENCH_MODE === 'visual-review'
+    ? path.join(appDataDir, 'videokit-visual-review')
+    : path.join(appDataDir, 'videokit');
+const electronLegacyUserData = path.join(appDataDir, 'Electron');
+const flowcueBackupDir = path.join(appDataDir, 'FlowCue', 'reels-presets-backup');
+
+try {
+    app.setName(WORKBENCH_MODE === 'visual-review' ? 'videokit-visual-review' : 'videokit');
+    app.setPath('userData', videokitUserData);
+} catch (e) {
+    console.warn('[FlowCue-Reels] setPath userData warning:', e.message);
+}
+
+const PRESET_FILE_PRIMARY = path.join(videokitUserData, 'videokit-presets', 'local-storage-presets.json');
+const PRESET_FILE_LEGACY  = path.join(electronLegacyUserData, 'videokit-presets', 'local-storage-presets.json');
+const PRESET_FILE_BACKUP  = path.join(flowcueBackupDir, 'local-storage-presets.json');
+
+const PRESET_KEYS = [
+    'reels_style_presets',
+    'reels_overlay_presets',
+    'reels_overlay_group_presets',
+    'reels_multi_export_presets',
+    'reels_export_presets',
+    'reels_batch_custom_presets',
+    'reels_custom_fonts',
+];
+
+function readPresetSnapshotFile(filePath) {
+    try {
+        if (!fs.existsSync(filePath)) return {};
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        if (parsed && typeof parsed.entries === 'object' && parsed.entries) {
+            return parsed.entries;
+        }
+        return {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function mergePresetEntries(entriesList) {
+    const mergedEntries = {};
+    for (const key of PRESET_KEYS) {
+        let combinedObj = {};
+        let hasAny = false;
+        for (const entries of entriesList) {
+            const rawStr = entries?.[key];
+            if (typeof rawStr !== 'string' || !rawStr.trim()) continue;
+            try {
+                const parsed = JSON.parse(rawStr);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    combinedObj = { ...combinedObj, ...parsed };
+                    hasAny = true;
+                } else if (Array.isArray(parsed) && parsed.length > 0) {
+                    combinedObj = parsed;
+                    hasAny = true;
+                }
+            } catch (_) {}
+        }
+        if (hasAny) {
+            mergedEntries[key] = JSON.stringify(combinedObj);
+        }
+    }
+    return mergedEntries;
+}
+
+function syncAndBackupPresetFiles(extraEntries = null) {
+    try {
+        const eLegacy  = readPresetSnapshotFile(PRESET_FILE_LEGACY);
+        const eBackup  = readPresetSnapshotFile(PRESET_FILE_BACKUP);
+        const ePrimary = readPresetSnapshotFile(PRESET_FILE_PRIMARY);
+        const list = [eLegacy, eBackup, ePrimary];
+        if (extraEntries && typeof extraEntries === 'object') {
+            list.push(extraEntries);
+        }
+        const merged = mergePresetEntries(list);
+        if (Object.keys(merged).length === 0) return merged;
+
+        const payload = JSON.stringify({
+            version: 1,
+            updatedAt: new Date().toISOString(),
+            entries: merged,
+        }, null, 2);
+
+        for (const targetFile of [PRESET_FILE_PRIMARY, PRESET_FILE_BACKUP]) {
+            const dir = path.dirname(targetFile);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(targetFile, payload, 'utf8');
+        }
+        return merged;
+    } catch (e) {
+        console.warn('[FlowCue-Reels] syncAndBackupPresetFiles warning:', e.message);
+        return {};
+    }
+}
+
+// 启动时立即合并同步一次预设文件
+syncAndBackupPresetFiles();
+
+let capturedMainWindow = null;
+let rendererReady = false;
+const pendingTasks = [];
+const udpClient = dgram.createSocket('udp4');
+
+function notifyPythonFocusHwnd() {
+    if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+        try {
+            capturedMainWindow.focus();
+            capturedMainWindow.webContents.focus();
+        } catch (_) {}
+    }
+    if (PY_FOCUS_UDP_PORT > 0) {
+        const msg = Buffer.from('FOCUS');
+        udpClient.send(msg, 0, msg.length, PY_FOCUS_UDP_PORT, '127.0.0.1', () => {});
+    }
+}
+
+const MIME_MAP = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.mjs': 'application/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon',
+    '.ttf': 'font/ttf',
+    '.otf': 'font/otf',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.mp4': 'video/mp4',
+    '.webm': 'video/webm',
+    '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
+};
+
+// 1. 启动静态 HTTP 服务供 Electron 主窗口加载 VideoKit/src
+const staticServer = http.createServer((req, res) => {
+    try {
+        const parsedUrl = new URL(req.url || '/', `http://localhost:${VITE_PORT}`);
+        let pathname = decodeURIComponent(parsedUrl.pathname || '/');
+        if (pathname === '/' || pathname === '') {
+            pathname = '/index.html';
+        }
+        const safeRel = path.normalize(pathname).replace(/^(\.\.(\/|\\|$))+/, '');
+        let filePath = path.join(VIDEOKIT_SRC, safeRel);
+        if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+            const altPath = path.join(VIDEOKIT_ROOT, safeRel);
+            if (fs.existsSync(altPath) && fs.statSync(altPath).isFile()) {
+                filePath = altPath;
+            } else {
+                res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end('Not Found');
+                return;
+            }
+        }
+
+        const ext = path.extname(filePath).toLowerCase();
+        const contentType = MIME_MAP[ext] || 'application/octet-stream';
+        const stat = fs.statSync(filePath);
+        const range = req.headers.range;
+
+        if (range) {
+            const parts = range.replace(/bytes=/, '').split('-');
+            const start = parseInt(parts[0], 10) || 0;
+            const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+            const chunkSize = Math.max(0, end - start + 1);
+            res.writeHead(206, {
+                'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': chunkSize,
+                'Content-Type': contentType,
+                'Access-Control-Allow-Origin': '*',
+            });
+            fs.createReadStream(filePath, { start, end }).pipe(res);
+        } else {
+            res.writeHead(200, {
+                'Content-Length': stat.size,
+                'Content-Type': contentType,
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'no-cache',
+            });
+            fs.createReadStream(filePath).pipe(res);
+        }
+    } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(String(err.message || err));
+    }
+});
+
+staticServer.on('error', (err) => {
+    console.warn('[FlowCue-Reels] Static server port warning:', err.message);
+});
+
+staticServer.listen(VITE_PORT, '127.0.0.1', () => {
+    console.log(`[FlowCue-Reels] Static server listening on http://127.0.0.1:${VITE_PORT}`);
+});
+
+function getWindowHwndNumber(win) {
+    if (!win || win.isDestroyed()) return 0;
+    try {
+        const buf = win.getNativeWindowHandle();
+        if (!buf || !buf.length) return 0;
+        if (buf.length >= 8) {
+            return Number(buf.readBigUInt64LE(0));
+        }
+        return buf.readUInt32LE(0);
+    } catch (e) {
+        return 0;
+    }
+}
+
+async function activateBatchReelsInRenderer(win) {
+    if (!win || win.isDestroyed()) return;
+    const mergedPresets = syncAndBackupPresetFiles();
+    const presetsJson = JSON.stringify(mergedPresets);
+    let enhancementsCode = '';
+    try {
+        if (fs.existsSync(ENHANCEMENTS_JS_PATH)) {
+            enhancementsCode = fs.readFileSync(ENHANCEMENTS_JS_PATH, 'utf8');
+        }
+    } catch (e) {
+        console.warn('[FlowCue-Reels] Failed to read enhancements JS:', e.message);
+    }
+
+    const script = `
+    (function() {
+        try {
+            window.__FLOWCUE_CTRL_PORT__ = ${CTRL_PORT};
+            // 恢复/合并所有持久化的字幕预设和覆层预设到 localStorage
+            const diskPresets = ${presetsJson};
+            if (diskPresets && typeof diskPresets === 'object') {
+                for (const [k, diskValStr] of Object.entries(diskPresets)) {
+                    if (typeof diskValStr !== 'string' || !diskValStr) continue;
+                    const curStr = localStorage.getItem(k);
+                    if (!curStr || curStr === '{}' || curStr === '[]') {
+                        localStorage.setItem(k, diskValStr);
+                    } else {
+                        try {
+                            const diskObj = JSON.parse(diskValStr);
+                            const curObj = JSON.parse(curStr);
+                            if (diskObj && curObj && typeof diskObj === 'object' && typeof curObj === 'object' && !Array.isArray(diskObj)) {
+                                localStorage.setItem(k, JSON.stringify({ ...diskObj, ...curObj }));
+                            }
+                        } catch (_) {}
+                    }
+                }
+            }
+
+            if (!document.getElementById('flowcue-embedded-style')) {
+                const style = document.createElement('style');
+                style.id = 'flowcue-embedded-style';
+                style.textContent = \`
+                    body.flowcue-embedded header.titlebar {
+                        display: none !important;
+                    }
+                    body.flowcue-embedded #path-warning-banner {
+                        display: none !important;
+                    }
+                    body.flowcue-embedded .app {
+                        height: 100vh !important;
+                        display: flex !important;
+                        flex-direction: column !important;
+                    }
+                    body.flowcue-embedded main.content {
+                        flex: 1 !important;
+                        height: 100vh !important;
+                        max-height: 100vh !important;
+                        padding: 6px 10px !important;
+                        overflow: auto !important;
+                    }
+                \`;
+                document.head.appendChild(style);
+            }
+            document.body.classList.add('flowcue-embedded');
+            localStorage.setItem('pathWarningDismissed', '1');
+            const reelsTabBtn = document.querySelector('button.tab[data-tab="batch-reels"]');
+            if (reelsTabBtn) {
+                reelsTabBtn.click();
+            }
+            if (typeof _loadSavedPresets === 'function') {
+                try { _loadSavedPresets(); } catch (_) {}
+            }
+            setTimeout(() => {
+                if (typeof reelsPreviewZoom === 'function') {
+                    reelsPreviewZoom('fit');
+                }
+            }, 250);
+            return true;
+        } catch (err) {
+            console.error('[FlowCue-Reels] activate error:', err);
+            return false;
+        }
+    })();
+    `;
+    try {
+        await win.webContents.executeJavaScript(script, true);
+        if (enhancementsCode) {
+            await win.webContents.executeJavaScript(enhancementsCode, true);
+        }
+    } catch (e) {
+        console.warn('[FlowCue-Reels] activateBatchReelsInRenderer failed:', e.message);
+    }
+}
+
+async function activateVisualReviewInRenderer(win) {
+    if (!win || win.isDestroyed()) return;
+    let enhancementsCode = '';
+    try {
+        if (fs.existsSync(ENHANCEMENTS_JS_PATH)) {
+            enhancementsCode = fs.readFileSync(ENHANCEMENTS_JS_PATH, 'utf8');
+        }
+    } catch (e) {
+        console.warn('[FlowCue-VisualReview] Failed to read enhancements JS:', e.message);
+    }
+
+    const script = `
+    (function() {
+        try {
+            window.__FLOWCUE_CTRL_PORT__ = ${CTRL_PORT};
+            if (!document.getElementById('flowcue-embedded-style')) {
+                const style = document.createElement('style');
+                style.id = 'flowcue-embedded-style';
+                style.textContent = \`
+                    body.flowcue-embedded header.titlebar {
+                        display: none !important;
+                    }
+                    body.flowcue-embedded #path-warning-banner {
+                        display: none !important;
+                    }
+                    body.flowcue-embedded aside.media-sidebar {
+                        display: none !important;
+                    }
+                    body.flowcue-embedded .app {
+                        height: 100vh !important;
+                        display: flex !important;
+                        flex-direction: column !important;
+                    }
+                    body.flowcue-embedded main.content {
+                        flex: 1 !important;
+                        height: 100vh !important;
+                        max-height: 100vh !important;
+                        padding: 6px 10px !important;
+                        overflow: auto !important;
+                    }
+                \`;
+                document.head.appendChild(style);
+            }
+            document.body.classList.add('flowcue-embedded');
+            localStorage.setItem('pathWarningDismissed', '1');
+            const mediaTabBtn = document.querySelector('button.tab[data-tab="media"]');
+            if (mediaTabBtn) {
+                mediaTabBtn.click();
+            }
+            const vrSubBtn = document.querySelector('button.sidebar-item[data-subtab="media-visualreview"]');
+            if (vrSubBtn) {
+                vrSubBtn.click();
+            }
+            return true;
+        } catch (err) {
+            console.error('[FlowCue-VisualReview] activate error:', err);
+            return false;
+        }
+    })();
+    `;
+    try {
+        await win.webContents.executeJavaScript(script, true);
+        if (enhancementsCode) {
+            await win.webContents.executeJavaScript(enhancementsCode, true);
+        }
+    } catch (e) {
+        console.warn('[FlowCue-VisualReview] activateVisualReviewInRenderer failed:', e.message);
+    }
+}
+
+async function injectVisualReviewFolderIntoRenderer(win, folderPath) {
+    if (!win || win.isDestroyed() || !folderPath) return { ok: false, error: '窗口或文件夹路径无效' };
+    const serializedPath = JSON.stringify(String(folderPath));
+    const js = `
+    (async function() {
+        const folderPath = ${serializedPath};
+        const mediaTabBtn = document.querySelector('button.tab[data-tab="media"]');
+        if (mediaTabBtn && !mediaTabBtn.classList.contains('active')) {
+            mediaTabBtn.click();
+        }
+        const vrSubBtn = document.querySelector('button.sidebar-item[data-subtab="media-visualreview"]');
+        if (vrSubBtn && !vrSubBtn.classList.contains('active')) {
+            vrSubBtn.click();
+        }
+        if (typeof window.visualReviewLoadDroppedFolder === 'function') {
+            await window.visualReviewLoadDroppedFolder(folderPath, { silent: false });
+            return { ok: true, folderPath };
+        }
+        throw new Error('visualReviewLoadDroppedFolder 尚未就绪');
+    })();
+    `;
+    return await win.webContents.executeJavaScript(js, true);
+}
+
+function enrichPayloadFromManifest(payload) {
+    const data = { ...(payload || {}) };
+    const manifestPath = data.manifest_path || data.project_path || '';
+    if (manifestPath && fs.existsSync(manifestPath)) {
+        try {
+            const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            if (!data.duration && (m.total_duration || m.output_duration)) {
+                data.duration = Number(m.total_duration || m.output_duration || 0);
+            }
+            if ((!Array.isArray(data.words) || data.words.length === 0) && Array.isArray(m.merged_words)) {
+                data.words = m.merged_words;
+            }
+            if ((!Array.isArray(data.segments) || data.segments.length === 0) && Array.isArray(m.clips)) {
+                data.segments = m.clips;
+            }
+        } catch (_) {}
+    }
+    return data;
+}
+
+async function injectFlowCueTaskIntoRenderer(win, rawPayload) {
+    if (!win || win.isDestroyed()) {
+        throw new Error('Reels 窗口尚未就绪');
+    }
+    const payload = enrichPayloadFromManifest(rawPayload);
+    const serialized = JSON.stringify(payload || {});
+    const js = `
+    (async function() {
+        const data = ${serialized};
+        const reelsTabBtn = document.querySelector('button.tab[data-tab="batch-reels"]');
+        if (reelsTabBtn && !reelsTabBtn.classList.contains('active')) {
+            reelsTabBtn.click();
+        }
+        if (typeof window.reelsCreateTaskFromAutoEditResult !== 'function') {
+            throw new Error('reelsCreateTaskFromAutoEditResult 尚未加载完成');
+        }
+        const autoEditResult = {
+            output_path: data.video_path || data.output_path || '',
+            srt_path: data.srt_path || '',
+            output_duration: Number(data.duration || data.output_duration || 0),
+            project_path: data.manifest_path || data.project_path || '',
+            output_dir: data.output_dir || '',
+            review_segments: Array.isArray(data.segments) ? data.segments : [],
+        };
+        const task = await window.reelsCreateTaskFromAutoEditResult(autoEditResult, {
+            baseName: data.project_name || undefined,
+            skipRecoveryCollection: true,
+        });
+
+        // 优先使用 FlowCue Gladia 核对对齐后的全片绝对时间轴逐词数组 (data.words / merged_words)
+        // 精确绑定到每个 SRT 句段，确保视频原速或加速导出时，逐词卡拉OK动画与人声 100% 严丝合缝！
+        if (task && Array.isArray(task.segments) && task.segments.length > 0) {
+            const globalWords = Array.isArray(data.words) ? data.words : [];
+            if (globalWords.length > 0) {
+                for (const seg of task.segments) {
+                    const sStart = Number(seg.start || 0);
+                    const sEnd = Number(seg.end || 0);
+                    const matched = globalWords.filter(w => {
+                        const ws = Number(w.start ?? 0);
+                        const we = Number(w.end ?? ws);
+                        const mid = (ws + we) * 0.5;
+                        return mid >= (sStart - 0.12) && mid <= (sEnd + 0.12);
+                    }).map(w => ({
+                        word: String(w.word || '').trim(),
+                        start: Number(w.start || 0),
+                        end: Number(w.end || 0),
+                    })).filter(w => w.word);
+                    if (matched.length > 0) {
+                        seg.words = matched;
+                    }
+                }
+            }
+            // 同步更新批量表格归档快照
+            if (typeof window.reelsArchiveTaskToActiveBatchTab === 'function') {
+                try { window.reelsArchiveTaskToActiveBatchTab(task); } catch (_) {}
+            }
+        }
+
+        if (typeof _renderBatchTable === 'function') {
+            try { _renderBatchTable(); } catch (_) {}
+        }
+        if (typeof reelsPreviewZoom === 'function') {
+            setTimeout(() => reelsPreviewZoom('fit'), 150);
+        }
+        if (typeof reelsUpdatePreview === 'function') {
+            reelsUpdatePreview(true);
+        }
+        if (!data._silentToast && typeof showToast === 'function') {
+            showToast('🎬 已从 FlowCue 导入成片与精确字幕时间轴: ' + (task?.fileName || ''), 'success', 4500);
+        }
+        return {
+            ok: true,
+            taskId: task?.id || '',
+            fileName: task?.fileName || '',
+            segmentCount: Array.isArray(task?.segments) ? task.segments.length : 0,
+            totalTasks: window._reelsState?.tasks?.length || 0,
+        };
+    })();
+    `;
+    return await win.webContents.executeJavaScript(js, true);
+}
+
+function execJsWithTimeout(win, jsCode, timeoutMs = 1500) {
+    if (!win || win.isDestroyed()) return Promise.resolve(null);
+    return Promise.race([
+        win.webContents.executeJavaScript(jsCode, true).catch(() => null),
+        new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+}
+
+// 2. 拦截主窗口创建，禁掉自动 DevTools 并在加载后自动进入批量Reels/素材快速审核
+app.on('browser-window-created', (_event, win) => {
+    const origOpenDevTools = win.webContents.openDevTools.bind(win.webContents);
+    let allowManualDevTools = false;
+    win.webContents.openDevTools = function (...args) {
+        if (allowManualDevTools) {
+            return origOpenDevTools(...args);
+        }
+        return undefined;
+    };
+    win._openDevToolsManual = () => {
+        allowManualDevTools = true;
+        origOpenDevTools({ mode: 'detach' });
+    };
+
+    try {
+        win.setMenuBarVisibility(false);
+        win.setAutoHideMenuBar(true);
+    } catch (_) {}
+
+    // 如果创建的是主可见窗口（非隐藏的存储迁移小窗口），立即记录句柄供 PyQt6 嵌入，防止窗口外露浮动
+    try {
+        const bounds = win.getBounds ? win.getBounds() : { width: 0 };
+        if (!capturedMainWindow && win.isVisible() && (bounds.width >= 900)) {
+            capturedMainWindow = win;
+            rendererReady = true;
+        }
+    } catch (_) {}
+
+    win.webContents.on('did-start-navigation', (_ev, url) => {
+        if (url && url.includes(`:${VITE_PORT}`) && !url.includes('template=')) {
+            capturedMainWindow = win;
+            rendererReady = true;
+        }
+    });
+
+    win.webContents.on('dom-ready', async () => {
+        const url = win.webContents.getURL() || '';
+        if (url.includes(`:${VITE_PORT}`) && !url.includes('template=')) {
+            capturedMainWindow = win;
+            rendererReady = true;
+            if (WORKBENCH_MODE === 'visual-review') {
+                await activateVisualReviewInRenderer(win);
+            } else {
+                await activateBatchReelsInRenderer(win);
+            }
+        }
+    });
+
+    win.webContents.on('did-finish-load', async () => {
+        const url = win.webContents.getURL() || '';
+        if (url.includes(`:${VITE_PORT}`) && !url.includes('template=')) {
+            capturedMainWindow = win;
+            rendererReady = true;
+            if (WORKBENCH_MODE === 'visual-review') {
+                await activateVisualReviewInRenderer(win);
+            } else {
+                await activateBatchReelsInRenderer(win);
+            }
+            while (pendingTasks.length > 0) {
+                const nextPayload = pendingTasks.shift();
+                try {
+                    if (WORKBENCH_MODE === 'visual-review' && nextPayload?.folder_path) {
+                        await injectVisualReviewFolderIntoRenderer(win, nextPayload.folder_path);
+                    } else {
+                        await injectFlowCueTaskIntoRenderer(win, nextPayload);
+                    }
+                } catch (e) {
+                    console.error('[FlowCue-Reels] Pending task inject failed:', e);
+                }
+            }
+        }
+    });
+});
+
+// 3. 启动控制 HTTP 服务，供 FlowCue (PyQt6) 通信
+function readJsonBody(req) {
+    return new Promise((resolve) => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', () => {
+            if (!body) return resolve({});
+            try {
+                resolve(JSON.parse(body));
+            } catch {
+                resolve({});
+            }
+        });
+    });
+}
+
+function sendJson(res, status, obj) {
+    const payload = JSON.stringify(obj);
+    res.writeHead(status, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(payload),
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    });
+    res.end(payload);
+}
+
+const ctrlServer = http.createServer(async (req, res) => {
+    try {
+        if (req.method === 'OPTIONS') {
+            return sendJson(res, 200, { ok: true });
+        }
+
+        const parsed = new URL(req.url || '/', `http://127.0.0.1:${CTRL_PORT}`);
+        const pathname = parsed.pathname;
+
+        if (req.method === 'GET' && pathname === '/status') {
+            const hwnd = getWindowHwndNumber(capturedMainWindow);
+            let stateInfo = {};
+            if (rendererReady && capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+                try {
+                    const resState = await execJsWithTimeout(
+                        capturedMainWindow,
+                        `({
+                            taskCount: window._reelsState?.tasks?.length || 0,
+                            selectedIdx: window._reelsState?.selectedIdx ?? -1,
+                            isExporting: !!window._reelsState?.isExporting,
+                            limitUnder3Min: !!(typeof window.flowcueGetLimitUnder3Min === 'function' ? window.flowcueGetLimitUnder3Min() : (localStorage.getItem('flowcue_reels_limit_under_3min') !== '0'))
+                        })`,
+                        400
+                    );
+                    if (resState && typeof resState === 'object') {
+                        stateInfo = resState;
+                    }
+                } catch (_) {}
+            }
+            return sendJson(res, 200, {
+                ok: true,
+                ready: rendererReady && hwnd > 0,
+                hwnd,
+                vitePort: VITE_PORT,
+                ctrlPort: CTRL_PORT,
+                workbenchMode: WORKBENCH_MODE,
+                presetPrimaryPath: PRESET_FILE_PRIMARY,
+                presetBackupPath: PRESET_FILE_BACKUP,
+                ...stateInfo,
+            });
+        }
+
+        if (req.method === 'POST' && pathname === '/set-limit-under-3min') {
+            const body = await readJsonBody(req);
+            const checked = !!body?.checked;
+            if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+                await capturedMainWindow.webContents.executeJavaScript(
+                    `(() => {
+                        if (typeof window.flowcueSetLimitUnder3Min === 'function') {
+                            return window.flowcueSetLimitUnder3Min(${checked ? 'true' : 'false'});
+                        }
+                        localStorage.setItem('flowcue_reels_limit_under_3min', ${checked ? "'1'" : "'0'"});
+                        return ${checked ? 'true' : 'false'};
+                    })()`,
+                    true
+                );
+            }
+            return sendJson(res, 200, { ok: true, limitUnder3Min: checked });
+        }
+
+        if (req.method === 'POST' && pathname === '/load-visual-review-folder') {
+            const body = await readJsonBody(req);
+            const folderPath = body?.folder_path || body?.folderPath || '';
+            if (!folderPath) {
+                return sendJson(res, 400, { ok: false, error: '缺少 folder_path' });
+            }
+            if (!rendererReady || !capturedMainWindow || capturedMainWindow.isDestroyed()) {
+                pendingTasks.push({ folder_path: folderPath });
+                return sendJson(res, 200, { ok: true, queued: true, folderPath });
+            }
+            const result = await injectVisualReviewFolderIntoRenderer(capturedMainWindow, folderPath);
+            return sendJson(res, 200, result);
+        }
+
+        if (req.method === 'POST' && pathname === '/focus-hwnd') {
+            notifyPythonFocusHwnd();
+            return sendJson(res, 200, { ok: true });
+        }
+
+        if (req.method === 'POST' && pathname === '/backup-presets') {
+            const body = await readJsonBody(req);
+            const entries = body && typeof body.entries === 'object' ? body.entries : {};
+            syncAndBackupPresetFiles(entries);
+            return sendJson(res, 200, { ok: true, primary: PRESET_FILE_PRIMARY, backup: PRESET_FILE_BACKUP });
+        }
+
+        if (req.method === 'POST' && pathname === '/focus-reels') {
+            if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+                await activateBatchReelsInRenderer(capturedMainWindow);
+                notifyPythonFocusHwnd();
+            }
+            return sendJson(res, 200, { ok: true });
+        }
+
+        if (req.method === 'POST' && pathname === '/toggle-header') {
+            if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+                const embedded = await capturedMainWindow.webContents.executeJavaScript(
+                    `(() => {
+                        document.body.classList.toggle('flowcue-embedded');
+                        if (typeof reelsPreviewZoom === 'function') setTimeout(() => reelsPreviewZoom('fit'), 100);
+                        return document.body.classList.contains('flowcue-embedded');
+                    })()`,
+                    true
+                );
+                return sendJson(res, 200, { ok: true, embedded });
+            }
+            return sendJson(res, 200, { ok: false });
+        }
+
+        if (req.method === 'POST' && pathname === '/fit-preview') {
+            if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+                await capturedMainWindow.webContents.executeJavaScript(
+                    `(() => { if (typeof reelsPreviewZoom === 'function') reelsPreviewZoom('fit'); return true; })()`,
+                    true
+                );
+            }
+            return sendJson(res, 200, { ok: true });
+        }
+
+        if (req.method === 'POST' && pathname === '/devtools') {
+            if (capturedMainWindow && !capturedMainWindow.isDestroyed() && capturedMainWindow._openDevToolsManual) {
+                capturedMainWindow._openDevToolsManual();
+            }
+            return sendJson(res, 200, { ok: true });
+        }
+
+        if (req.method === 'POST' && pathname === '/sync-keys') {
+            const body = await readJsonBody(req);
+            if (capturedMainWindow && !capturedMainWindow.isDestroyed()) {
+                const payloadStr = JSON.stringify(body || {});
+                await capturedMainWindow.webContents.executeJavaScript(
+                    `(async () => {
+                        const keys = ${payloadStr};
+                        if (window.electronAPI && window.electronAPI.apiCall) {
+                            await window.electronAPI.apiCall('settings/save', keys);
+                        }
+                        return true;
+                    })()`,
+                    true
+                );
+            }
+            return sendJson(res, 200, { ok: true });
+        }
+
+        if (req.method === 'POST' && pathname === '/load-task') {
+            const body = await readJsonBody(req);
+            if (!rendererReady || !capturedMainWindow || capturedMainWindow.isDestroyed()) {
+                pendingTasks.push(body);
+                return sendJson(res, 200, { ok: true, queued: true });
+            }
+            const result = await injectFlowCueTaskIntoRenderer(capturedMainWindow, body);
+            return sendJson(res, 200, result);
+        }
+
+        if (req.method === 'POST' && pathname === '/load-tasks-batch') {
+            const body = await readJsonBody(req);
+            const items = Array.isArray(body?.tasks) ? body.tasks : [];
+            if (!rendererReady || !capturedMainWindow || capturedMainWindow.isDestroyed()) {
+                items.forEach(item => pendingTasks.push(item));
+                return sendJson(res, 200, { ok: true, queued: true, count: items.length });
+            }
+            const results = [];
+            for (let i = 0; i < items.length; i++) {
+                const itemPayload = { ...items[i], _silentToast: i < items.length - 1 };
+                const r = await injectFlowCueTaskIntoRenderer(capturedMainWindow, itemPayload);
+                results.push(r);
+            }
+            if (items.length > 1) {
+                await capturedMainWindow.webContents.executeJavaScript(
+                    `(() => {
+                        if (typeof showToast === 'function') {
+                            showToast('🎉 已批量将 ' + ${items.length} + ' 个合并成片送入 批量Reels！', 'success', 5000);
+                        }
+                    })()`,
+                    true
+                );
+            }
+            return sendJson(res, 200, {
+                ok: true,
+                count: results.length,
+                totalTasks: results.length > 0 ? results[results.length - 1].totalTasks : 0,
+                results,
+            });
+        }
+
+        return sendJson(res, 404, { ok: false, error: 'Unknown endpoint' });
+    } catch (err) {
+        return sendJson(res, 500, { ok: false, error: String(err.message || err) });
+    }
+});
+
+ctrlServer.listen(CTRL_PORT, '127.0.0.1', () => {
+    console.log(`[FlowCue-Reels] Control server listening on http://127.0.0.1:${CTRL_PORT}`);
+});
+
+// 4. 加载 VideoKit 原生 Electron 主进程（包含全部 80+ IPC 与 FFmpeg/WebCodecs 管线）
+require(path.join(VIDEOKIT_ROOT, 'electron', 'main.js'));
