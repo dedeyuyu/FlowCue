@@ -27,6 +27,12 @@ class FFmpegHelper:
     _ffprobe_path_cache = None
 
     @classmethod
+    def clear_cache(cls):
+        """Clears cached ffmpeg/ffprobe paths so newly installed runtime binaries are discovered."""
+        cls._ffmpeg_path_cache = None
+        cls._ffprobe_path_cache = None
+
+    @classmethod
     def _candidate_dirs(cls):
         """Returns candidate directories where ffmpeg/ffprobe might reside."""
         candidates = []
@@ -36,7 +42,17 @@ class FFmpegHelper:
             p = Path(env_ffmpeg)
             candidates.append(p.parent if p.is_file() else p)
 
-        # 2. Frozen PyInstaller bundle or FlowCue project vendor folder
+        # 2. Permanent user-level auto-installed runtime (%LOCALAPPDATA%\FlowCue\runtime)
+        local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+        runtime_base = Path(local_appdata) / "FlowCue" / "runtime"
+        candidates.extend([
+            runtime_base / "ffmpeg" / "bin",
+            runtime_base / "ffmpeg",
+            runtime_base / "videokit" / "vendor" / "windows" / "ffmpeg" / "bin",
+            runtime_base / "videokit" / "vendor" / "ffmpeg" / "bin",
+        ])
+
+        # 3. Frozen PyInstaller bundle or FlowCue project vendor folder
         if getattr(sys, "frozen", False):
             base_dir = Path(sys.executable).resolve().parent
             candidates.extend([
@@ -49,7 +65,7 @@ class FFmpegHelper:
         candidates.extend([
             code_root / "vendor" / "ffmpeg" / "bin",
             code_root / "vendor" / "windows" / "ffmpeg" / "bin",
-            # VideoKit shared vendor binary path on user's machine
+            # VideoKit shared vendor binary path on developer's machine
             Path(r"D:\Antigravity\videokit\vendor\windows\ffmpeg\bin"),
             code_root.parent.parent / "videokit" / "vendor" / "windows" / "ffmpeg" / "bin",
         ])
@@ -102,6 +118,22 @@ class FFmpegHelper:
         try:
             res = subprocess.run(
                 [ffmpeg_bin, "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                creationflags=_SUBPROCESS_FLAGS,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    @classmethod
+    def is_ffprobe_available(cls) -> bool:
+        """Returns True if ffprobe is available and runnable."""
+        ffprobe_bin = cls.get_ffprobe_path()
+        try:
+            res = subprocess.run(
+                [ffprobe_bin, "-version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=5,

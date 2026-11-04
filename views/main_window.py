@@ -158,6 +158,25 @@ class MainWindow(QMainWindow):
         self.update_plugin_status_ui()
 
         self.load_initial_state()
+        QTimer.singleShot(500, self._check_and_install_runtime_on_startup)
+
+    def _check_and_install_runtime_on_startup(self):
+        """首次启动检测是否已安装 FFmpeg 与 VideoKit (批量Reels/素材快速审核) 运行环境。
+        若未安装，自动弹窗一键下载并配置到 %LOCALAPPDATA%\\FlowCue\\runtime；
+        若已安装，则完全静默跳过（后续版本更新绝不重复下载）。"""
+        try:
+            from services.runtime_installer import get_missing_runtime_components, RuntimeInstallDialog
+            missing = get_missing_runtime_components()
+            if not missing:
+                return
+            dlg = RuntimeInstallDialog(missing, parent=self, auto_start=True)
+            if dlg.exec() == RuntimeInstallDialog.DialogCode.Accepted or dlg.install_succeeded:
+                if hasattr(self, "batch_reels_tab") and self.batch_reels_tab and self.batch_reels_tab.isVisible():
+                    self.batch_reels_tab.ensure_engine_started()
+                if hasattr(self, "visual_review_tab") and self.visual_review_tab and self.visual_review_tab.isVisible():
+                    self.visual_review_tab.ensure_engine_started()
+        except Exception as e:
+            print(f"[MainWindow] _check_and_install_runtime_on_startup warning: {e}")
 
     def init_ui(self):
         from version import __version__
@@ -1251,6 +1270,15 @@ class MainWindow(QMainWindow):
 
     def open_batch_splice_all_dialog(self):
         """Opens the multi-task batch splice dialog to splice selected tasks one-by-one and send all to Batch Reels."""
+        try:
+            from services.runtime_installer import is_ffmpeg_runtime_installed, RuntimeInstallDialog
+            if not is_ffmpeg_runtime_installed():
+                install_dlg = RuntimeInstallDialog(["ffmpeg"], parent=self, auto_start=True)
+                if install_dlg.exec() != RuntimeInstallDialog.DialogCode.Accepted and not install_dlg.install_succeeded:
+                    return
+        except Exception as e:
+            print(f"[MainWindow] FFmpeg runtime check warning: {e}")
+
         from views.video_compare_widget import BatchAllTasksSpliceDialog
         dlg = BatchAllTasksSpliceDialog(
             storage_manager=self.storage_manager,

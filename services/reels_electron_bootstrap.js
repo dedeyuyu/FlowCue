@@ -16,8 +16,42 @@ const dgram = require('dgram');
 const fs = require('fs');
 const path = require('path');
 
-const VIDEOKIT_ROOT = process.env.VIDEOKIT_ROOT || 'D:\\Antigravity\\videokit';
+function resolveDefaultVideokitRoot() {
+    if (process.env.VIDEOKIT_ROOT && fs.existsSync(process.env.VIDEOKIT_ROOT)) {
+        return process.env.VIDEOKIT_ROOT;
+    }
+    const localAppData = process.env.LOCALAPPDATA || path.join(app.getPath('home'), 'AppData', 'Local');
+    const runtimeVk = path.join(localAppData, 'FlowCue', 'runtime', 'videokit');
+    if (fs.existsSync(path.join(runtimeVk, 'src', 'index.html'))) {
+        return runtimeVk;
+    }
+    return 'D:\\Antigravity\\videokit';
+}
+
+const VIDEOKIT_ROOT = resolveDefaultVideokitRoot();
 const VIDEOKIT_SRC = path.join(VIDEOKIT_ROOT, 'src');
+
+// 确保 FlowCue 传入的 FFMPEG_PATH / FFPROBE_PATH 或 runtime/ffmpeg/bin 优先注入到 PATH
+(function ensureRuntimeFfmpegInPath() {
+    try {
+        const localAppData = process.env.LOCALAPPDATA || path.join(app.getPath('home'), 'AppData', 'Local');
+        const runtimeFfmpegBin = path.join(localAppData, 'FlowCue', 'runtime', 'ffmpeg', 'bin');
+        if (!process.env.FFMPEG_PATH && fs.existsSync(path.join(runtimeFfmpegBin, 'ffmpeg.exe'))) {
+            process.env.FFMPEG_PATH = path.join(runtimeFfmpegBin, 'ffmpeg.exe');
+        }
+        if (!process.env.FFPROBE_PATH && fs.existsSync(path.join(runtimeFfmpegBin, 'ffprobe.exe'))) {
+            process.env.FFPROBE_PATH = path.join(runtimeFfmpegBin, 'ffprobe.exe');
+        }
+        if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) {
+            const binDir = path.dirname(process.env.FFMPEG_PATH);
+            if (!(process.env.PATH || '').includes(binDir)) {
+                process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH || ''}`;
+            }
+        }
+    } catch (e) {
+        console.warn('[FlowCue-Reels] ensureRuntimeFfmpegInPath warning:', e.message);
+    }
+})();
 const VITE_PORT = Number(process.env.VITE_PORT) || 5179;
 const CTRL_PORT = Number(process.env.FLOWCUE_CTRL_PORT) || 5180;
 const PY_FOCUS_UDP_PORT = Number(process.env.FLOWCUE_FOCUS_UDP_PORT) || 0;

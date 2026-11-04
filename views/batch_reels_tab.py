@@ -361,6 +361,16 @@ class BatchReelsTabWidget(QWidget):
         )
         ph_layout.addWidget(self.placeholder_label)
 
+        self.btn_install_runtime = QPushButton("⬇️ 一键自动下载并配置运行环境（仅首次使用需安装一次）")
+        self.btn_install_runtime.setStyleSheet(
+            "QPushButton { background-color: #10B981; color: white; font-size: 14px; font-weight: bold; "
+            "padding: 10px 24px; border-radius: 8px; border: none; margin-top: 12px; }"
+            "QPushButton:hover { background-color: #059669; }"
+        )
+        self.btn_install_runtime.clicked.connect(self._on_install_runtime_clicked)
+        self.btn_install_runtime.hide()
+        ph_layout.addWidget(self.btn_install_runtime, alignment=Qt.AlignmentFlag.AlignCenter)
+
         self.host_page = QWidget()
         self.host_layout = QVBoxLayout(self.host_page)
         self.host_layout.setContentsMargins(0, 0, 0, 0)
@@ -406,14 +416,30 @@ class BatchReelsTabWidget(QWidget):
     def _is_process_alive(self) -> bool:
         return self.electron_proc is not None and self.electron_proc.poll() is None
 
+    def _get_videokit_root(self) -> str:
+        from services.runtime_installer import get_videokit_root
+        root = get_videokit_root()
+        self.VIDEOKIT_ROOT = root
+        return root
+
     def _get_electron_exe(self) -> str:
+        vk_root = self._get_videokit_root()
         candidates = [
-            os.path.join(self.VIDEOKIT_ROOT, "node_modules", "electron", "dist", "electron.exe"),
+            os.path.join(vk_root, "node_modules", "electron", "dist", "electron.exe"),
         ]
         for c in candidates:
             if os.path.isfile(c):
                 return c
         return ""
+
+    def _on_install_runtime_clicked(self):
+        from services.runtime_installer import get_missing_runtime_components, RuntimeInstallDialog
+        missing = get_missing_runtime_components()
+        if not missing:
+            missing = ["videokit"]
+        dlg = RuntimeInstallDialog(missing, parent=self, auto_start=True)
+        if dlg.exec() == RuntimeInstallDialog.DialogCode.Accepted or dlg.install_succeeded:
+            self.ensure_engine_started()
 
     def _get_bootstrap_script(self) -> str:
         candidates = []
@@ -435,11 +461,19 @@ class BatchReelsTabWidget(QWidget):
         bootstrap_js = self._get_bootstrap_script()
 
         if not electron_exe or not os.path.isfile(electron_exe):
-            self.status_badge.setText("❌ 未找到 VideoKit Electron 运行时")
+            self.status_badge.setText("📦 首次使用需自动配置运行环境")
             self.placeholder_label.setText(
-                f"⚠️ 未找到 Electron 可执行文件:\n{os.path.join(self.VIDEOKIT_ROOT, 'node_modules', 'electron', 'dist', 'electron.exe')}"
+                "📦 检测到当前电脑尚未安装「批量Reels」渲染运行环境\n\n"
+                "请点击下方绿色按钮一键自动下载并配置（仅首次使用需安装一次，后续软件升级自动复用，无需重新下载）"
             )
+            self.btn_install_runtime.show()
             return
+
+        self.btn_install_runtime.hide()
+        self.placeholder_label.setText(
+            "🎬 正在启动「批量Reels」全功能渲染引擎...\n\n"
+            "包含：80+ 动态字幕样式与预设 · 18+ 逐词/逐字动画 · 6大类媒体卡片与覆层 · B-Roll 插入素材轨 · 多轨时间线精修 · 硬件加速/WYSIWYG导出"
+        )
 
         if not os.path.isfile(bootstrap_js):
             self.status_badge.setText("❌ 未找到 reels_electron_bootstrap.js")
@@ -459,6 +493,16 @@ class BatchReelsTabWidget(QWidget):
         env["FLOWCUE_CTRL_PORT"] = str(self.ctrl_port)
         env["FLOWCUE_FOCUS_UDP_PORT"] = str(self.focus_udp_port)
         env["FLOWCUE_HIDE_UNTIL_EMBED"] = "1"
+        try:
+            from services.ffmpeg_helper import FFmpegHelper
+            ffmpeg_p = FFmpegHelper.get_ffmpeg_path()
+            ffprobe_p = FFmpegHelper.get_ffprobe_path()
+            if os.path.isfile(ffmpeg_p):
+                env["FFMPEG_PATH"] = ffmpeg_p
+            if os.path.isfile(ffprobe_p):
+                env["FFPROBE_PATH"] = ffprobe_p
+        except Exception:
+            pass
         env.pop("ELECTRON_RUN_AS_NODE", None)
 
         self.status_badge.setText("⏳ 正在启动 批量Reels 渲染引擎...")

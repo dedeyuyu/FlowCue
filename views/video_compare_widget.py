@@ -2304,6 +2304,15 @@ class VideoCompareWidget(QWidget):
         if not self.project_model or not self.project_path:
             return
 
+        try:
+            from services.runtime_installer import is_ffmpeg_runtime_installed, RuntimeInstallDialog
+            if not is_ffmpeg_runtime_installed():
+                install_dlg = RuntimeInstallDialog(["ffmpeg"], parent=self, auto_start=True)
+                if install_dlg.exec() != RuntimeInstallDialog.DialogCode.Accepted and not install_dlg.install_succeeded:
+                    return
+        except Exception as e:
+            print(f"[VideoCompareWidget] FFmpeg runtime check warning: {e}")
+
         plan = self._build_splice_plan()
         if not plan:
             QMessageBox.warning(self, "提示", "没有可合并拼接的视频片段（请先确保视频已归位且未被标记删除）。")
@@ -2410,6 +2419,15 @@ class VideoCompareWidget(QWidget):
 
     def open_batch_all_tasks_splice_dialog(self):
         """Opens the multi-task batch splice dialog to splice selected tasks one-by-one and send all to Batch Reels."""
+        try:
+            from services.runtime_installer import is_ffmpeg_runtime_installed, RuntimeInstallDialog
+            if not is_ffmpeg_runtime_installed():
+                install_dlg = RuntimeInstallDialog(["ffmpeg"], parent=self, auto_start=True)
+                if install_dlg.exec() != RuntimeInstallDialog.DialogCode.Accepted and not install_dlg.install_succeeded:
+                    return
+        except Exception as e:
+            print(f"[VideoCompareWidget] FFmpeg runtime check warning: {e}")
+
         # Save current project's trim/breath adjustments first
         if self.project_model and self.project_path:
             try:
