@@ -6,15 +6,18 @@ anti-flicker SRT subtitle generation + Batch Reels project manifest output.
 Supports both single-task splicing and multi-task batch splicing + one-click send to Batch Reels.
 """
 import os
+import re
 import sys
 import json
 import time
 import uuid
 import shutil
+import difflib
 import hashlib
 import tempfile
 import threading
 import subprocess
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -66,6 +69,228 @@ class VideoSpliceService:
         srt_path.parent.mkdir(parents=True, exist_ok=True)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
+
+    @staticmethod
+    def parse_custom_srt_lines(custom_srt_text: str) -> list[str]:
+        """将用户提供的自定义断行文本解析为非空字幕行列表（自动忽略空行、/// 分隔符以及 accidentally 粘贴的 SRT 时间轴行）。"""
+        raw = str(custom_srt_text or "").strip()
+        if not raw:
+            return []
+        raw_lines = [ln.strip() for ln in re.split(r"\r?\n|///", raw)]
+        ts_re = re.compile(r"^\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}")
+        cleaned = []
+        n = len(raw_lines)
+        for i, ln in enumerate(raw_lines):
+            if not ln:
+                continue
+            if ts_re.match(ln):
+                continue
+            # 若下一行是 SRT 时间戳行，且当前行是纯数字序号，则跳过该 SRT 序号行
+            if ln.isdigit() and (i + 1 < n) and ts_re.match(raw_lines[i + 1]):
+                continue
+            cleaned.append(ln)
+        return cleaned
+
+    @staticmethod
+    def _normalize_align_token(token: str) -> str:
+        """归一化单词以用于断行文本与逐词时间轴对齐（去除重音符号、标点，并统一数字与西语/英语数字词）。"""
+        t = str(token or "").strip().lower()
+        if not t:
+            return ""
+        t = unicodedata.normalize("NFD", t)
+        t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
+        t = re.sub(r"[^\w]+", "", t, flags=re.UNICODE)
+        if not t:
+            return ""
+        try:
+            from services.speech_extractor import SpeechExtractor
+            norm_fn = getattr(SpeechExtractor, "normalize_number_token", None)
+            if callable(norm_fn):
+                t = norm_fn(t)
+        except Exception:
+            pass
+        return t
+
+    @classmethod
+    def _tokenize_for_align(cls, text: str) -> list[str]:
+        raw_toks = re.findall(r"[\w']+", str(text or ""), flags=re.UNICODE)
+        out = [cls._normalize_align_token(t) for t in raw_toks]
+        return [t for t in out if t]
+
+    @classmethod
+    def _synthesize_words_for_span(cls, text: str, start_sec: float, end_sec: float) -> list[dict]:
+        """当某一段缺少语音识别逐词时间戳时，按字符比例在该段 [start_sec, end_sec] 内生成虚拟逐词时间轴。"""
+        raw_words = [w.strip() for w in re.findall(r"\S+", str(text or "")) if w.strip()]
+        if not raw_words:
+            return []
+        dur = max(0.05, float(end_sec) - float(start_sec))
+        weights = [max(1, len(cls._normalize_align_token(w)) or len(w)) for w in raw_words]
+        total_w = sum(weights) or len(raw_words)
+        cursor = float(start_sec)
+        synth = []
+        for idx, (w_str, weight) in enumerate(zip(raw_words, weights)):
+            w_dur = dur * (weight / total_w)
+            w_end = float(end_sec) if idx == len(raw_words) - 1 else (cursor + w_dur)
+            synth.append({
+                "word": w_str,
+                "start": round(cursor, 3),
+                "end": round(max(cursor + 0.01, w_end), 3),
+            })
+            cursor = w_end
+        return synth
+
+    @classmethod
+    def build_custom_srt_items(
+        cls,
+        custom_srt_text: str,
+        timeline_words: list,
+        default_srt_items: list,
+        total_dur_ms: int,
+    ) -> list[dict]:
+        """根据用户提供的自定义断行文本 (custom_srt_text) 与全片逐词时间轴 (timeline_words)，
+        精确对齐生成最终 SRT 字幕条目列表 [{"start_ms": int, "end_ms": int, "text": str}, ...]。
+        """
+        custom_lines = cls.parse_custom_srt_lines(custom_srt_text)
+        if not custom_lines:
+            return default_srt_items
+
+        # 准备可用于对齐的完整逐词时间轴
+        effective_words = [
+            w for w in (timeline_words or [])
+            if isinstance(w, dict) and str(w.get("word", "")).strip()
+        ]
+        if not effective_words and default_srt_items:
+            for item in default_srt_items:
+                s_sec = max(0.0, float(item.get("start_ms", 0)) / 1000.0)
+                e_sec = max(s_sec + 0.05, float(item.get("end_ms", 0)) / 1000.0)
+                effective_words.extend(cls._synthesize_words_for_span(item.get("text", ""), s_sec, e_sec))
+
+        total_dur_ms = max(100, int(total_dur_ms or 0))
+        if not effective_words:
+            # 极端兜底：既无逐词时间轴也无默认分段时，按各行字符数均分总时长
+            weights = [max(1, len(ln)) for ln in custom_lines]
+            total_w = sum(weights) or len(custom_lines)
+            cursor_ms = 0
+            fallback_items = []
+            for idx, (ln, weight) in enumerate(zip(custom_lines, weights)):
+                span_ms = max(60, int(round(total_dur_ms * (weight / total_w))))
+                end_ms = total_dur_ms if idx == len(custom_lines) - 1 else min(total_dur_ms, cursor_ms + span_ms)
+                fallback_items.append({
+                    "start_ms": cursor_ms,
+                    "end_ms": max(cursor_ms + 50, end_ms),
+                    "text": ln,
+                })
+                cursor_ms = end_ms
+            return fallback_items
+
+        # 1. 将每行自定义断行文本拆分为归一化 token，并记录每个 token 所属行号
+        line_token_Ranges = []
+        flat_custom_tokens = []
+        for li, ln in enumerate(custom_lines):
+            toks = cls._tokenize_for_align(ln)
+            if not toks:
+                toks = [cls._normalize_align_token(ln) or f"_line_{li}"]
+            start_ci = len(flat_custom_tokens)
+            flat_custom_tokens.extend(toks)
+            end_ci = len(flat_custom_tokens) - 1
+            line_token_Ranges.append((start_ci, end_ci))
+
+        word_norm_tokens = [
+            cls._normalize_align_token(w.get("word", "")) or f"_w_{wi}"
+            for wi, w in enumerate(effective_words)
+        ]
+
+        M = len(flat_custom_tokens)
+        N = len(word_norm_tokens)
+        c_to_w_span = [None] * M
+
+        matcher = difflib.SequenceMatcher(None, flat_custom_tokens, word_norm_tokens, autojunk=False)
+        blocks = matcher.get_matching_blocks()
+
+        prev_c = 0
+        prev_w = 0
+        for ci, wi, size in blocks:
+            # 先对锚点块之间的未匹配区间做单调比例映射（含模糊相似度微调）
+            c_gap = ci - prev_c
+            w_gap = wi - prev_w
+            if c_gap > 0:
+                if w_gap > 0:
+                    for k in range(c_gap):
+                        w0 = prev_w + int(k * w_gap / c_gap)
+                        w1 = prev_w + max(int(k * w_gap / c_gap), int((k + 1) * w_gap / c_gap) - 1)
+                        w0 = min(max(0, w0), N - 1)
+                        w1 = min(max(w0, w1), N - 1)
+                        c_to_w_span[prev_c + k] = (w0, w1)
+                else:
+                    bound_w = min(max(0, prev_w if prev_w < N else N - 1), N - 1)
+                    for k in range(c_gap):
+                        c_to_w_span[prev_c + k] = (bound_w, bound_w)
+
+            # 精确匹配块直接一一对应
+            for k in range(size):
+                c_to_w_span[ci + k] = (wi + k, wi + k)
+
+            prev_c = ci + size
+            prev_w = wi + size
+
+        # 2. 汇总每行自定义断行文本的起止时间戳 (start_ms, end_ms)
+        raw_cues = []
+        for li, (c_start, c_end) in enumerate(line_token_Ranges):
+            spans = [c_to_w_span[c] for c in range(c_start, c_end + 1) if c_to_w_span[c] is not None]
+            if spans:
+                w_first = min(s[0] for s in spans)
+                w_last = max(s[1] for s in spans)
+            else:
+                w_first = min(N - 1, int(li * N / max(1, len(custom_lines))))
+                w_last = w_first
+
+            s_ms = int(round(float(effective_words[w_first].get("start", 0.0)) * 1000))
+            e_ms = int(round(float(effective_words[w_last].get("end", 0.0)) * 1000))
+            s_ms = max(0, min(total_dur_ms - 50, s_ms))
+            e_ms = max(s_ms + 50, min(total_dur_ms, e_ms))
+            raw_cues.append({
+                "start_ms": s_ms,
+                "end_ms": e_ms,
+                "text": custom_lines[li],
+                "_w_first": w_first,
+                "_w_last": w_last,
+            })
+
+        # 3. 若连续多行落入同一时间窗口（例如某行单词在语音识别中被漏读），按字符长度平滑拆分该窗口
+        i = 0
+        L = len(raw_cues)
+        while i < L:
+            j = i + 1
+            while j < L and raw_cues[j]["start_ms"] < raw_cues[j - 1]["end_ms"] and (
+                raw_cues[j]["_w_first"] <= raw_cues[j - 1]["_w_last"]
+            ):
+                j += 1
+            if j - i > 1:
+                win_start = raw_cues[i]["start_ms"]
+                win_end = max(c["end_ms"] for c in raw_cues[i:j])
+                if win_end <= win_start + (j - i) * 50:
+                    next_limit = raw_cues[j]["start_ms"] if j < L else total_dur_ms
+                    win_end = max(win_start + (j - i) * 60, min(total_dur_ms, next_limit))
+                span = max((j - i) * 50, win_end - win_start)
+                weights = [max(1, len(raw_cues[k]["text"])) for k in range(i, j)]
+                tot_w = sum(weights) or (j - i)
+                cur = win_start
+                for idx_k, k in enumerate(range(i, j)):
+                    part = int(round(span * (weights[idx_k] / tot_w)))
+                    nxt = win_end if k == j - 1 else min(win_end, cur + max(50, part))
+                    raw_cues[k]["start_ms"] = cur
+                    raw_cues[k]["end_ms"] = max(cur + 50, nxt)
+                    cur = raw_cues[k]["end_ms"]
+            i = j
+
+        return [
+            {
+                "start_ms": c["start_ms"],
+                "end_ms": c["end_ms"],
+                "text": c["text"],
+            }
+            for c in raw_cues
+        ]
 
     @staticmethod
     def compute_clip_cache_signature(
@@ -216,6 +441,7 @@ class VideoSpliceService:
             processed_manifest_clips = []
             srt_items = []
             merged_words = []
+            alignment_words = []
             timeline_cursor_ms = 0
             cache_hits = 0
 
@@ -318,9 +544,17 @@ class VideoSpliceService:
                         cue_end_ms = seg_start_ms + int(round(clip_words_in_range[-1]["end"] * 1000))
                         cue_start_ms = max(seg_start_ms, min(seg_end_ms - 50, cue_start_ms))
                         cue_end_ms = max(cue_start_ms + 50, min(seg_end_ms, cue_end_ms))
+                        alignment_words.extend(abs_clip_words)
                     else:
                         cue_start_ms = seg_start_ms
                         cue_end_ms = seg_end_ms
+                        alignment_words.extend(
+                            cls._synthesize_words_for_span(
+                                script_text,
+                                seg_start_ms / 1000.0,
+                                seg_end_ms / 1000.0,
+                            )
+                        )
 
                     srt_items.append({
                         "start_ms": cue_start_ms,
@@ -419,10 +653,32 @@ class VideoSpliceService:
 
             # Step 3: Write synchronized SRT and project manifest
             _emit_prog(95, "📝 正在生成同步 SRT 字幕与工程清单...")
-            srt_path = output_video_path.with_suffix(".srt")
-            cls.write_srt_file(srt_items, srt_path)
+            custom_srt_text = ""
+            if project_path:
+                try:
+                    p_dir = Path(project_path)
+                    if (p_dir / "metadata.json").is_file():
+                        from models.project_model import ProjectModel
+                        custom_srt_text = str(getattr(ProjectModel(p_dir), "custom_srt_text", "") or "").strip()
+                except Exception:
+                    custom_srt_text = ""
 
-            all_scripts = [c["script"] for c in processed_manifest_clips if c.get("script")]
+            if cls.parse_custom_srt_lines(custom_srt_text):
+                final_srt_items = cls.build_custom_srt_items(
+                    custom_srt_text=custom_srt_text,
+                    timeline_words=alignment_words or merged_words,
+                    default_srt_items=srt_items,
+                    total_dur_ms=timeline_cursor_ms,
+                )
+            else:
+                final_srt_items = srt_items
+
+            srt_path = output_video_path.with_suffix(".srt")
+            cls.write_srt_file(final_srt_items, srt_path)
+
+            all_scripts = [c["text"] for c in final_srt_items if c.get("text")] or [
+                c["script"] for c in processed_manifest_clips if c.get("script")
+            ]
             with open(eng_dir / "文案.txt", "w", encoding="utf-8") as f:
                 f.write("\n".join(all_scripts))
 
@@ -438,6 +694,7 @@ class VideoSpliceService:
                 "output_duration": total_dur_sec,
                 "clips": processed_manifest_clips,
                 "merged_words": merged_words,
+                "custom_srt_text": custom_srt_text,
             }
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump(manifest_data, f, ensure_ascii=False, indent=2)
@@ -661,6 +918,41 @@ class BatchMultiProjectSpliceWorker(QThread):
                 dur = float(m_data.get("total_duration") or m_data.get("output_duration") or 0.0)
                 words = m_data.get("merged_words", [])
                 clips = m_data.get("clips", [])
+
+                # 若用户更新了该任务的自定义断行文本 (custom_srt_text)，即使复用已有成片也立即重新生成最新 SRT！
+                cur_custom_srt = ""
+                if proj_path and (proj_path / "metadata.json").is_file():
+                    from models.project_model import ProjectModel
+                    cur_custom_srt = str(getattr(ProjectModel(proj_path), "custom_srt_text", "") or "").strip()
+                if m_data.get("custom_srt_text", "") != cur_custom_srt:
+                    default_cues = []
+                    cursor_ms = 0
+                    for c in clips:
+                        c_dur_ms = max(50, int(round(float(c.get("duration", 0.0) or 0.0) * 1000)))
+                        txt = str(c.get("script", "")).strip()
+                        if txt:
+                            default_cues.append({
+                                "start_ms": cursor_ms,
+                                "end_ms": cursor_ms + c_dur_ms,
+                                "text": txt,
+                            })
+                        cursor_ms += c_dur_ms
+                    tot_ms = max(100, int(round(dur * 1000)) or cursor_ms)
+                    if VideoSpliceService.parse_custom_srt_lines(cur_custom_srt):
+                        new_cues = VideoSpliceService.build_custom_srt_items(
+                            custom_srt_text=cur_custom_srt,
+                            timeline_words=words,
+                            default_srt_items=default_cues,
+                            total_dur_ms=tot_ms,
+                        )
+                    else:
+                        new_cues = default_cues
+                    if new_cues:
+                        VideoSpliceService.write_srt_file(new_cues, out_srt)
+                        m_data["custom_srt_text"] = cur_custom_srt
+                        with open(manifest_path, "w", encoding="utf-8") as fw:
+                            json.dump(m_data, fw, ensure_ascii=False, indent=2)
+
                 res = {
                     "project_name": proj_id,
                     "video_path": str(out_video),

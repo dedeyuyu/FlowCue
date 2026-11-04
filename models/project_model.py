@@ -64,6 +64,7 @@ class ProjectModel:
         self.selected_template_id = ""
         self.selected_motion_id = ""
         self.enable_end_frame = None  # None: follow config, True/False: explicit project override
+        self.custom_srt_text = ""     # 用户自定义断行后的文本（仅用于最终合并生成 SRT 字幕，不影响分句与文案核对）
         
         # Load existing metadata if available
         self.load()
@@ -87,6 +88,7 @@ class ProjectModel:
                     self.selected_template_id = data.get("selected_template_id", "")
                     self.selected_motion_id = data.get("selected_motion_id", "")
                     self.enable_end_frame = data.get("enable_end_frame", None)
+                    self.custom_srt_text = str(data.get("custom_srt_text", "") or "")
 
                 # 记录「刚读到的内容」，之后内容未修改的 save() 可直接跳过写盘
                 try:
@@ -116,7 +118,8 @@ class ProjectModel:
             "associated_media": self.associated_media,
             "prompt_template": self.prompt_template,
             "selected_template_id": self.selected_template_id,
-            "selected_motion_id": self.selected_motion_id
+            "selected_motion_id": self.selected_motion_id,
+            "custom_srt_text": getattr(self, "custom_srt_text", "") or "",
         }
         if self.enable_end_frame is not None:
             data["enable_end_frame"] = self.enable_end_frame

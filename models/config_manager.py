@@ -90,7 +90,7 @@ class ConfigManager:
     ]
     
     # New Import column mapping defaults & supported types
-    DEFAULT_IMPORT_COLUMNS = [
+    LEGACY_DEFAULT_IMPORT_COLUMNS = [
         "name",      # 第 1 列：名字
         "empty",     # 第 2 列：空列
         "empty",     # 第 3 列：空列
@@ -99,12 +99,23 @@ class ConfigManager:
         "link",      # 第 6 列：链接
         "name",      # 第 7 列：名字（补充）
     ]
+    DEFAULT_IMPORT_COLUMNS = [
+        "name",       # 第 1 列：名字
+        "empty",      # 第 2 列：空列
+        "empty",      # 第 3 列：空列
+        "chinese",    # 第 4 列：中文文案
+        "original",   # 第 5 列：原文文案
+        "link",       # 第 6 列：链接
+        "name",       # 第 7 列：名字（补充）
+        "srt_lines",  # 第 8 列：断行文本（可选，用于最终拼接生成 SRT 字幕）
+    ]
     
     SUPPORTED_IMPORT_COLUMN_TYPES = [
         ("name", "🏷️ 名字 (任务名称)"),
         ("chinese", "🇨🇳 中文 (中文文案)"),
         ("original", "📝 原文 (外语文案)"),
         ("link", "🔗 链接 (云盘链接)"),
+        ("srt_lines", "✂️ 断行文本 (SRT字幕断行文案)"),
         ("empty", "⬜ 空列 (忽略不读取)"),
     ]
     
@@ -305,7 +316,10 @@ class ConfigManager:
                         and all(c in valid_col_types for c in raw_cols)
                         and required_col_types.issubset(set(raw_cols))
                     ):
-                        self.import_columns = list(raw_cols)
+                        if raw_cols == self.LEGACY_DEFAULT_IMPORT_COLUMNS:
+                            self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
+                        else:
+                            self.import_columns = list(raw_cols)
                     else:
                         self.import_columns = list(self.DEFAULT_IMPORT_COLUMNS)
 

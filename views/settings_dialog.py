@@ -515,7 +515,7 @@ class SettingsDialog(QDialog):
         btn_del_import_col.clicked.connect(lambda: self.spin_import_col_count.setValue(self.spin_import_col_count.value() - 1))
         top_col_bar.addWidget(btn_del_import_col)
 
-        btn_reset_import_col = QPushButton("🔄 恢复默认7列")
+        btn_reset_import_col = QPushButton("🔄 恢复默认8列")
         btn_reset_import_col.setStyleSheet("background-color: #8D6E63; color: white; padding: 4px 10px; font-size: 12px;")
         btn_reset_import_col.clicked.connect(self._reset_import_columns_to_default)
         top_col_bar.addWidget(btn_reset_import_col)
@@ -537,6 +537,7 @@ class SettingsDialog(QDialog):
         lbl_import_cols_hint = QLabel(
             "💡 规则说明：无论设置多少列，必须包含【名字、中文、原文、链接】这 4 项必填列。\n"
             "• 多列设为「名字」时会自动合并作为任务名称（例如第1列名字+第7列名字补充，或第1、2列都设为名字）。\n"
+            "• 设为「✂️ 断行文本」的列（默认第8列，选填）在导入时会自动保存为该任务的自定义 SRT 断行字幕文案，在最终合并拼接视频时自动按此断行生成 SRT 字幕。\n"
             "• 设为「空列」的列在复制表格导入时会自动跳过不读取，方便匹配您自己的表格列习惯。"
         )
         lbl_import_cols_hint.setWordWrap(True)

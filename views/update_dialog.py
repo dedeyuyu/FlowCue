@@ -15,7 +15,7 @@ class UpdateDialog(QDialog):
     def __init__(self, parent=None, auto_check=True):
         super().__init__(parent)
         self.setWindowTitle("检查更新 & 下载最新插件")
-        self.resize(560, 440)
+        self.resize(640, 450)
         self.info = None
         self.check_thread = None
         self.dl_thread = None
@@ -46,6 +46,16 @@ class UpdateDialog(QDialog):
             "QPushButton:hover{background:#6D28D9;}"
             "QPushButton:disabled{background:#9CA3AF;}"
         )
+        self.btn_download_runtime = QPushButton("📦 下载必要插件 (FFmpeg+Reels)")
+        self.btn_download_runtime.setToolTip(
+            "手动一键下载并安装视频拼接所需的 FFmpeg 与批量Reels/素材快速审核运行环境\n"
+            "自动安装到系统路径：%LOCALAPPDATA%\\FlowCue\\runtime"
+        )
+        self.btn_download_runtime.setStyleSheet(
+            "QPushButton{background:#D97706;color:white;font-weight:bold;padding:6px 14px;border-radius:4px;}"
+            "QPushButton:hover{background:#B45309;}"
+            "QPushButton:disabled{background:#9CA3AF;}"
+        )
         self.btn_update = QPushButton("⬇️ 立即更新软件")
         self.btn_update.setEnabled(False)
         self.btn_update.setStyleSheet(
@@ -56,6 +66,7 @@ class UpdateDialog(QDialog):
         self.btn_close = QPushButton("关闭")
         row.addWidget(self.btn_check)
         row.addWidget(self.btn_download_ext)
+        row.addWidget(self.btn_download_runtime)
         row.addStretch()
         row.addWidget(self.btn_update)
         row.addWidget(self.btn_close)
@@ -63,6 +74,7 @@ class UpdateDialog(QDialog):
 
         self.btn_check.clicked.connect(self.start_check)
         self.btn_download_ext.clicked.connect(self.start_download_extension)
+        self.btn_download_runtime.clicked.connect(self.start_download_runtime)
         self.btn_update.clicked.connect(self.start_update)
         self.btn_close.clicked.connect(self.close)
         if auto_check:
@@ -164,6 +176,62 @@ class UpdateDialog(QDialog):
                 subprocess.Popen(["explorer", "/select,", os.path.normpath(msg)])
             except Exception:
                 pass
+
+    # ── 手动下载并安装必要插件/组件 (FFmpeg + VideoKit 批量Reels引擎) ──
+    def start_download_runtime(self):
+        from services.runtime_installer import (
+            get_missing_runtime_components,
+            get_runtime_base_dir,
+            get_runtime_ffmpeg_bin_dir,
+            get_runtime_videokit_dir,
+            _is_valid_videokit_dir,
+            RuntimeInstallDialog,
+        )
+        from services.ffmpeg_helper import FFmpegHelper
+
+        missing = list(get_missing_runtime_components())
+        runtime_ff_dir = get_runtime_ffmpeg_bin_dir()
+        if "ffmpeg" not in missing and not ((runtime_ff_dir / "ffmpeg.exe").is_file() and (runtime_ff_dir / "ffprobe.exe").is_file()):
+            missing.append("ffmpeg")
+        if "videokit" not in missing and not _is_valid_videokit_dir(get_runtime_videokit_dir()):
+            missing.append("videokit")
+
+        target_components = missing
+        if not target_components:
+            reply = QMessageBox.question(
+                self,
+                "必要插件已安装",
+                f"检测到当前电脑已安装全部必要运行组件：\n"
+                f"• FFmpeg & FFprobe 音视频拼接引擎\n"
+                f"• VideoKit 批量Reels & 素材快速审核渲染引擎\n\n"
+                f"安装目录：{get_runtime_base_dir()}\n\n"
+                f"是否强制重新下载并覆盖修复这两个必要组件？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            target_components = ["ffmpeg", "videokit"]
+
+        dlg = RuntimeInstallDialog(target_components, parent=self, auto_start=True)
+        if dlg.exec() == RuntimeInstallDialog.DialogCode.Accepted or dlg.install_succeeded:
+            FFmpegHelper.clear_cache()
+            self.lbl_status.setText(f"✅ 必要插件 (FFmpeg + 批量Reels引擎) 已成功安装至：{get_runtime_base_dir()}")
+            mw = self.parent()
+            if mw is not None:
+                try:
+                    if hasattr(mw, "batch_reels_tab") and mw.batch_reels_tab:
+                        mw.batch_reels_tab.restart_engine()
+                    if hasattr(mw, "visual_review_tab") and mw.visual_review_tab and mw.visual_review_tab.isVisible():
+                        mw.visual_review_tab.ensure_engine_started()
+                except Exception as e:
+                    print(f"[UpdateDialog] restart reels engine after runtime install warning: {e}")
+            QMessageBox.information(
+                self,
+                "必要插件安装完成",
+                f"FFmpeg 与 批量Reels 渲染引擎已全部下载并安装到：\n{get_runtime_base_dir()}\n\n"
+                "现在您可以直接正常使用「视频拼接」与「🎬 批量Reels / 👁️ 素材快速审核」功能！",
+            )
 
     # ── 下载并安装软件 ──
     def start_update(self):

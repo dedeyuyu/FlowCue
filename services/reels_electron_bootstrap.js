@@ -88,7 +88,7 @@ const PRESET_FILE_PRIMARY = path.join(videokitUserData, 'videokit-presets', 'loc
 const PRESET_FILE_LEGACY  = path.join(electronLegacyUserData, 'videokit-presets', 'local-storage-presets.json');
 const PRESET_FILE_BACKUP  = path.join(flowcueBackupDir, 'local-storage-presets.json');
 
-const PRESET_KEYS = [
+const PRESET_DICT_KEYS = [
     'reels_style_presets',
     'reels_overlay_presets',
     'reels_overlay_group_presets',
@@ -97,6 +97,19 @@ const PRESET_KEYS = [
     'reels_batch_custom_presets',
     'reels_custom_fonts',
 ];
+
+const LATEST_VALUE_KEYS = [
+    'reels_align_language',
+    'rbt_align_source',
+    'rbt_align_txt_col',
+    'rbt_align_auto_detect',
+    'reels_naming_mode',
+    'reels_batch_config_autosave',
+    'reels_autosave',
+    'flowcue_dismissed_archive_paths',
+];
+
+const PRESET_KEYS = [...PRESET_DICT_KEYS, ...LATEST_VALUE_KEYS];
 
 function readPresetSnapshotFile(filePath) {
     try {
@@ -113,7 +126,7 @@ function readPresetSnapshotFile(filePath) {
 
 function mergePresetEntries(entriesList) {
     const mergedEntries = {};
-    for (const key of PRESET_KEYS) {
+    for (const key of PRESET_DICT_KEYS) {
         let combinedObj = {};
         let hasAny = false;
         for (const entries of entriesList) {
@@ -132,6 +145,19 @@ function mergePresetEntries(entriesList) {
         }
         if (hasAny) {
             mergedEntries[key] = JSON.stringify(combinedObj);
+        }
+    }
+    // 标量配置与批量任务快照（如字幕对齐语言 reels_align_language、批量任务自动存档 reels_batch_config_autosave）：
+    // 按 entriesList 顺序取最新一次有效写入的值
+    for (const key of LATEST_VALUE_KEYS) {
+        for (const entries of entriesList) {
+            if (!entries || typeof entries !== 'object') continue;
+            if (Object.prototype.hasOwnProperty.call(entries, key)) {
+                const rawStr = entries[key];
+                if (typeof rawStr === 'string' && rawStr.length > 0) {
+                    mergedEntries[key] = rawStr;
+                }
+            }
         }
     }
     return mergedEntries;
@@ -317,11 +343,23 @@ async function activateBatchReelsInRenderer(win) {
     (function() {
         try {
             window.__FLOWCUE_CTRL_PORT__ = ${CTRL_PORT};
-            // 恢复/合并所有持久化的字幕预设和覆层预设到 localStorage
+            // 恢复/合并所有持久化的字幕预设、覆层预设、字幕对齐语言及批量任务队列到 localStorage
             const diskPresets = ${presetsJson};
+            const latestValueKeys = new Set([
+                'reels_align_language',
+                'rbt_align_auto_detect',
+                'reels_naming_mode',
+                'reels_batch_config_autosave',
+                'reels_autosave',
+                'flowcue_dismissed_archive_paths',
+            ]);
             if (diskPresets && typeof diskPresets === 'object') {
                 for (const [k, diskValStr] of Object.entries(diskPresets)) {
                     if (typeof diskValStr !== 'string' || !diskValStr) continue;
+                    if (latestValueKeys.has(k)) {
+                        localStorage.setItem(k, diskValStr);
+                        continue;
+                    }
                     const curStr = localStorage.getItem(k);
                     if (!curStr || curStr === '{}' || curStr === '[]') {
                         localStorage.setItem(k, diskValStr);
@@ -336,6 +374,29 @@ async function activateBatchReelsInRenderer(win) {
                     }
                 }
             }
+
+            // 立即应用已保存的字幕核对对齐语言（防止页面初始化早于磁盘快照恢复而退回英语）
+            const savedAlignLang = localStorage.getItem('reels_align_language');
+            if (savedAlignLang) {
+                try {
+                    const rbtLangEl = document.getElementById('rbt-align-lang');
+                    if (rbtLangEl) rbtLangEl.value = savedAlignLang;
+                    const mainLangEl = document.getElementById('reels-align-lang');
+                    if (mainLangEl) mainLangEl.value = savedAlignLang;
+                    if (typeof window._rbtSetAlignLanguage === 'function') {
+                        window._rbtSetAlignLanguage(savedAlignLang);
+                    }
+                } catch (_) {}
+            }
+
+            // 若磁盘备份中有 reels_batch_config_autosave 且当前内存任务为空，立即触发恢复
+            try {
+                if ((!window._reelsState?.tasks || window._reelsState.tasks.length === 0) &&
+                    localStorage.getItem('reels_batch_config_autosave') &&
+                    typeof _batchAutoRestore === 'function') {
+                    _batchAutoRestore();
+                }
+            } catch (_) {}
 
             if (!document.getElementById('flowcue-embedded-style')) {
                 const style = document.createElement('style');
@@ -509,6 +570,9 @@ async function injectFlowCueTaskIntoRenderer(win, rawPayload) {
     const js = `
     (async function() {
         const data = ${serialized};
+        const normPath = (p) => String(p || '').replace(/\\\\/g, '/').trim().toLowerCase();
+        const targetVideoNorm = normPath(data.video_path || data.output_path || '');
+
         const reelsTabBtn = document.querySelector('button.tab[data-tab="batch-reels"]');
         if (reelsTabBtn && !reelsTabBtn.classList.contains('active')) {
             reelsTabBtn.click();
@@ -516,6 +580,49 @@ async function injectFlowCueTaskIntoRenderer(win, rawPayload) {
         if (typeof window.reelsCreateTaskFromAutoEditResult !== 'function') {
             throw new Error('reelsCreateTaskFromAutoEditResult 尚未加载完成');
         }
+
+        // 检查当前队列中是否已存在相同视频路径的任务
+        const existingTasks = Array.isArray(window._reelsState?.tasks) ? window._reelsState.tasks : [];
+        const existingIdx = targetVideoNorm
+            ? existingTasks.findIndex(t => normPath(t?.videoPath || t?.bgPath || t?.autoEditProject?.outputPath || '') === targetVideoNorm)
+            : -1;
+
+        if (data.skip_if_exists && existingIdx >= 0) {
+            return {
+                ok: true,
+                skippedExisting: true,
+                taskId: existingTasks[existingIdx]?.id || '',
+                fileName: existingTasks[existingIdx]?.fileName || '',
+                segmentCount: Array.isArray(existingTasks[existingIdx]?.segments) ? existingTasks[existingIdx].segments.length : 0,
+                totalTasks: existingTasks.length,
+            };
+        }
+
+        // 用户主动导入或重新拼接送入时，从已手动清除名单中移除该路径，并移除旧重复项以避免重复堆叠
+        if (!data.skip_if_exists && targetVideoNorm) {
+            try {
+                const dismissed = JSON.parse(localStorage.getItem('flowcue_dismissed_archive_paths') || '[]');
+                if (Array.isArray(dismissed) && dismissed.includes(targetVideoNorm)) {
+                    const nextDismissed = dismissed.filter(p => p !== targetVideoNorm);
+                    localStorage.setItem('flowcue_dismissed_archive_paths', JSON.stringify(nextDismissed));
+                }
+            } catch (_) {}
+
+            if (existingIdx >= 0) {
+                const oldTaskId = existingTasks[existingIdx]?.id;
+                existingTasks.splice(existingIdx, 1);
+                try {
+                    if (typeof _batchTableState === 'object' && Array.isArray(_batchTableState?.tabs)) {
+                        for (const tab of _batchTableState.tabs) {
+                            if (Array.isArray(tab?.tasks)) {
+                                tab.tasks = tab.tasks.filter(t => t?.id !== oldTaskId && normPath(t?.videoPath || t?.bgPath || '') !== targetVideoNorm);
+                            }
+                        }
+                    }
+                } catch (_) {}
+            }
+        }
+
         const autoEditResult = {
             output_path: data.video_path || data.output_path || '',
             srt_path: data.srt_path || '',
@@ -556,6 +663,14 @@ async function injectFlowCueTaskIntoRenderer(win, rawPayload) {
             if (typeof window.reelsArchiveTaskToActiveBatchTab === 'function') {
                 try { window.reelsArchiveTaskToActiveBatchTab(task); } catch (_) {}
             }
+        }
+
+        // 立即持久化当前任务队列到 localStorage 及磁盘双备份，确保关闭软件重启后任务绝不丢失
+        if (typeof _batchAutoSave === 'function') {
+            try { _batchAutoSave({ skipSync: true }); } catch (_) {}
+        }
+        if (typeof window.__flowcueBackupStorageNow === 'function') {
+            try { window.__flowcueBackupStorageNow(); } catch (_) {}
         }
 
         if (typeof _renderBatchTable === 'function') {
@@ -1052,6 +1167,193 @@ const ctrlServer = http.createServer(async (req, res) => {
                 );
             }
             return sendJson(res, 200, { ok: true });
+        }
+
+        if (req.method === 'POST' && pathname === '/sync-archived-tasks') {
+            const body = await readJsonBody(req);
+            const items = Array.isArray(body?.items) ? body.items : [];
+            if (!rendererReady || !capturedMainWindow || capturedMainWindow.isDestroyed()) {
+                return sendJson(res, 200, { ok: false, notReady: true });
+            }
+
+            // 1. 先检查当前队列中的所有任务，将本地磁盘上已被删除项目文件夹/视频文件的任务自动移除
+            const currentTaskPaths = await capturedMainWindow.webContents.executeJavaScript(
+                `(() => {
+                    const tasks = Array.isArray(window._reelsState?.tasks) ? window._reelsState.tasks : [];
+                    return tasks.map(t => ({
+                        id: String(t?.id || ''),
+                        videoPath: String(t?.videoPath || t?.bgPath || t?.autoEditProject?.outputPath || ''),
+                    }));
+                })()`,
+                true
+            );
+
+            const missingIds = [];
+            const missingNormPaths = [];
+            const normNodePath = (p) => String(p || '').replace(/\\/g, '/').trim().toLowerCase();
+            if (Array.isArray(currentTaskPaths)) {
+                for (const tInfo of currentTaskPaths) {
+                    const vp = String(tInfo?.videoPath || '').trim();
+                    if (vp && !fs.existsSync(vp)) {
+                        missingIds.push(String(tInfo.id || ''));
+                        missingNormPaths.push(normNodePath(vp));
+                    }
+                }
+            }
+
+            const preSyncInfo = await capturedMainWindow.webContents.executeJavaScript(
+                `(() => {
+                    const normPath = (p) => String(p || '').replace(/\\\\/g, '/').trim().toLowerCase();
+                    const missIds = new Set(${JSON.stringify(missingIds)});
+                    const missPaths = new Set(${JSON.stringify(missingNormPaths)});
+                    let prunedCount = 0;
+
+                    if (missIds.size > 0 || missPaths.size > 0) {
+                        if (Array.isArray(window._reelsState?.tasks)) {
+                            const before = window._reelsState.tasks.length;
+                            window._reelsState.tasks = window._reelsState.tasks.filter(t => {
+                                const vp = normPath(t?.videoPath || t?.bgPath || t?.autoEditProject?.outputPath || '');
+                                return !missIds.has(String(t?.id || '')) && !(vp && missPaths.has(vp));
+                            });
+                            prunedCount = before - window._reelsState.tasks.length;
+                            if (window._reelsState.selectedIdx >= window._reelsState.tasks.length) {
+                                window._reelsState.selectedIdx = window._reelsState.tasks.length - 1;
+                            }
+                        }
+                        try {
+                            if (typeof _batchTableState === 'object' && Array.isArray(_batchTableState?.tabs)) {
+                                for (const tab of _batchTableState.tabs) {
+                                    if (Array.isArray(tab?.tasks)) {
+                                        tab.tasks = tab.tasks.filter(t => {
+                                            const vp = normPath(t?.videoPath || t?.bgPath || t?.autoEditProject?.outputPath || '');
+                                            return !missIds.has(String(t?.id || '')) && !(vp && missPaths.has(vp));
+                                        });
+                                    }
+                                }
+                            }
+                        } catch (_) {}
+                    }
+
+                    let dismissed = [];
+                    try {
+                        dismissed = JSON.parse(localStorage.getItem('flowcue_dismissed_archive_paths') || '[]');
+                        if (!Array.isArray(dismissed)) dismissed = [];
+                    } catch (_) { dismissed = []; }
+
+                    const existingNormPaths = (Array.isArray(window._reelsState?.tasks) ? window._reelsState.tasks : [])
+                        .map(t => normPath(t?.videoPath || t?.bgPath || t?.autoEditProject?.outputPath || ''))
+                        .filter(Boolean);
+
+                    if (prunedCount > 0) {
+                        if (typeof _renderTaskList === 'function') { try { _renderTaskList(); } catch (_) {} }
+                        if (typeof _renderBatchTable === 'function') { try { _renderBatchTable(); } catch (_) {} }
+                        if (typeof _batchAutoSave === 'function') { try { _batchAutoSave({ skipSync: true }); } catch (_) {} }
+                        if (typeof window.__flowcueBackupStorageNow === 'function') { try { window.__flowcueBackupStorageNow(); } catch (_) {} }
+                    }
+
+                    return { prunedCount, dismissed, existingNormPaths };
+                })()`,
+                true
+            );
+
+            const dismissedSet = new Set(Array.isArray(preSyncInfo?.dismissed) ? preSyncInfo.dismissed : []);
+            const existingSet = new Set(Array.isArray(preSyncInfo?.existingNormPaths) ? preSyncInfo.existingNormPaths : []);
+
+            // 2. 自动补齐本地项目文件夹中存在存档、但尚未在批量Reels队列中（且未被用户手动清空）的任务
+            let addedCount = 0;
+            for (const item of items) {
+                const vp = String(item?.video_path || '').trim();
+                const sp = String(item?.srt_path || '').trim();
+                if (!vp || !sp || !fs.existsSync(vp) || !fs.existsSync(sp)) continue;
+                const normVp = normNodePath(vp);
+                if (existingSet.has(normVp) || dismissedSet.has(normVp)) continue;
+                const r = await injectFlowCueTaskIntoRenderer(capturedMainWindow, {
+                    ...item,
+                    skip_if_exists: true,
+                    _silentToast: true,
+                });
+                if (r && r.ok && !r.skippedExisting) {
+                    addedCount += 1;
+                    existingSet.add(normVp);
+                }
+            }
+
+            const totalTasks = await capturedMainWindow.webContents.executeJavaScript(
+                `(() => {
+                    if (typeof _batchAutoSave === 'function') { try { _batchAutoSave({ skipSync: true }); } catch (_) {} }
+                    if (typeof window.__flowcueBackupStorageNow === 'function') { try { window.__flowcueBackupStorageNow(); } catch (_) {} }
+                    return window._reelsState?.tasks?.length || 0;
+                })()`,
+                true
+            );
+
+            return sendJson(res, 200, {
+                ok: true,
+                prunedCount: preSyncInfo?.prunedCount || 0,
+                addedCount,
+                totalTasks,
+            });
+        }
+
+        if (req.method === 'POST' && pathname === '/clear-all-tasks') {
+            const body = await readJsonBody(req);
+            const extraPaths = Array.isArray(body?.archive_paths) ? body.archive_paths : [];
+            if (!rendererReady || !capturedMainWindow || capturedMainWindow.isDestroyed()) {
+                return sendJson(res, 200, { ok: false, notReady: true });
+            }
+            const clearRes = await capturedMainWindow.webContents.executeJavaScript(
+                `(() => {
+                    const normPath = (p) => String(p || '').replace(/\\\\/g, '/').trim().toLowerCase();
+                    let dismissed = [];
+                    try {
+                        dismissed = JSON.parse(localStorage.getItem('flowcue_dismissed_archive_paths') || '[]');
+                        if (!Array.isArray(dismissed)) dismissed = [];
+                    } catch (_) { dismissed = []; }
+                    const dSet = new Set(dismissed.map(normPath).filter(Boolean));
+
+                    const curTasks = Array.isArray(window._reelsState?.tasks) ? window._reelsState.tasks : [];
+                    const removedCount = curTasks.length;
+                    for (const t of curTasks) {
+                        const vp = normPath(t?.videoPath || t?.bgPath || t?.autoEditProject?.outputPath || '');
+                        if (vp) dSet.add(vp);
+                    }
+                    const extra = ${JSON.stringify(extraPaths)};
+                    if (Array.isArray(extra)) {
+                        for (const p of extra) {
+                            const np = normPath(p);
+                            if (np) dSet.add(np);
+                        }
+                    }
+                    localStorage.setItem('flowcue_dismissed_archive_paths', JSON.stringify(Array.from(dSet)));
+
+                    if (window._reelsState) {
+                        window._reelsState.tasks = [];
+                        window._reelsState.selectedIdx = -1;
+                    }
+                    try {
+                        if (typeof _batchTableState === 'object' && Array.isArray(_batchTableState?.tabs)) {
+                            for (const tab of _batchTableState.tabs) {
+                                if (Array.isArray(tab?.tasks)) tab.tasks = [];
+                                if (tab?.selectedIndices && typeof tab.selectedIndices.clear === 'function') {
+                                    tab.selectedIndices.clear();
+                                }
+                            }
+                        }
+                    } catch (_) {}
+
+                    if (typeof _renderTaskList === 'function') { try { _renderTaskList(); } catch (_) {} }
+                    if (typeof _renderBatchTable === 'function') { try { _renderBatchTable(); } catch (_) {} }
+                    if (typeof reelsUpdatePreview === 'function') { try { reelsUpdatePreview(true); } catch (_) {} }
+                    if (typeof _batchAutoSave === 'function') { try { _batchAutoSave({ skipSync: true }); } catch (_) {} }
+                    if (typeof window.__flowcueBackupStorageNow === 'function') { try { window.__flowcueBackupStorageNow(); } catch (_) {} }
+                    if (typeof showToast === 'function') {
+                        showToast('🗑️ 已手动清空批量Reels中的所有任务', 'info', 3500);
+                    }
+                    return { ok: true, removedCount };
+                })()`,
+                true
+            );
+            return sendJson(res, 200, clearRes || { ok: true });
         }
 
         if (req.method === 'POST' && pathname === '/load-task') {

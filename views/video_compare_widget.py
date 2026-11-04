@@ -3105,7 +3105,7 @@ class BatchAllTasksSpliceDialog(QDialog):
         self._row_by_proj_id = {}
 
         self.setWindowTitle("📚 所有任务一键拼接成片 (+SRT) 并全部送入批量Reels")
-        self.resize(940, 620)
+        self.resize(1100, 650)
         self.init_ui()
         self.load_projects_table()
 
@@ -3207,11 +3207,27 @@ class BatchAllTasksSpliceDialog(QDialog):
         self.spin_parallel_splice.setToolTip("同时并行合并拼接的任务数量（范围 1 ~ 4；1 = 逐个拼接）")
         row2.addWidget(self.spin_parallel_splice)
 
-        lbl_hint = QLabel("💡 请勾选需要合并拼接的任务（支持任意多选或全选，多任务并行无缝拼接导出 MP4 + SRT）：")
+        lbl_hint = QLabel("💡 勾选需要拼接的任务（双击「✂️ 断行文本」列可单独输入，或点右侧按钮从表格一键批量粘贴）：")
         lbl_hint.setStyleSheet("font-size: 12px; color: #5D4037;")
         row2.addWidget(lbl_hint)
 
         row2.addStretch()
+
+        self.btn_paste_srt_lines = QPushButton("📋 从表格粘贴断行文本")
+        self.btn_paste_srt_lines.setStyleSheet("background-color: #7C3AED; color: white; padding: 4px 12px;")
+        self.btn_paste_srt_lines.setToolTip(
+            "在 Excel / 飞书 / Google 表格中复制一列【各任务的断行后文本】，点击此按钮即可按顺序批量粘贴到各任务！\n"
+            "• 仅在最终合并拼接生成 SRT 字幕时按您提供的断行文本断行（如每行2~3个单词）\n"
+            "• 完全不影响原本的分句任务分配与语音核对文案匹配"
+        )
+        self.btn_paste_srt_lines.clicked.connect(self._paste_srt_lines_from_clipboard)
+        row2.addWidget(self.btn_paste_srt_lines)
+
+        self.btn_clear_srt_lines = QPushButton("🗑️ 清空断行文本")
+        self.btn_clear_srt_lines.setStyleSheet("background-color: #B45309; color: white; padding: 4px 10px;")
+        self.btn_clear_srt_lines.setToolTip("清空当前已勾选任务的自定义断行文本（恢复按每个小任务分句生成 SRT）")
+        self.btn_clear_srt_lines.clicked.connect(self._clear_selected_srt_lines)
+        row2.addWidget(self.btn_clear_srt_lines)
 
         self.btn_sel_all = QPushButton("☑️ 全选")
         self.btn_sel_all.setStyleSheet("background-color: #64748B; color: white; padding: 4px 10px;")
@@ -3232,24 +3248,33 @@ class BatchAllTasksSpliceDialog(QDialog):
         layout.addWidget(cfg_frame)
 
         # Projects Table
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels([
-            "选择", "任务名称 (Project)", "总句段", "视频就绪 / 缺失", "已有合成片状态", "批量拼接实时进度"
+            "选择",
+            "任务名称 (Project)",
+            "总句段",
+            "视频就绪 / 缺失",
+            "已有合成片状态",
+            "✂️ 断行文本 (双击编辑/可粘贴)",
+            "批量拼接实时进度",
         ])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(0, 54)
+        self.table.setColumnWidth(0, 50)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(2, 74)
+        self.table.setColumnWidth(2, 68)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(3, 130)
+        self.table.setColumnWidth(3, 120)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(4, 165)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(4, 130)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(5, 220)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, stretch=1)
 
         # Progress & Bottom Buttons
@@ -3297,6 +3322,267 @@ class BatchAllTasksSpliceDialog(QDialog):
 
         layout.addLayout(btn_row)
 
+    @staticmethod
+    def _format_custom_srt_preview(custom_srt_text: str) -> tuple[str, str]:
+        """返回断行文本在表格中的简短摘要文本与悬停完整提示。"""
+        from services.video_splice_service import VideoSpliceService
+        lines = VideoSpliceService.parse_custom_srt_lines(custom_srt_text)
+        if not lines:
+            return ("⚪ 默认(按分句断行) · 双击编辑", "当前未设置自定义断行文本（将默认按每个小任务分句生成 SRT）。\n双击此单元格可单独输入，或点击上方「📋 从表格粘贴断行文本」批量粘贴。")
+        first_preview = lines[0][:24] + ("..." if len(lines[0]) > 24 else "")
+        summary = f"✂️ 已设 {len(lines)} 行: {first_preview}"
+        preview_lines = lines[:25]
+        tip = f"已设置自定义断行文本（共 {len(lines)} 行，双击可修改）：\n" + "\n".join(preview_lines)
+        if len(lines) > 25:
+            tip += f"\n...（还有 {len(lines) - 25} 行）"
+        return summary, tip
+
+    def _update_row_srt_cell(self, row_idx: int, custom_srt_text: str):
+        if row_idx < 0 or row_idx >= self.table.rowCount():
+            return
+        if row_idx < len(self._projects_data):
+            self._projects_data[row_idx]["custom_srt_text"] = custom_srt_text
+        summary, tip = self._format_custom_srt_preview(custom_srt_text)
+        it_srt = self.table.item(row_idx, 5)
+        if it_srt is None:
+            it_srt = QTableWidgetItem()
+            self.table.setItem(row_idx, 5, it_srt)
+        it_srt.setText(summary)
+        it_srt.setToolTip(tip)
+        if custom_srt_text and custom_srt_text.strip():
+            it_srt.setForeground(QColor("#6D28D9"))
+        else:
+            it_srt.setForeground(QColor("#64748B"))
+
+    def _save_project_custom_srt(self, row_idx: int, new_text: str):
+        if row_idx < 0 or row_idx >= len(self._projects_data):
+            return
+        p_data = self._projects_data[row_idx]
+        p_path = Path(p_data["path"])
+        cleaned = str(new_text or "").strip()
+        try:
+            from models.project_model import ProjectModel
+            model = ProjectModel(p_path)
+            model.custom_srt_text = cleaned
+            model.save()
+            # 若主界面当前正打开该项目，同步更新内存中的 custom_srt_text
+            if self.main_window and hasattr(self.main_window, "detail_widget"):
+                dw = self.main_window.detail_widget
+                if getattr(dw, "project_model", None) and Path(getattr(dw, "project_path", "")) == p_path:
+                    dw.project_model.custom_srt_text = cleaned
+        except Exception as e:
+            print(f"Error saving custom_srt_text for {p_path}: {e}")
+        self._update_row_srt_cell(row_idx, cleaned)
+
+    def _on_table_cell_double_clicked(self, row: int, col: int):
+        """双击任意行的「✂️ 断行文本」列（或双击行）打开该任务的断行文本编辑框。"""
+        if row < 0 or row >= len(self._projects_data):
+            return
+        if col != 5:
+            return
+        p_data = self._projects_data[row]
+        p_id = p_data["id"]
+        cur_text = str(p_data.get("custom_srt_text", "") or "")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"✂️ 编辑自定义断行文本 (SRT) — {p_id}")
+        dlg.resize(560, 480)
+        vbox = QVBoxLayout(dlg)
+        vbox.setContentsMargins(14, 14, 14, 14)
+        vbox.setSpacing(8)
+
+        lbl_top = QLabel(
+            f"任务：{p_id}\n"
+            "💡 请在下方输入或粘贴您自己断行好的文本（每行对应最终生成 SRT 的一句字幕，如每行 2~3 个单词）。\n"
+            "留空则恢复默认按每个小任务分句生成 SRT。"
+        )
+        lbl_top.setWordWrap(True)
+        lbl_top.setStyleSheet("font-size: 12px; color: #5D4037;")
+        vbox.addWidget(lbl_top)
+
+        from PyQt6.QtWidgets import QPlainTextEdit
+        from services.video_splice_service import VideoSpliceService
+        editor = QPlainTextEdit()
+        editor.setPlainText(cur_text)
+        editor.setPlaceholderText("在此输入或粘贴断行后的外语文本，每行一句字幕...\n例如：\nPastor dígame\nsi todos vamos\na morir algún día\npara qué estamos vivos")
+        editor.setStyleSheet(
+            "QPlainTextEdit { background: white; color: #1E293B; border: 1px solid #CBD5E1; "
+            "border-radius: 5px; padding: 8px; font-size: 13px; font-family: 'Segoe UI', Consolas, sans-serif; }"
+        )
+        vbox.addWidget(editor, 1)
+
+        lbl_cnt = QLabel("")
+        lbl_cnt.setStyleSheet("font-size: 12px; color: #6D28D9; font-weight: bold;")
+        vbox.addWidget(lbl_cnt)
+
+        def _upd_cnt():
+            lines = VideoSpliceService.parse_custom_srt_lines(editor.toPlainText())
+            lbl_cnt.setText(f"当前有效断行：{len(lines)} 行字幕" if lines else "当前为空（将使用默认小任务分句）")
+
+        editor.textChanged.connect(_upd_cnt)
+        _upd_cnt()
+
+        brow = QHBoxLayout()
+        btn_clr = QPushButton("🗑️ 清空")
+        btn_clr.setStyleSheet("background-color: #EF4444; color: white; padding: 6px 12px;")
+        btn_clr.clicked.connect(editor.clear)
+        brow.addWidget(btn_clr)
+        brow.addStretch()
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setStyleSheet("background-color: #94A3B8; color: white; padding: 6px 14px;")
+        btn_cancel.clicked.connect(dlg.reject)
+        brow.addWidget(btn_cancel)
+
+        btn_ok = QPushButton("💾 保存断行文本")
+        btn_ok.setStyleSheet("background-color: #10B981; color: white; padding: 6px 16px; font-weight: bold;")
+        btn_ok.clicked.connect(dlg.accept)
+        brow.addWidget(btn_ok)
+        vbox.addLayout(brow)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._save_project_custom_srt(row, editor.toPlainText())
+            self.lbl_overall_status.setText(f"✅ 已保存任务「{p_id}」的自定义断行文本！")
+
+    @staticmethod
+    def _parse_clipboard_srt_cells() -> list[str]:
+        """从剪贴板解析从 Excel / 飞书 / Google Sheets 复制的一列（或多行）断行文本单元格。
+        每个单元格内部可能包含多行（即一个任务的多行断行文本）。"""
+        import csv
+        import io
+        from bs4 import BeautifulSoup
+
+        clipboard = QGuiApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None:
+            return []
+
+        # 1. 优先尝试解析 HTML 表格（Excel / Google Sheets / 飞书 / WPS 复制单元格时最准确，保留单元格内换行）
+        if mime.hasHtml():
+            try:
+                soup = BeautifulSoup(mime.html(), "html.parser")
+                tr_list = soup.find_all("tr")
+                if tr_list:
+                    cells = []
+                    for tr in tr_list:
+                        tds = tr.find_all(["td", "th"])
+                        if not tds:
+                            continue
+                        # 取该行最后一个非空单元格或第一个单元格
+                        cell_texts = [td.get_text(separator="\n").strip() for td in tds]
+                        non_empty = [t for t in cell_texts if t]
+                        cells.append(non_empty[-1] if non_empty else "")
+                    if any(c for c in cells):
+                        return cells
+            except Exception:
+                pass
+
+        # 2. 解析纯文本 TSV（Excel 复制含换行的多行单元格时会用双引号包裹单元格）
+        if mime.hasText():
+            raw_text = mime.text()
+            if not raw_text or not raw_text.strip():
+                return []
+            stripped = raw_text.strip("\r\n")
+            if '"' in stripped or "\t" in stripped:
+                try:
+                    reader = csv.reader(io.StringIO(stripped), delimiter="\t")
+                    cells = []
+                    for row in reader:
+                        if not row:
+                            cells.append("")
+                            continue
+                        non_empty = [c.strip() for c in row if c and c.strip()]
+                        cells.append(non_empty[-1] if non_empty else "")
+                    if len(cells) > 1 or (len(cells) == 1 and cells[0]):
+                        return cells
+                except Exception:
+                    pass
+            return [stripped]
+        return []
+
+    def _paste_srt_lines_from_clipboard(self):
+        """一键将表格中复制的一列断行文本按顺序批量粘贴到各任务。"""
+        row_count = self.table.rowCount()
+        if row_count == 0:
+            QMessageBox.information(self, "提示", "当前列表中没有任务。")
+            return
+
+        cells = self._parse_clipboard_srt_cells()
+        if not cells or not any(c.strip() for c in cells):
+            QMessageBox.warning(
+                self,
+                "剪贴板为空",
+                "未能从剪贴板读取到断行文本！\n\n"
+                "📌 使用方法：\n"
+                "1. 在 Excel / 飞书 / Google 表格中，选中并复制【断行文本】这一列（每个单元格放对应任务断好行的多行文本）；\n"
+                "2. 回到本窗口点击「📋 从表格粘贴断行文本」即可一键批量填入所有任务！\n"
+                "（也可直接双击表格中的「✂️ 断行文本」列为单个任务粘贴/编辑）",
+            )
+            return
+
+        checked_rows = [
+            r for r in range(row_count)
+            if self.table.item(r, 0) and self.table.item(r, 0).checkState() == Qt.CheckState.Checked
+        ]
+        sel_rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+
+        # 智能匹配目标行：
+        # 1) 若复制的单元格数量恰好等于当前勾选的任务数 -> 按勾选顺序一一对应
+        # 2) 若只复制了 1 个单元格且用户在表格中选中了某一行 -> 粘贴到该选中行
+        # 3) 若用户在表格中选中了起始行且剩余行数足够 -> 从选中行开始依次往下粘贴
+        # 4) 否则 -> 从第 1 行 (row 0) 开始依次往下粘贴
+        if len(cells) == len(checked_rows) and len(checked_rows) > 0:
+            target_rows = checked_rows
+        elif len(cells) == 1 and len(sel_rows) == 1:
+            target_rows = [sel_rows[0]]
+        elif len(sel_rows) >= 1 and sel_rows[0] > 0 and (sel_rows[0] + len(cells) <= row_count):
+            target_rows = list(range(sel_rows[0], sel_rows[0] + len(cells)))
+        else:
+            target_rows = list(range(min(row_count, len(cells))))
+
+        updated_count = 0
+        for cell_idx, r in enumerate(target_rows):
+            if cell_idx >= len(cells):
+                break
+            val = cells[cell_idx].strip()
+            if val:
+                self._save_project_custom_srt(r, val)
+                updated_count += 1
+
+        self.lbl_overall_status.setText(f"✅ 已从剪贴板批量粘贴并保存 {updated_count} 个任务的自定义断行文本！")
+        QMessageBox.information(
+            self,
+            "批量粘贴断行文本成功",
+            f"🎉 已成功将剪贴板中的断行文本批量填入并保存到 {updated_count} 个任务！\n\n"
+            "点击右下角【🎬 开始拼接并送入批量Reels】时，将自动按您提供的断行句子生成 SRT 字幕。",
+        )
+
+    def _clear_selected_srt_lines(self):
+        checked_rows = [
+            r for r in range(self.table.rowCount())
+            if self.table.item(r, 0) and self.table.item(r, 0).checkState() == Qt.CheckState.Checked
+        ]
+        target_rows = checked_rows if checked_rows else list(range(self.table.rowCount()))
+        has_any = any(
+            bool(str(self._projects_data[r].get("custom_srt_text", "") or "").strip())
+            for r in target_rows if r < len(self._projects_data)
+        )
+        if not has_any:
+            QMessageBox.information(self, "提示", "当前勾选的任务均未设置自定义断行文本。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认清空断行文本",
+            f"确定要清空所选 {len(target_rows)} 个任务的自定义断行文本吗？\n（清空后将恢复按每个小任务分句生成 SRT）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for r in target_rows:
+            self._save_project_custom_srt(r, "")
+        self.lbl_overall_status.setText(f"🗑️ 已清空 {len(target_rows)} 个任务的自定义断行文本。")
+
     def load_projects_table(self):
         from models.project_model import ProjectModel
         from services.video_checker import VideoChecker
@@ -3311,8 +3597,10 @@ class BatchAllTasksSpliceDialog(QDialog):
         for row_idx, p_info in enumerate(projects):
             p_id = str(p_info.get("id", ""))
             p_path = Path(p_info["path"])
+            custom_srt_text = ""
             try:
                 model = ProjectModel(p_path)
+                custom_srt_text = str(getattr(model, "custom_srt_text", "") or "").strip()
                 report = VideoChecker.check_project_videos(model, p_path, base_storage_path=base_dir)
                 segs = model.spanish_segments or []
                 total_segs = len(segs)
@@ -3334,6 +3622,7 @@ class BatchAllTasksSpliceDialog(QDialog):
                 "found_cnt": found_cnt,
                 "missing_cnt": missing_cnt,
                 "has_merged": has_merged,
+                "custom_srt_text": custom_srt_text,
             })
             self._row_by_proj_id[p_id] = row_idx
 
@@ -3359,8 +3648,10 @@ class BatchAllTasksSpliceDialog(QDialog):
             it_m.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row_idx, 4, it_m)
 
+            self._update_row_srt_cell(row_idx, custom_srt_text)
+
             prog_txt = "⏳ 等待拼接" if found_cnt > 0 else "⚠️ 无可用视频片段"
-            self.table.setItem(row_idx, 5, QTableWidgetItem(prog_txt))
+            self.table.setItem(row_idx, 6, QTableWidgetItem(prog_txt))
 
     def _select_all_rows(self):
         for r in range(self.table.rowCount()):
@@ -3431,7 +3722,7 @@ class BatchAllTasksSpliceDialog(QDialog):
     def _on_task_started(self, proj_id: str):
         r = self._row_by_proj_id.get(proj_id)
         if r is not None:
-            it = self.table.item(r, 5)
+            it = self.table.item(r, 6)
             if it:
                 it.setText("🔄 正在裁切并合并片段...")
                 it.setForeground(QColor("#0284C7"))
@@ -3439,7 +3730,7 @@ class BatchAllTasksSpliceDialog(QDialog):
     def _on_task_progress(self, proj_id: str, pct: int, msg: str):
         r = self._row_by_proj_id.get(proj_id)
         if r is not None:
-            it = self.table.item(r, 5)
+            it = self.table.item(r, 6)
             if it:
                 it.setText(f"[{pct}%] {msg}")
                 it.setForeground(QColor("#0284C7"))
@@ -3449,7 +3740,7 @@ class BatchAllTasksSpliceDialog(QDialog):
         if r is None:
             return
         it_m = self.table.item(r, 4)
-        it_prog = self.table.item(r, 5)
+        it_prog = self.table.item(r, 6)
         if success:
             if it_m:
                 it_m.setText("🟢 已有合成片")

@@ -259,6 +259,15 @@ class BatchReelsTabWidget(QWidget):
         self.btn_import_all_merged.clicked.connect(self._on_import_all_merged_projects)
         top_layout.addWidget(self.btn_import_all_merged)
 
+        self.btn_clear_all_tasks = QPushButton("🗑️ 清空所有任务")
+        self.btn_clear_all_tasks.setToolTip("一键清空当前批量Reels中的所有任务（不会删除本地成片文件；重新执行批量拼接或点击导入可随时再次载入）")
+        self.btn_clear_all_tasks.setStyleSheet(
+            "QPushButton { background-color: #EF4444; color: white; font-weight: bold; font-size: 12px; padding: 5px 10px; border-radius: 5px; border: none; }"
+            "QPushButton:hover { background-color: #DC2626; }"
+        )
+        self.btn_clear_all_tasks.clicked.connect(self._on_clear_all_reels_tasks)
+        top_layout.addWidget(self.btn_clear_all_tasks)
+
         # 导出自动调速开关（不超过3分钟 / ≤2分58秒，SRT同步）
         self.chk_limit_3min = QCheckBox("⏱️ 自动调速/不超过3分钟 (≤2分58秒，SRT字幕同步)")
         self.chk_limit_3min.setChecked(True)
@@ -407,6 +416,7 @@ class BatchReelsTabWidget(QWidget):
         if not self._is_process_alive():
             self.ensure_engine_started()
         elif self._engine_ready:
+            self._sync_archived_projects_to_reels()
             if self.is_docked and self._ready_hwnd and self._ready_hwnd != self.embedded_hwnd:
                 self._embed_hwnd(self._ready_hwnd)
             else:
@@ -579,6 +589,7 @@ class BatchReelsTabWidget(QWidget):
                     "background: #D1FAE5; border-radius: 4px; border: none;"
                 )
                 self._sync_flowcue_api_keys()
+                self._sync_archived_projects_to_reels()
                 self._flush_pending_tasks()
         elif action == "load_task":
             if ok:
@@ -594,6 +605,19 @@ class BatchReelsTabWidget(QWidget):
                 self.status_badge.setText(f"🟢 已批量载入 {cnt} 个成片任务 (当前队列共 {total} 个任务)")
             else:
                 QMessageBox.warning(self, "批量导入提示", f"批量导入任务到批量Reels时发生错误:\n{err}")
+        elif action == "sync_archived_tasks":
+            if ok:
+                total = data.get("totalTasks", 0)
+                added = data.get("added", 0)
+                pruned = data.get("pruned", 0)
+                if added > 0 or pruned > 0:
+                    self.status_badge.setText(f"🟢 批量Reels 已同步本地成片任务 (当前共 {total} 个任务)")
+        elif action == "clear_all_tasks":
+            if ok:
+                cleared = data.get("cleared", 0)
+                self.status_badge.setText(f"🗑️ 已清空批量Reels中的所有任务 (共清除 {cleared} 个任务)")
+            else:
+                QMessageBox.warning(self, "清空任务提示", f"清空批量Reels任务时发生错误:\n{err}")
 
     def _embed_hwnd(self, hwnd: int):
         if not hwnd:
@@ -776,6 +800,37 @@ class BatchReelsTabWidget(QWidget):
             QMessageBox.information(self, "提示", "暂无已合成的成片项目。")
             return
         self.load_flowcue_merged_tasks_batch(self._found_found_items)
+
+    def _on_clear_all_reels_tasks(self):
+        if not self._is_process_alive() or not self._engine_ready:
+            QMessageBox.information(self, "提示", "批量Reels 引擎尚未就绪。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "🗑️ 确认清空所有任务",
+            "确定要清空当前「批量Reels」中的所有任务吗？\n\n"
+            "• 仅清空批量Reels当前工作队列，不会删除您电脑上的成片视频与SRT文件；\n"
+            "• 清空后重启软件不会再自动恢复这批旧任务，直到您再次点击「批量拼接」或「导入全部已合成片」。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.refresh_merged_projects_list()
+        archive_paths = [
+            item.get("video_path", "")
+            for item in (self._found_found_items or [])
+            if isinstance(item, dict) and item.get("video_path")
+        ]
+        self._send_ctrl_command("clear_all_tasks", "POST", "/clear-all-tasks", {"archive_paths": archive_paths})
+
+    def _sync_archived_projects_to_reels(self):
+        """将当前存储路径下存在的项目成片存档与批量Reels队列同步（自动保留/恢复未删除存档，清理已删项目的残留任务）。"""
+        if not self._is_process_alive() or not self._engine_ready:
+            return
+        self.refresh_merged_projects_list()
+        tasks_list = list(self._found_found_items or [])
+        self._send_ctrl_command("sync_archived_tasks", "POST", "/sync-archived-tasks", {"tasks": tasks_list})
 
     def load_flowcue_merged_task(self, payload: dict):
         """确保引擎启动并将单条成片 + SRT + 逐词时间轴直接推入批量Reels。"""

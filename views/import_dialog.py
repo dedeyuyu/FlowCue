@@ -17,6 +17,7 @@ class ImportDialog(QDialog):
         "chinese": "中文",
         "original": "原文",
         "link": "链接",
+        "srt_lines": "断行文本",
         "empty": "空列",
     }
 
@@ -113,22 +114,27 @@ class ImportDialog(QDialog):
         zh_cols = [i + 1 for i, t in enumerate(self.import_columns) if t == "chinese"]
         orig_cols = [i + 1 for i, t in enumerate(self.import_columns) if t == "original"]
         link_cols = [i + 1 for i, t in enumerate(self.import_columns) if t == "link"]
+        srt_cols = [i + 1 for i, t in enumerate(self.import_columns) if t == "srt_lines"]
 
         h_name1 = f"{name_cols[0]}: 名称前缀" if len(name_cols) > 1 else f"{name_cols[0] if name_cols else 1}: 名字"
         h_zh = f"{','.join(map(str, zh_cols))}: 中文文案"
         h_orig = f"{','.join(map(str, orig_cols))}: 原文文案"
         h_link = f"{','.join(map(str, link_cols))}: 链接"
         h_name2 = f"{','.join(map(str, name_cols[1:]))}: 名字补充/后缀" if len(name_cols) > 1 else "名字补充 (无)"
+        h_srt = f"{','.join(map(str, srt_cols))}: ✂️ 断行文本 (SRT)" if srt_cols else "断行文本 (无)"
 
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels([
-            "序号", h_name1, h_zh, h_orig, h_link, h_name2
+            "序号", h_name1, h_zh, h_orig, h_link, h_name2, h_srt
         ])
         self.table.setColumnHidden(5, len(name_cols) <= 1)
+        self.table.setColumnHidden(6, not bool(srt_cols))
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        if srt_cols:
+            self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
         
         # Action Buttons
@@ -274,6 +280,7 @@ class ImportDialog(QDialog):
         zh_indices = [i for i, t in enumerate(self.import_columns) if t == "chinese"]
         orig_indices = [i for i, t in enumerate(self.import_columns) if t == "original"]
         link_indices = [i for i, t in enumerate(self.import_columns) if t == "link"]
+        srt_indices = [i for i, t in enumerate(self.import_columns) if t == "srt_lines"]
                 
         for row_idx, row in enumerate(self.imported_rows):
             proj_idx = next_idx + row_idx
@@ -314,6 +321,10 @@ class ImportDialog(QDialog):
             # Additional name / notes suffix
             self.table.setItem(row_idx, 5, QTableWidgetItem(col7_val))
 
+            # Optional custom line-broken SRT text
+            srt_text = "\n".join(row[i]["text"] for i in srt_indices if i < len(row) and row[i]["text"]).strip()
+            self.table.setItem(row_idx, 6, QTableWidgetItem(srt_text))
+
     def confirm_import(self):
         """Creates project directories and stores metadata.json."""
         if not self.storage_manager.get_base_path():
@@ -334,6 +345,8 @@ class ImportDialog(QDialog):
                 col5 = self.table.item(row_idx, 3).text()
                 col6 = self.table.item(row_idx, 4).text()
                 col7 = self.table.item(row_idx, 5).text()
+                srt_item = self.table.item(row_idx, 6)
+                col_srt = srt_item.text().strip() if srt_item else ""
                 
                 # 1. Create project folder
                 proj_dir, proj_id = self.storage_manager.create_project_dir(idx_val, col1, col7)
@@ -346,6 +359,7 @@ class ImportDialog(QDialog):
                 proj.google_drive_url = col6
                 proj.chinese_text = col4
                 proj.spanish_text = col5
+                proj.custom_srt_text = col_srt
                 # Auto clean and segment Spanish text on import using config_manager rules if available
                 config_mgr = self.config_manager or getattr(self.parent(), "config_manager", None)
                 if config_mgr:

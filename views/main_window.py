@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
         self.btn_rules_config.clicked.connect(self.open_settings_dialog)
         top_row1.addWidget(self.btn_rules_config)
 
-        top_row1.addSpacing(8)
+        top_row1.addStretch(1)
 
         self.btn_check_update = QPushButton("⬆️ 检查更新")
         self.btn_check_update.setStyleSheet("""
@@ -367,11 +367,9 @@ class MainWindow(QMainWindow):
         top_row1.addWidget(self.btn_theme_toggle)
         self._update_theme_toggle_btn()
 
-        top_row1.addStretch(1)
-
         top_container_layout.addLayout(top_row1)
 
-        # ── 第二行：归位 + 核对文案 + 批量拼接 + 批量选择预设 + 快速审核 (统一绿色，字号稍小) + 打开文件夹 (保留原色) ──
+        # ── 第二行：左侧 [核对文案 + 批量拼接 + 快速审核 (绿色)] | 右侧 [归位(粉) + 批量选择预设(粉) + 打开文件夹(原色)] ──
         top_row2 = QHBoxLayout()
         top_row2.setSpacing(8)
 
@@ -392,13 +390,23 @@ class MainWindow(QMainWindow):
                 background-color: #047857;
             }
         """
-
-        self.btn_batch_check_video = QPushButton("🔍 归位")
-        self.btn_batch_check_video.setObjectName("btn_batch_check_video")
-        self.btn_batch_check_video.setStyleSheet(row2_green_qss)
-        self.btn_batch_check_video.setToolTip("全项目视频完整性核查与一键批量归位")
-        self.btn_batch_check_video.clicked.connect(self.open_batch_video_check_dialog)
-        top_row2.addWidget(self.btn_batch_check_video)
+        row2_pink_qss = """
+            QPushButton {
+                background-color: #EC4899;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 5px 13px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #DB2777;
+            }
+            QPushButton:pressed {
+                background-color: #BE185D;
+            }
+        """
 
         self.btn_batch_verify_all = QPushButton("📚 核对文案")
         self.btn_batch_verify_all.setObjectName("btn_batch_verify_all")
@@ -414,9 +422,25 @@ class MainWindow(QMainWindow):
         self.btn_batch_splice_all.clicked.connect(self.open_batch_splice_all_dialog)
         top_row2.addWidget(self.btn_batch_splice_all)
 
+        self.btn_top_quick_review = QPushButton("👁️ 快速审核")
+        self.btn_top_quick_review.setObjectName("btn_top_quick_review")
+        self.btn_top_quick_review.setStyleSheet(row2_green_qss)
+        self.btn_top_quick_review.setToolTip("跳转到「👁️ 素材快速审核」标签页并直接加载当前项目的全部视频与图片素材")
+        self.btn_top_quick_review.clicked.connect(self.open_current_project_quick_review)
+        top_row2.addWidget(self.btn_top_quick_review)
+
+        top_row2.addStretch(1)
+
+        self.btn_batch_check_video = QPushButton("🔍 归位")
+        self.btn_batch_check_video.setObjectName("btn_batch_check_video")
+        self.btn_batch_check_video.setStyleSheet(row2_pink_qss)
+        self.btn_batch_check_video.setToolTip("全项目视频完整性核查与一键批量归位")
+        self.btn_batch_check_video.clicked.connect(self.open_batch_video_check_dialog)
+        top_row2.addWidget(self.btn_batch_check_video)
+
         self.btn_top_multi_select = QPushButton("🖼️ 批量选择预设")
         self.btn_top_multi_select.setObjectName("btn_top_multi_select")
-        self.btn_top_multi_select.setStyleSheet(row2_green_qss)
+        self.btn_top_multi_select.setStyleSheet(row2_pink_qss)
         self.btn_top_multi_select.setToolTip(
             "打开多选与图片预设可视化管理大窗：\n"
             "• 一目了然展示所有断句图片（支持 Ctrl+鼠标滚轮无级缩放）\n"
@@ -426,13 +450,6 @@ class MainWindow(QMainWindow):
         )
         self.btn_top_multi_select.clicked.connect(self.open_current_project_bulk_edit)
         top_row2.addWidget(self.btn_top_multi_select)
-
-        self.btn_top_quick_review = QPushButton("👁️ 快速审核")
-        self.btn_top_quick_review.setObjectName("btn_top_quick_review")
-        self.btn_top_quick_review.setStyleSheet(row2_green_qss)
-        self.btn_top_quick_review.setToolTip("跳转到「👁️ 素材快速审核」标签页并直接加载当前项目的全部视频与图片素材")
-        self.btn_top_quick_review.clicked.connect(self.open_current_project_quick_review)
-        top_row2.addWidget(self.btn_top_quick_review)
 
         self.btn_top_open_folder = QPushButton("📂 打开文件夹")
         self.btn_top_open_folder.setObjectName("btn_top_open_folder")
@@ -453,8 +470,6 @@ class MainWindow(QMainWindow):
         self.btn_top_open_folder.setToolTip("在系统资源管理器中打开当前项目的文件夹")
         self.btn_top_open_folder.clicked.connect(self.open_current_project_folder)
         top_row2.addWidget(self.btn_top_open_folder)
-
-        top_row2.addStretch()
 
         top_container_layout.addLayout(top_row2)
         main_layout.addLayout(top_container_layout)
@@ -1021,8 +1036,13 @@ class MainWindow(QMainWindow):
                 if self.detail_widget.project_model and self.detail_widget.project_model.project_id == project_id:
                     self.detail_widget.reset_to_no_selection()
                     
-                # 4. Reload the sidebar
+                # 4. Reload the sidebar & sync Batch Reels archived tasks
                 self.reload_projects_list()
+                if hasattr(self, "batch_reels_tab") and self.batch_reels_tab:
+                    try:
+                        self.batch_reels_tab._sync_archived_projects_to_reels()
+                    except Exception:
+                        pass
                 QMessageBox.information(self, "成功", f"项目【{project_id}】已成功删除！")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"删除项目文件夹失败: {str(e)}")

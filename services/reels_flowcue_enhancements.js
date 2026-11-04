@@ -1477,6 +1477,68 @@
         });
     }
 
+    function syncSavedAlignLanguageUI() {
+        try {
+            const savedLang = (localStorage.getItem('reels_align_language') || '').trim();
+            const rbtLangInput = document.getElementById('rbt-align-lang');
+            const rbtLangBtn = document.getElementById('rbt-lang-picker-btn');
+            const rbtLangList = document.getElementById('rbt-lang-list');
+            const mainLangSelect = document.getElementById('reels-align-lang');
+
+            if (savedLang) {
+                if (rbtLangInput && rbtLangInput.value !== savedLang) {
+                    rbtLangInput.value = savedLang;
+                }
+                if (rbtLangBtn) {
+                    // 若下拉列表中有对应项则提取其显示文本，否则直接显示 savedLang + ' ▾'
+                    let displayLabel = `${savedLang} ▾`;
+                    if (rbtLangList) {
+                        const matchedItem = rbtLangList.querySelector(`[data-lang="${CSS.escape(savedLang)}"]`);
+                        if (matchedItem) {
+                            const txt = (matchedItem.textContent || '').trim();
+                            if (txt) displayLabel = `${txt} ▾`;
+                        }
+                    }
+                    if (rbtLangBtn.textContent !== displayLabel) {
+                        rbtLangBtn.textContent = displayLabel;
+                    }
+                }
+                if (mainLangSelect && mainLangSelect.value !== savedLang) {
+                    const hasOpt = Array.from(mainLangSelect.options || []).some(o => o.value === savedLang);
+                    if (hasOpt) {
+                        mainLangSelect.value = savedLang;
+                    }
+                }
+            }
+
+            if (rbtLangList && rbtLangList.dataset.flowcueLangPersistBound !== '1') {
+                rbtLangList.dataset.flowcueLangPersistBound = '1';
+                rbtLangList.addEventListener('click', () => {
+                    setTimeout(() => {
+                        const cur = (document.getElementById('rbt-align-lang')?.value || '').trim();
+                        if (cur) {
+                            localStorage.setItem('reels_align_language', cur);
+                            schedulePresetBackupToDisk(60);
+                        }
+                    }, 20);
+                });
+            }
+
+            if (mainLangSelect && mainLangSelect.dataset.flowcueLangPersistBound !== '1') {
+                mainLangSelect.dataset.flowcueLangPersistBound = '1';
+                mainLangSelect.addEventListener('change', () => {
+                    const cur = (mainLangSelect.value || '').trim();
+                    if (cur) {
+                        localStorage.setItem('reels_align_language', cur);
+                        schedulePresetBackupToDisk(60);
+                    }
+                });
+            }
+        } catch (e) {
+            console.warn('[FlowCue] syncSavedAlignLanguageUI error:', e);
+        }
+    }
+
     function hookBatchTableRender() {
         if (typeof window._renderBatchTable === 'function' && !window._renderBatchTable._flowcueWrapped) {
             const origRender = window._renderBatchTable;
@@ -1485,6 +1547,7 @@
                 try {
                     enhanceBatchTablePresetColumns();
                     ensureAllRangeSlidersHaveNumberInput(getBatchTableContainerEl() || document);
+                    syncSavedAlignLanguageUI();
                 } catch (e) {
                     console.warn('[FlowCue] enhanceBatchTablePresetColumns error:', e);
                 }
@@ -1499,7 +1562,7 @@
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // 5. 字幕预设与覆层预设实时双保险自动备份（防止更新或端口变化丢失）
+    // 5. 字幕预设、覆层预设、对齐语言与批量任务队列实时双保险自动备份（防止重启或更新丢失）
     // ═══════════════════════════════════════════════════════════════════════
     const PRESET_STORAGE_KEYS = [
         'reels_style_presets',
@@ -1509,17 +1572,25 @@
         'reels_export_presets',
         'reels_batch_custom_presets',
         'reels_custom_fonts',
+        'reels_align_language',
+        'rbt_align_source',
+        'rbt_align_txt_col',
+        'rbt_align_auto_detect',
+        'reels_naming_mode',
+        'reels_batch_config_autosave',
+        'reels_autosave',
+        'flowcue_dismissed_archive_paths',
     ];
 
     let _backupTimer = null;
-    function schedulePresetBackupToDisk() {
+    function schedulePresetBackupToDisk(delayMs = 350) {
         if (_backupTimer) clearTimeout(_backupTimer);
         _backupTimer = setTimeout(() => {
             try {
                 const snapshot = {};
                 PRESET_STORAGE_KEYS.forEach((k) => {
                     const v = localStorage.getItem(k);
-                    if (typeof v === 'string' && v.length > 2) {
+                    if (typeof v === 'string' && v.length > 0) {
                         snapshot[k] = v;
                     }
                 });
@@ -1535,8 +1606,25 @@
                     }).catch(() => {});
                 }
             } catch (_) {}
-        }, 400);
+        }, delayMs);
     }
+
+    window.__flowcueBackupStorageNow = () => schedulePresetBackupToDisk(30);
+    window.addEventListener('beforeunload', () => {
+        try {
+            const snapshot = {};
+            PRESET_STORAGE_KEYS.forEach((k) => {
+                const v = localStorage.getItem(k);
+                if (typeof v === 'string' && v.length > 0) {
+                    snapshot[k] = v;
+                }
+            });
+            if (Object.keys(snapshot).length > 0 && CTRL_PORT > 0 && navigator.sendBeacon) {
+                const blob = new Blob([JSON.stringify({ entries: snapshot })], { type: 'application/json' });
+                navigator.sendBeacon(`http://127.0.0.1:${CTRL_PORT}/backup-presets`, blob);
+            }
+        } catch (_) {}
+    });
 
     const origSetItem = Storage.prototype.setItem;
     Storage.prototype.setItem = function (key, value) {
@@ -2188,6 +2276,7 @@
             installUnder3MinSpeedScalingOverride();
             hookBatchTableRender();
             enhanceBatchTablePresetColumns();
+            syncSavedAlignLanguageUI();
             ensureExportTitlesAndPresetsButtons();
             installVisualReviewHooks();
             schedulePresetBackupToDisk();
