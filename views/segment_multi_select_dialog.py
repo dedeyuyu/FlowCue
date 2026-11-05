@@ -19,7 +19,9 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QScrollArea, QFrame, QSlider, QFileDialog, QMessageBox,
-    QToolTip, QSizePolicy, QCheckBox
+    QToolTip, QSizePolicy, QCheckBox, QTabWidget, QListWidget, QListWidgetItem,
+    QLineEdit, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView, QInputDialog
 )
 from PyQt6.QtCore import Qt, QRect, QPoint, QSize, pyqtSignal, QTimer
 from PyQt6.QtGui import (
@@ -28,7 +30,9 @@ from PyQt6.QtGui import (
 )
 
 from models.project_model import ProjectModel
+from models.template_manager import PRESET_COLOR_PALETTE, get_preset_color_info
 from services.text_processor import TextProcessor
+import uuid
 
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
@@ -414,14 +418,29 @@ class SegmentCardGridViewport(QWidget):
             is_sel = idx in self.selected_indices
             is_hov = idx == self.hover_index
 
+            # Check if segment has individual preset override (follows unified -> card_color_info is None)
+            card_color_info, tpl_color_info, mot_color_info = self.dialog.get_segment_card_color_info(seg)
+
             # 1. Card background & border
-            if is_dark:
-                bg_color = QColor("#1E293B") if is_sel else (QColor("#2E2A1E") if is_hov else QColor("#242429"))
-                border_color = QColor("#3B82F6") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#3F3F46"))
+            if card_color_info is not None:
+                # 单独选择了预设的任务卡片：显示该预设指定的浅色（未指定时默认浅粉红色 #FCE7F3）
+                bg_color = QColor(card_color_info["dark_bg"] if is_dark else card_color_info["bg"])
+                if is_sel:
+                    border_color = QColor("#3B82F6" if is_dark else "#2563EB")
+                elif is_hov:
+                    border_color = QColor("#F59E0B")
+                else:
+                    border_color = QColor(card_color_info["dark_border"] if is_dark else card_color_info["border"])
+                border_width = 3 if is_sel else (2 if is_hov else 2)
             else:
-                bg_color = QColor("#EFF6FF") if is_sel else (QColor("#FFFBEB") if is_hov else QColor("#FFFFFF"))
-                border_color = QColor("#2563EB") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#CBD5E1"))
-            border_width = 3 if is_sel else (2 if is_hov else 1)
+                # 遵循统一模板与统一运镜：不增加额外颜色
+                if is_dark:
+                    bg_color = QColor("#1E293B") if is_sel else (QColor("#2E2A1E") if is_hov else QColor("#242429"))
+                    border_color = QColor("#3B82F6") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#3F3F46"))
+                else:
+                    bg_color = QColor("#EFF6FF") if is_sel else (QColor("#FFFBEB") if is_hov else QColor("#FFFFFF"))
+                    border_color = QColor("#2563EB") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#CBD5E1"))
+                border_width = 3 if is_sel else (2 if is_hov else 1)
 
             painter.setPen(QPen(border_color, border_width))
             painter.setBrush(QBrush(bg_color))
@@ -488,20 +507,28 @@ class SegmentCardGridViewport(QWidget):
 
             # 6. Preset badges row (Template / Motion / Mode)
             tags_y = img_rect.bottom() + 5
-            has_custom_tpl = bool(seg.get("template_id"))
-            has_custom_mot = bool(seg.get("motion_id"))
+            has_custom_tpl = tpl_color_info is not None
+            has_custom_mot = mot_color_info is not None
             has_custom_mode = bool(seg.get("mode_overridden"))
 
             if is_dark:
+                tpl_t_bg = tpl_color_info["dark_border"] if tpl_color_info else "#27272A"
+                tpl_t_fg = "#FFFFFF" if tpl_color_info else "#D4D4D8"
+                mot_t_bg = mot_color_info["dark_border"] if mot_color_info else "#27272A"
+                mot_t_fg = "#FFFFFF" if mot_color_info else "#D4D4D8"
                 tags = [
-                    (f"📐{tpl_name}", "#172554" if has_custom_tpl else "#27272A", "#93C5FD" if has_custom_tpl else "#D4D4D8"),
-                    (f"🎥{mot_name}", "#3B2F14" if has_custom_mot else "#27272A", "#FDE68A" if has_custom_mot else "#D4D4D8"),
+                    (f"📐{tpl_name}", tpl_t_bg, tpl_t_fg),
+                    (f"🎥{mot_name}", mot_t_bg, mot_t_fg),
                     (f"{mode_name}", "#143326" if has_custom_mode else "#27272A", "#6EE7B7" if has_custom_mode else "#D4D4D8"),
                 ]
             else:
+                tpl_t_bg = tpl_color_info["tag_bg"] if tpl_color_info else "#F1F5F9"
+                tpl_t_fg = tpl_color_info["tag_fg"] if tpl_color_info else "#475569"
+                mot_t_bg = mot_color_info["tag_bg"] if mot_color_info else "#F1F5F9"
+                mot_t_fg = mot_color_info["tag_fg"] if mot_color_info else "#475569"
                 tags = [
-                    (f"📐{tpl_name}", "#DBEAFE" if has_custom_tpl else "#F1F5F9", "#1D4ED8" if has_custom_tpl else "#475569"),
-                    (f"🎥{mot_name}", "#FEF3C7" if has_custom_mot else "#F1F5F9", "#B45309" if has_custom_mot else "#475569"),
+                    (f"📐{tpl_name}", tpl_t_bg, tpl_t_fg),
+                    (f"🎥{mot_name}", mot_t_bg, mot_t_fg),
                     (f"{mode_name}", "#DCFCE7" if has_custom_mode else "#F1F5F9", "#15803D" if has_custom_mode else "#475569"),
                 ]
 
@@ -547,6 +574,665 @@ class SegmentCardGridViewport(QWidget):
             painter.setPen(QPen(QColor("#2563EB"), 2, Qt.PenStyle.SolidLine))
             painter.setBrush(QBrush(QColor(37, 99, 235, 45)))
             painter.drawRect(box)
+
+
+class PresetGroupAndColorDialog(QDialog):
+    """
+    📦 预设组合与专属浅色管理弹窗：
+    - Tab 1: 📦 运镜预设组合（创建/删除运镜组合，勾选哪些运镜放入组合，支持上下调整顺序，同一运镜可出现在多个组合中）
+    - Tab 2: 📦 模板预设组合（创建/删除模板组合，勾选哪些模板放入组合，支持上下调整顺序，同一模板可出现在多个组合中）
+    - Tab 3: 🎨 预设专属浅色设置（为任意运镜或提示词模板指定浅色卡片颜色；未指定颜色时默认使用浅粉红色 #FCE7F3）
+    """
+
+    def __init__(self, template_manager, on_changed_callback=None, initial_tab: int = 0, parent=None):
+        super().__init__(parent)
+        self.tm = template_manager
+        self.on_changed_callback = on_changed_callback
+        self.setWindowTitle("📦 预设组合与卡片专属浅色设置 (模板组合 · 运镜组合 · 预设颜色)")
+        self.resize(960, 620)
+        self.setStyleSheet("""
+            QDialog { background-color: #FAF6F0; color: #334155; font-family: "Microsoft YaHei", sans-serif; }
+            QLabel { font-size: 13px; color: #334155; font-weight: bold; }
+            QLineEdit, QComboBox, QListWidget, QTableWidget {
+                background-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 5px;
+                padding: 5px 8px;
+                color: #1E293B;
+                font-size: 13px;
+            }
+            QListWidget::item { padding: 7px 6px; border-bottom: 1px solid #F1F5F9; }
+            QListWidget::item:selected { background-color: #DBEAFE; color: #1E3A8A; font-weight: bold; }
+            QPushButton {
+                background-color: #2563EB; color: white; border: none; border-radius: 5px;
+                padding: 6px 12px; font-size: 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #1D4ED8; }
+            QTabWidget::pane { border: 1px solid #CBD5E1; background-color: #FFFDF9; border-radius: 6px; }
+            QTabBar::tab {
+                background-color: #E2E8F0; color: #475569; padding: 8px 18px;
+                border-top-left-radius: 6px; border-top-right-radius: 6px; font-weight: bold; font-size: 13px;
+            }
+            QTabBar::tab:selected {
+                background-color: #FFFDF9; color: #1E40AF; border: 1px solid #CBD5E1; border-bottom-color: #FFFDF9;
+            }
+        """)
+        self._init_ui()
+        self.tabs.setCurrentIndex(initial_tab)
+
+    def _notify_changed(self):
+        if callable(self.on_changed_callback):
+            try:
+                self.on_changed_callback()
+            except Exception:
+                pass
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        lbl_banner = QLabel(
+            "💡 使用说明：\n"
+            "1️⃣ 【预设组合】：模板组合与运镜组合分开管理。您可创建多个组合，勾选任意预设加入组合并调整顺序（同一预设可出现在多个组合中）。多选任务卡片后选择组合，即可按顺序平均分配！\n"
+            "2️⃣ 【卡片浅色】：遵循任务统一模板/统一运镜的卡片无额外颜色；当单个任务卡片选择了单独的预设时，卡片会变为该预设指定的浅色（未指定颜色的预设默认显示为「浅粉红色」）。"
+        )
+        lbl_banner.setWordWrap(True)
+        lbl_banner.setStyleSheet(
+            "background-color: #EFF6FF; color: #1E3A8A; border: 1px solid #BFDBFE; "
+            "border-radius: 6px; padding: 8px 12px; font-size: 12px; font-weight: bold;"
+        )
+        layout.addWidget(lbl_banner)
+
+        self.tabs = QTabWidget()
+        self._init_motion_groups_tab()
+        self._init_template_groups_tab()
+        self._init_colors_tab()
+        layout.addWidget(self.tabs, 1)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch()
+        btn_close = QPushButton("✅ 完成并关闭")
+        btn_close.setStyleSheet("background-color: #059669; color: white; padding: 7px 24px; font-size: 13px;")
+        btn_close.clicked.connect(self.accept)
+        bottom_row.addWidget(btn_close)
+        layout.addLayout(bottom_row)
+
+        self._reload_motion_groups_ui()
+        self._reload_template_groups_ui()
+        self._reload_colors_table_ui()
+
+    def _format_preset_label_with_color(self, preset: dict) -> str:
+        name = preset.get("name", "未命名")
+        ck = (preset.get("color") or "").strip()
+        c_info = get_preset_color_info(ck)
+        return f"[{c_info['label']}]  {name}"
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Tab 1: 运镜预设组合
+    # ───────────────────────────────────────────────────────────────────────
+    def _init_motion_groups_tab(self):
+        tab = QWidget()
+        lay = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: Motion group list
+        left_w = QWidget()
+        left_l = QVBoxLayout(left_w)
+        left_l.setContentsMargins(4, 4, 4, 4)
+        left_l.addWidget(QLabel("📦 已创建的运镜组合:"))
+
+        self.list_mot_groups = QListWidget()
+        self.list_mot_groups.currentRowChanged.connect(self._on_mot_group_selected)
+        left_l.addWidget(self.list_mot_groups, 1)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("＋ 新建运镜组合")
+        btn_add.setStyleSheet("background-color: #059669; color: white;")
+        btn_add.clicked.connect(self._create_mot_group)
+        btn_del = QPushButton("🗑️ 删除组合")
+        btn_del.setStyleSheet("background-color: #EF4444; color: white;")
+        btn_del.clicked.connect(self._delete_mot_group)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_del)
+        left_l.addLayout(btn_row)
+        splitter.addWidget(left_w)
+
+        # Right: Presets in current motion group
+        right_w = QWidget()
+        right_l = QVBoxLayout(right_w)
+        right_l.setContentsMargins(4, 4, 4, 4)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("组合名称:"))
+        self.txt_mot_group_name = QLineEdit()
+        self.txt_mot_group_name.setPlaceholderText("输入运镜组合名称（如：推进+拉远交替组合）")
+        self.txt_mot_group_name.editingFinished.connect(self._on_mot_group_name_edited)
+        name_row.addWidget(self.txt_mot_group_name, 1)
+        right_l.addLayout(name_row)
+
+        hdr_row = QHBoxLayout()
+        hdr_row.addWidget(QLabel("☑️ 勾选要放入该组合的运镜预设（按列表从上到下的顺序平均分配）:"))
+        hdr_row.addStretch()
+        btn_up = QPushButton("⬆️ 上移顺序")
+        btn_up.setStyleSheet("background-color: #64748B; color: white; padding: 4px 10px;")
+        btn_up.clicked.connect(lambda: self._move_group_preset_item(self.list_mot_group_presets, -1, is_motion=True))
+        btn_down = QPushButton("⬇️ 下移顺序")
+        btn_down.setStyleSheet("background-color: #64748B; color: white; padding: 4px 10px;")
+        btn_down.clicked.connect(lambda: self._move_group_preset_item(self.list_mot_group_presets, 1, is_motion=True))
+        hdr_row.addWidget(btn_up)
+        hdr_row.addWidget(btn_down)
+        right_l.addLayout(hdr_row)
+
+        self.list_mot_group_presets = QListWidget()
+        self.list_mot_group_presets.itemChanged.connect(self._on_mot_group_preset_checked)
+        right_l.addWidget(self.list_mot_group_presets, 1)
+
+        self.lbl_mot_group_preview = QLabel("当前组合顺序预览：暂无")
+        self.lbl_mot_group_preview.setWordWrap(True)
+        self.lbl_mot_group_preview.setStyleSheet(
+            "background-color: #F0FDF4; color: #166534; border: 1px solid #BBF7D0; "
+            "border-radius: 5px; padding: 6px 10px; font-size: 12px;"
+        )
+        right_l.addWidget(self.lbl_mot_group_preview)
+
+        splitter.addWidget(right_w)
+        splitter.setSizes([300, 620])
+        lay.addWidget(splitter)
+        self.tabs.addTab(tab, "📦 运镜预设组合")
+
+    def _reload_motion_groups_ui(self, select_group_id: str = None):
+        if not self.tm:
+            return
+        self.list_mot_groups.blockSignals(True)
+        self.list_mot_groups.clear()
+        sel_row = 0
+        for i, g in enumerate(self.tm.motion_groups):
+            cnt = len([pid for pid in g.get("preset_ids", []) if self.tm.get_motion(pid)])
+            it = QListWidgetItem(f"📦 {g.get('name', '未命名组合')} ({cnt} 个运镜)")
+            it.setData(Qt.ItemDataRole.UserRole, g["id"])
+            self.list_mot_groups.addItem(it)
+            if select_group_id and g["id"] == select_group_id:
+                sel_row = i
+        self.list_mot_groups.blockSignals(False)
+
+        if self.list_mot_groups.count() > 0:
+            self.list_mot_groups.setCurrentRow(sel_row)
+            self._on_mot_group_selected(sel_row)
+        else:
+            self._on_mot_group_selected(-1)
+
+    def _on_mot_group_selected(self, row: int):
+        self.list_mot_group_presets.blockSignals(True)
+        self.list_mot_group_presets.clear()
+        if row < 0 or row >= self.list_mot_groups.count() or not self.tm:
+            self.txt_mot_group_name.clear()
+            self.txt_mot_group_name.setEnabled(False)
+            self.list_mot_group_presets.setEnabled(False)
+            self.lbl_mot_group_preview.setText("💡 请先点击左侧「＋ 新建运镜组合」创建一个运镜组合。")
+            self.list_mot_group_presets.blockSignals(False)
+            return
+
+        self.txt_mot_group_name.setEnabled(True)
+        self.list_mot_group_presets.setEnabled(True)
+        gid = self.list_mot_groups.item(row).data(Qt.ItemDataRole.UserRole)
+        grp = self.tm.get_motion_group(gid)
+        if not grp:
+            self.list_mot_group_presets.blockSignals(False)
+            return
+
+        self.txt_mot_group_name.setText(grp.get("name", ""))
+        selected_ids = [pid for pid in grp.get("preset_ids", []) if self.tm.get_motion(pid)]
+        selected_set = set(selected_ids)
+
+        # 先按组合内已保存的顺序排列已勾选的预设，再列出未勾选的预设
+        ordered_motions = []
+        for pid in selected_ids:
+            m = self.tm.get_motion(pid)
+            if m:
+                ordered_motions.append((m, True))
+        for m in self.tm.motions:
+            if m["id"] not in selected_set:
+                ordered_motions.append((m, False))
+
+        for m, is_checked in ordered_motions:
+            it = QListWidgetItem(self._format_preset_label_with_color(m))
+            it.setData(Qt.ItemDataRole.UserRole, m["id"])
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
+            c_info = get_preset_color_info((m.get("color") or "").strip())
+            it.setBackground(QBrush(QColor(c_info["bg"])))
+            it.setForeground(QBrush(QColor(c_info["tag_fg"])))
+            self.list_mot_group_presets.addItem(it)
+
+        self.list_mot_group_presets.blockSignals(False)
+        self._update_mot_group_preview(grp)
+
+    def _update_mot_group_preview(self, grp: dict):
+        names = []
+        for pid in grp.get("preset_ids", []):
+            m = self.tm.get_motion(pid)
+            if m:
+                names.append(m["name"])
+        if names:
+            seq_str = "  ➔  ".join(f"【{i + 1}. {n}】" for i, n in enumerate(names))
+            self.lbl_mot_group_preview.setText(f"✅ 当前组合分配顺序（共 {len(names)} 个运镜）：\n{seq_str}")
+        else:
+            self.lbl_mot_group_preview.setText("⚠️ 当前组合尚未勾选任何运镜预设，请在上方列表中勾选要加入组合的运镜。")
+
+    def _create_mot_group(self):
+        if not self.tm:
+            return
+        name, ok = QInputDialog.getText(self, "新建运镜预设组合", "请输入运镜组合名称：")
+        if not ok or not name.strip():
+            return
+        new_grp = {
+            "id": f"mgrp_{uuid.uuid4().hex[:8]}",
+            "name": name.strip(),
+            "preset_ids": []
+        }
+        self.tm.motion_groups.append(new_grp)
+        self.tm.save_motion_groups()
+        self._reload_motion_groups_ui(select_group_id=new_grp["id"])
+        self._notify_changed()
+
+    def _delete_mot_group(self):
+        row = self.list_mot_groups.currentRow()
+        if row < 0 or not self.tm:
+            return
+        gid = self.list_mot_groups.item(row).data(Qt.ItemDataRole.UserRole)
+        grp = self.tm.get_motion_group(gid)
+        gname = grp.get("name", "") if grp else ""
+        reply = QMessageBox.question(
+            self, "确认删除运镜组合",
+            f"确定要删除运镜组合【{gname}】吗？\n（仅删除组合关系，不会删除里面的运镜预设本身）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tm.motion_groups = [g for g in self.tm.motion_groups if g.get("id") != gid]
+            self.tm.save_motion_groups()
+            self._reload_motion_groups_ui()
+            self._notify_changed()
+
+    def _on_mot_group_name_edited(self):
+        row = self.list_mot_groups.currentRow()
+        if row < 0 or not self.tm:
+            return
+        new_name = self.txt_mot_group_name.text().strip()
+        if not new_name:
+            return
+        gid = self.list_mot_groups.item(row).data(Qt.ItemDataRole.UserRole)
+        grp = self.tm.get_motion_group(gid)
+        if grp:
+            grp["name"] = new_name
+            self.tm.save_motion_groups()
+            cnt = len([pid for pid in grp.get("preset_ids", []) if self.tm.get_motion(pid)])
+            self.list_mot_groups.item(row).setText(f"📦 {new_name} ({cnt} 个运镜)")
+            self._notify_changed()
+
+    def _on_mot_group_preset_checked(self, _item):
+        self._sync_current_group_presets(is_motion=True)
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Tab 2: 模板预设组合
+    # ───────────────────────────────────────────────────────────────────────
+    def _init_template_groups_tab(self):
+        tab = QWidget()
+        lay = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: Template group list
+        left_w = QWidget()
+        left_l = QVBoxLayout(left_w)
+        left_l.setContentsMargins(4, 4, 4, 4)
+        left_l.addWidget(QLabel("📦 已创建的模板组合:"))
+
+        self.list_tpl_groups = QListWidget()
+        self.list_tpl_groups.currentRowChanged.connect(self._on_tpl_group_selected)
+        left_l.addWidget(self.list_tpl_groups, 1)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("＋ 新建模板组合")
+        btn_add.setStyleSheet("background-color: #059669; color: white;")
+        btn_add.clicked.connect(self._create_tpl_group)
+        btn_del = QPushButton("🗑️ 删除组合")
+        btn_del.setStyleSheet("background-color: #EF4444; color: white;")
+        btn_del.clicked.connect(self._delete_tpl_group)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_del)
+        left_l.addLayout(btn_row)
+        splitter.addWidget(left_w)
+
+        # Right: Presets in current template group
+        right_w = QWidget()
+        right_l = QVBoxLayout(right_w)
+        right_l.setContentsMargins(4, 4, 4, 4)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("组合名称:"))
+        self.txt_tpl_group_name = QLineEdit()
+        self.txt_tpl_group_name.setPlaceholderText("输入模板组合名称（如：多动作交替模板组合）")
+        self.txt_tpl_group_name.editingFinished.connect(self._on_tpl_group_name_edited)
+        name_row.addWidget(self.txt_tpl_group_name, 1)
+        right_l.addLayout(name_row)
+
+        hdr_row = QHBoxLayout()
+        hdr_row.addWidget(QLabel("☑️ 勾选要放入该组合的提示词模板（按列表从上到下的顺序平均分配）:"))
+        hdr_row.addStretch()
+        btn_up = QPushButton("⬆️ 上移顺序")
+        btn_up.setStyleSheet("background-color: #64748B; color: white; padding: 4px 10px;")
+        btn_up.clicked.connect(lambda: self._move_group_preset_item(self.list_tpl_group_presets, -1, is_motion=False))
+        btn_down = QPushButton("⬇️ 下移顺序")
+        btn_down.setStyleSheet("background-color: #64748B; color: white; padding: 4px 10px;")
+        btn_down.clicked.connect(lambda: self._move_group_preset_item(self.list_tpl_group_presets, 1, is_motion=False))
+        hdr_row.addWidget(btn_up)
+        hdr_row.addWidget(btn_down)
+        right_l.addLayout(hdr_row)
+
+        self.list_tpl_group_presets = QListWidget()
+        self.list_tpl_group_presets.itemChanged.connect(self._on_tpl_group_preset_checked)
+        right_l.addWidget(self.list_tpl_group_presets, 1)
+
+        self.lbl_tpl_group_preview = QLabel("当前组合顺序预览：暂无")
+        self.lbl_tpl_group_preview.setWordWrap(True)
+        self.lbl_tpl_group_preview.setStyleSheet(
+            "background-color: #F0FDF4; color: #166534; border: 1px solid #BBF7D0; "
+            "border-radius: 5px; padding: 6px 10px; font-size: 12px;"
+        )
+        right_l.addWidget(self.lbl_tpl_group_preview)
+
+        splitter.addWidget(right_w)
+        splitter.setSizes([300, 620])
+        lay.addWidget(splitter)
+        self.tabs.addTab(tab, "📦 模板预设组合")
+
+    def _reload_template_groups_ui(self, select_group_id: str = None):
+        if not self.tm:
+            return
+        self.list_tpl_groups.blockSignals(True)
+        self.list_tpl_groups.clear()
+        sel_row = 0
+        for i, g in enumerate(self.tm.template_groups):
+            cnt = len([pid for pid in g.get("preset_ids", []) if self.tm.get_template(pid)])
+            it = QListWidgetItem(f"📦 {g.get('name', '未命名组合')} ({cnt} 个模板)")
+            it.setData(Qt.ItemDataRole.UserRole, g["id"])
+            self.list_tpl_groups.addItem(it)
+            if select_group_id and g["id"] == select_group_id:
+                sel_row = i
+        self.list_tpl_groups.blockSignals(False)
+
+        if self.list_tpl_groups.count() > 0:
+            self.list_tpl_groups.setCurrentRow(sel_row)
+            self._on_tpl_group_selected(sel_row)
+        else:
+            self._on_tpl_group_selected(-1)
+
+    def _on_tpl_group_selected(self, row: int):
+        self.list_tpl_group_presets.blockSignals(True)
+        self.list_tpl_group_presets.clear()
+        if row < 0 or row >= self.list_tpl_groups.count() or not self.tm:
+            self.txt_tpl_group_name.clear()
+            self.txt_tpl_group_name.setEnabled(False)
+            self.list_tpl_group_presets.setEnabled(False)
+            self.lbl_tpl_group_preview.setText("💡 请先点击左侧「＋ 新建模板组合」创建一个模板组合。")
+            self.list_tpl_group_presets.blockSignals(False)
+            return
+
+        self.txt_tpl_group_name.setEnabled(True)
+        self.list_tpl_group_presets.setEnabled(True)
+        gid = self.list_tpl_groups.item(row).data(Qt.ItemDataRole.UserRole)
+        grp = self.tm.get_template_group(gid)
+        if not grp:
+            self.list_tpl_group_presets.blockSignals(False)
+            return
+
+        self.txt_tpl_group_name.setText(grp.get("name", ""))
+        selected_ids = [pid for pid in grp.get("preset_ids", []) if self.tm.get_template(pid)]
+        selected_set = set(selected_ids)
+
+        ordered_tpls = []
+        for pid in selected_ids:
+            t = self.tm.get_template(pid)
+            if t:
+                ordered_tpls.append((t, True))
+        for t in self.tm.templates:
+            if t["id"] not in selected_set:
+                ordered_tpls.append((t, False))
+
+        for t, is_checked in ordered_tpls:
+            it = QListWidgetItem(self._format_preset_label_with_color(t))
+            it.setData(Qt.ItemDataRole.UserRole, t["id"])
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
+            c_info = get_preset_color_info((t.get("color") or "").strip())
+            it.setBackground(QBrush(QColor(c_info["bg"])))
+            it.setForeground(QBrush(QColor(c_info["tag_fg"])))
+            self.list_tpl_group_presets.addItem(it)
+
+        self.list_tpl_group_presets.blockSignals(False)
+        self._update_tpl_group_preview(grp)
+
+    def _update_tpl_group_preview(self, grp: dict):
+        names = []
+        for pid in grp.get("preset_ids", []):
+            t = self.tm.get_template(pid)
+            if t:
+                names.append(t["name"])
+        if names:
+            seq_str = "  ➔  ".join(f"【{i + 1}. {n}】" for i, n in enumerate(names))
+            self.lbl_tpl_group_preview.setText(f"✅ 当前组合分配顺序（共 {len(names)} 个模板）：\n{seq_str}")
+        else:
+            self.lbl_tpl_group_preview.setText("⚠️ 当前组合尚未勾选任何提示词模板，请在上方列表中勾选要加入组合的模板。")
+
+    def _create_tpl_group(self):
+        if not self.tm:
+            return
+        name, ok = QInputDialog.getText(self, "新建模板预设组合", "请输入模板组合名称：")
+        if not ok or not name.strip():
+            return
+        new_grp = {
+            "id": f"tgrp_{uuid.uuid4().hex[:8]}",
+            "name": name.strip(),
+            "preset_ids": []
+        }
+        self.tm.template_groups.append(new_grp)
+        self.tm.save_template_groups()
+        self._reload_template_groups_ui(select_group_id=new_grp["id"])
+        self._notify_changed()
+
+    def _delete_tpl_group(self):
+        row = self.list_tpl_groups.currentRow()
+        if row < 0 or not self.tm:
+            return
+        gid = self.list_tpl_groups.item(row).data(Qt.ItemDataRole.UserRole)
+        grp = self.tm.get_template_group(gid)
+        gname = grp.get("name", "") if grp else ""
+        reply = QMessageBox.question(
+            self, "确认删除模板组合",
+            f"确定要删除模板组合【{gname}】吗？\n（仅删除组合关系，不会删除里面的提示词模板本身）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tm.template_groups = [g for g in self.tm.template_groups if g.get("id") != gid]
+            self.tm.save_template_groups()
+            self._reload_template_groups_ui()
+            self._notify_changed()
+
+    def _on_tpl_group_name_edited(self):
+        row = self.list_tpl_groups.currentRow()
+        if row < 0 or not self.tm:
+            return
+        new_name = self.txt_tpl_group_name.text().strip()
+        if not new_name:
+            return
+        gid = self.list_tpl_groups.item(row).data(Qt.ItemDataRole.UserRole)
+        grp = self.tm.get_template_group(gid)
+        if grp:
+            grp["name"] = new_name
+            self.tm.save_template_groups()
+            cnt = len([pid for pid in grp.get("preset_ids", []) if self.tm.get_template(pid)])
+            self.list_tpl_groups.item(row).setText(f"📦 {new_name} ({cnt} 个模板)")
+            self._notify_changed()
+
+    def _on_tpl_group_preset_checked(self, _item):
+        self._sync_current_group_presets(is_motion=False)
+
+    def _move_group_preset_item(self, list_widget: QListWidget, direction: int, is_motion: bool):
+        row = list_widget.currentRow()
+        if row < 0:
+            return
+        target = row + direction
+        if target < 0 or target >= list_widget.count():
+            return
+        list_widget.blockSignals(True)
+        it = list_widget.takeItem(row)
+        list_widget.insertItem(target, it)
+        list_widget.setCurrentRow(target)
+        list_widget.blockSignals(False)
+        self._sync_current_group_presets(is_motion=is_motion)
+
+    def _sync_current_group_presets(self, is_motion: bool):
+        if not self.tm:
+            return
+        if is_motion:
+            g_row = self.list_mot_groups.currentRow()
+            if g_row < 0:
+                return
+            gid = self.list_mot_groups.item(g_row).data(Qt.ItemDataRole.UserRole)
+            grp = self.tm.get_motion_group(gid)
+            if not grp:
+                return
+            checked_ids = []
+            for i in range(self.list_mot_group_presets.count()):
+                it = self.list_mot_group_presets.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    checked_ids.append(it.data(Qt.ItemDataRole.UserRole))
+            grp["preset_ids"] = checked_ids
+            self.tm.save_motion_groups()
+            self.list_mot_groups.item(g_row).setText(f"📦 {grp.get('name', '未命名组合')} ({len(checked_ids)} 个运镜)")
+            self._update_mot_group_preview(grp)
+        else:
+            g_row = self.list_tpl_groups.currentRow()
+            if g_row < 0:
+                return
+            gid = self.list_tpl_groups.item(g_row).data(Qt.ItemDataRole.UserRole)
+            grp = self.tm.get_template_group(gid)
+            if not grp:
+                return
+            checked_ids = []
+            for i in range(self.list_tpl_group_presets.count()):
+                it = self.list_tpl_group_presets.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    checked_ids.append(it.data(Qt.ItemDataRole.UserRole))
+            grp["preset_ids"] = checked_ids
+            self.tm.save_template_groups()
+            self.list_tpl_groups.item(g_row).setText(f"📦 {grp.get('name', '未命名组合')} ({len(checked_ids)} 个模板)")
+            self._update_tpl_group_preview(grp)
+        self._notify_changed()
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Tab 3: 预设专属浅色设置
+    # ───────────────────────────────────────────────────────────────────────
+    def _init_colors_tab(self):
+        tab = QWidget()
+        lay = QHBoxLayout(tab)
+
+        # Left column: Camera Motions Colors
+        mot_box = QVBoxLayout()
+        mot_box.addWidget(QLabel("🎥 运镜预设卡片浅色设置（单独应用该运镜时卡片显示的颜色）:"))
+        self.table_mot_colors = QTableWidget(0, 2)
+        self.table_mot_colors.setHorizontalHeaderLabels(["运镜预设名称 (浅色预览)", "选择卡片专属浅色"])
+        self.table_mot_colors.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table_mot_colors.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_mot_colors.verticalHeader().setDefaultSectionSize(38)
+        mot_box.addWidget(self.table_mot_colors, 1)
+        lay.addLayout(mot_box, 1)
+
+        # Right column: Prompt Templates Colors
+        tpl_box = QVBoxLayout()
+        tpl_box.addWidget(QLabel("📐 提示词模板卡片浅色设置（单独应用该模板时卡片显示的颜色）:"))
+        self.table_tpl_colors = QTableWidget(0, 2)
+        self.table_tpl_colors.setHorizontalHeaderLabels(["提示词模板名称 (浅色预览)", "选择卡片专属浅色"])
+        self.table_tpl_colors.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table_tpl_colors.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_tpl_colors.verticalHeader().setDefaultSectionSize(38)
+        tpl_box.addWidget(self.table_tpl_colors, 1)
+        lay.addLayout(tpl_box, 1)
+
+        self.tabs.addTab(tab, "🎨 预设专属浅色设置")
+
+    def _reload_colors_table_ui(self):
+        if not self.tm:
+            return
+        # Populate Motion Colors table
+        self.table_mot_colors.setRowCount(len(self.tm.motions))
+        for r, m in enumerate(self.tm.motions):
+            ck = (m.get("color") or "").strip()
+            c_info = get_preset_color_info(ck)
+            name_item = QTableWidgetItem(f"🎥 {m.get('name', '未命名')}")
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            name_item.setBackground(QBrush(QColor(c_info["bg"])))
+            name_item.setForeground(QBrush(QColor(c_info["tag_fg"])))
+            self.table_mot_colors.setItem(r, 0, name_item)
+
+            cb = QComboBox()
+            for c in PRESET_COLOR_PALETTE:
+                idx = cb.count()
+                cb.addItem(c["label"], c["key"])
+                cb.setItemData(idx, QBrush(QColor(c["bg"])), Qt.ItemDataRole.BackgroundRole)
+                cb.setItemData(idx, QBrush(QColor(c["tag_fg"])), Qt.ItemDataRole.ForegroundRole)
+            c_idx = cb.findData(ck)
+            cb.setCurrentIndex(c_idx if c_idx >= 0 else 0)
+            cb.currentIndexChanged.connect(lambda _idx, row=r, mid=m["id"], combo=cb: self._on_table_preset_color_changed(True, row, mid, combo))
+            self.table_mot_colors.setCellWidget(r, 1, cb)
+
+        # Populate Template Colors table
+        self.table_tpl_colors.setRowCount(len(self.tm.templates))
+        for r, t in enumerate(self.tm.templates):
+            ck = (t.get("color") or "").strip()
+            c_info = get_preset_color_info(ck)
+            name_item = QTableWidgetItem(f"📐 {t.get('name', '未命名')}")
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            name_item.setBackground(QBrush(QColor(c_info["bg"])))
+            name_item.setForeground(QBrush(QColor(c_info["tag_fg"])))
+            self.table_tpl_colors.setItem(r, 0, name_item)
+
+            cb = QComboBox()
+            for c in PRESET_COLOR_PALETTE:
+                idx = cb.count()
+                cb.addItem(c["label"], c["key"])
+                cb.setItemData(idx, QBrush(QColor(c["bg"])), Qt.ItemDataRole.BackgroundRole)
+                cb.setItemData(idx, QBrush(QColor(c["tag_fg"])), Qt.ItemDataRole.ForegroundRole)
+            c_idx = cb.findData(ck)
+            cb.setCurrentIndex(c_idx if c_idx >= 0 else 0)
+            cb.currentIndexChanged.connect(lambda _idx, row=r, tid=t["id"], combo=cb: self._on_table_preset_color_changed(False, row, tid, combo))
+            self.table_tpl_colors.setCellWidget(r, 1, cb)
+
+    def _on_table_preset_color_changed(self, is_motion: bool, row: int, preset_id: str, combo: QComboBox):
+        if not self.tm:
+            return
+        new_ck = combo.currentData() or ""
+        c_info = get_preset_color_info(new_ck)
+        if is_motion:
+            m = self.tm.get_motion(preset_id)
+            if m:
+                m["color"] = new_ck
+                self.tm.save_motions()
+            it = self.table_mot_colors.item(row, 0)
+            if it:
+                it.setBackground(QBrush(QColor(c_info["bg"])))
+                it.setForeground(QBrush(QColor(c_info["tag_fg"])))
+            self._on_mot_group_selected(self.list_mot_groups.currentRow())
+        else:
+            t = self.tm.get_template(preset_id)
+            if t:
+                t["color"] = new_ck
+                self.tm.save_templates()
+            it = self.table_tpl_colors.item(row, 0)
+            if it:
+                it.setBackground(QBrush(QColor(c_info["bg"])))
+                it.setForeground(QBrush(QColor(c_info["tag_fg"])))
+            self._on_tpl_group_selected(self.list_tpl_groups.currentRow())
+        self._notify_changed()
 
 
 class SegmentVisualBatchManagerDialog(QDialog):
@@ -795,6 +1481,60 @@ class SegmentVisualBatchManagerDialog(QDialog):
         pick_row.addWidget(btn_reset_sel)
 
         preset_outer.addLayout(pick_row)
+
+        # Row 2C: Preset Group Average Distribution & Preset Pastel Color Manager
+        group_row = QHBoxLayout()
+        group_row.setSpacing(8)
+
+        lbl_grp_title = QLabel("📦 按预设组合平均分配:")
+        lbl_grp_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #7C3AED; border: none;")
+        group_row.addWidget(lbl_grp_title)
+
+        lbl_tg = QLabel("📐 模板组合:")
+        lbl_tg.setStyleSheet("font-weight: bold; color: #1E293B; border: none;")
+        group_row.addWidget(lbl_tg)
+        self.combo_batch_tpl_group = QComboBox()
+        self.combo_batch_tpl_group.setMinimumWidth(185)
+        self.combo_batch_tpl_group.activated.connect(self._on_apply_batch_tpl_group)
+        group_row.addWidget(self.combo_batch_tpl_group)
+
+        lbl_mg = QLabel("🎥 运镜组合:")
+        lbl_mg.setStyleSheet("font-weight: bold; color: #1E293B; border: none;")
+        group_row.addWidget(lbl_mg)
+        self.combo_batch_mot_group = QComboBox()
+        self.combo_batch_mot_group.setMinimumWidth(185)
+        self.combo_batch_mot_group.activated.connect(self._on_apply_batch_mot_group)
+        group_row.addWidget(self.combo_batch_mot_group)
+
+        lbl_dist = QLabel("分配顺序:")
+        lbl_dist.setStyleSheet("font-weight: bold; color: #1E293B; border: none;")
+        group_row.addWidget(lbl_dist)
+        self.combo_group_dist_mode = QComboBox()
+        self.combo_group_dist_mode.addItem("🔄 按顺序轮流平均 (1→2→3→1→2→3)", "cycle")
+        self.combo_group_dist_mode.addItem("📊 按顺序分段平均 (1,1→2,2→3,3)", "block")
+        self.combo_group_dist_mode.setToolTip(
+            "选择多个任务卡片并应用组合预设时的平均分配方式：\n"
+            "• 按顺序轮流平均：第1张用预设1、第2张用预设2、第3张用预设3、第4张用预设1...\n"
+            "• 按顺序分段平均：前1/N卡片用预设1、中间1/N卡片用预设2、后1/N卡片用预设3..."
+        )
+        group_row.addWidget(self.combo_group_dist_mode)
+
+        group_row.addStretch()
+
+        self.btn_manage_groups_colors = QPushButton("🎨 管理预设组合 & 预设浅色")
+        self.btn_manage_groups_colors.setToolTip(
+            "打开预设组合与卡片专属浅色设置：\n"
+            "• 创建/编辑/删除「模板预设组合」与「运镜预设组合」（同一预设可加入多个组合）\n"
+            "• 为任意预设指定专属浅色（未指定颜色的独立预设默认显示为浅粉红色）"
+        )
+        self.btn_manage_groups_colors.setStyleSheet(
+            "QPushButton { background: #EC4899; color: white; font-weight: bold; padding: 5px 14px; border-radius: 5px; border: none; }"
+            "QPushButton:hover { background: #DB2777; }"
+        )
+        self.btn_manage_groups_colors.clicked.connect(lambda: self._open_preset_group_and_color_dialog(initial_tab=0))
+        group_row.addWidget(self.btn_manage_groups_colors)
+
+        preset_outer.addLayout(group_row)
         root_layout.addWidget(preset_bar)
 
         # ═══════════════════════════════════════════════════════════════════
@@ -1096,6 +1836,49 @@ class SegmentVisualBatchManagerDialog(QDialog):
 
         return tpl_name, mot_name, mode_name, dur_label
 
+    def get_segment_card_color_info(self, seg: dict):
+        """
+        返回 (card_color_info, tpl_color_info, mot_color_info)。
+        - 当任务分句遵循统一模板和统一运镜时，card_color_info / tpl_color_info / mot_color_info 均为 None（无额外颜色）。
+        - 当单个分句选择了单独的模板或运镜预设时，返回该预设指定的浅色配置；若用户未为该预设指定颜色，默认返回浅粉红色 (#FCE7F3)。
+        """
+        tpl_id = (seg.get("template_id") or "").strip()
+        mot_id = (seg.get("motion_id") or "").strip()
+
+        has_custom_tpl = bool(tpl_id)
+        has_custom_mot = bool(mot_id)
+
+        if not has_custom_tpl and not has_custom_mot:
+            return None, None, None
+
+        tpl_color_key = ""
+        mot_color_key = ""
+        tpl_color_info = None
+        mot_color_info = None
+
+        if has_custom_tpl:
+            t_obj = self.template_manager.get_template(tpl_id) if self.template_manager else None
+            tpl_color_key = (t_obj.get("color") or "").strip() if t_obj else ""
+            tpl_color_info = get_preset_color_info(tpl_color_key)
+
+        if has_custom_mot:
+            m_obj = self.template_manager.get_motion(mot_id) if self.template_manager else None
+            mot_color_key = (m_obj.get("color") or "").strip() if m_obj else ""
+            mot_color_info = get_preset_color_info(mot_color_key)
+
+        # 决定整张卡片的背景浅色：
+        # 1. 若运镜单独指定且该运镜设置了专属颜色 -> 用运镜专属颜色
+        # 2. 否则若模板单独指定且该模板设置了专属颜色 -> 用模板专属颜色
+        # 3. 否则（有单独运镜或单独模板，但用户未指定特殊颜色）-> 默认浅粉红色 (#FCE7F3)
+        if has_custom_mot and mot_color_key:
+            card_color_info = mot_color_info
+        elif has_custom_tpl and tpl_color_key:
+            card_color_info = tpl_color_info
+        else:
+            card_color_info = get_preset_color_info("")
+
+        return card_color_info, tpl_color_info, mot_color_info
+
     def _populate_preset_combos(self):
         # 1. 任务级统一模板 & 统一运镜
         self.combo_unified_tpl.blockSignals(True)
@@ -1120,28 +1903,40 @@ class SegmentVisualBatchManagerDialog(QDialog):
         self.combo_unified_tpl.blockSignals(False)
         self.combo_unified_mot.blockSignals(False)
 
-        # 2. 批量指定分句模板下拉框
+        # 2. 批量指定分句模板下拉框（附带浅色标记）
         u_tpl_name = self.combo_unified_tpl.currentText() or "未选择"
         u_mot_name = self.combo_unified_mot.currentText() or "未选择"
 
         self.combo_batch_tpl.blockSignals(True)
         self.combo_batch_tpl.clear()
         self.combo_batch_tpl.addItem("📐 选择模板直接应用到已选...", None)
-        self.combo_batch_tpl.addItem(f"-- 遵循统一模板 ({u_tpl_name}) --", "")
+        self.combo_batch_tpl.addItem(f"-- 遵循统一模板 ({u_tpl_name}) [无额外底色] --", "")
         if self.template_manager:
             for t in self.template_manager.templates:
-                self.combo_batch_tpl.addItem(t["name"], t["id"])
+                ck = (t.get("color") or "").strip()
+                c_info = get_preset_color_info(ck)
+                idx = self.combo_batch_tpl.count()
+                label = f"{t['name']}  ({c_info['label']})" if ck else f"{t['name']}  (🌸默认浅粉红)"
+                self.combo_batch_tpl.addItem(label, t["id"])
+                self.combo_batch_tpl.setItemData(idx, QBrush(QColor(c_info["bg"])), Qt.ItemDataRole.BackgroundRole)
+                self.combo_batch_tpl.setItemData(idx, QBrush(QColor(c_info["tag_fg"])), Qt.ItemDataRole.ForegroundRole)
         self.combo_batch_tpl.setCurrentIndex(0)
         self.combo_batch_tpl.blockSignals(False)
 
-        # 3. 批量指定分句运镜下拉框
+        # 3. 批量指定分句运镜下拉框（附带浅色标记）
         self.combo_batch_mot.blockSignals(True)
         self.combo_batch_mot.clear()
         self.combo_batch_mot.addItem("🎥 选择运镜直接应用到已选...", None)
-        self.combo_batch_mot.addItem(f"-- 遵循统一运镜 ({u_mot_name}) --", "")
+        self.combo_batch_mot.addItem(f"-- 遵循统一运镜 ({u_mot_name}) [无额外底色] --", "")
         if self.template_manager:
             for m in self.template_manager.motions:
-                self.combo_batch_mot.addItem(m["name"], m["id"])
+                ck = (m.get("color") or "").strip()
+                c_info = get_preset_color_info(ck)
+                idx = self.combo_batch_mot.count()
+                label = f"{m['name']}  ({c_info['label']})" if ck else f"{m['name']}  (🌸默认浅粉红)"
+                self.combo_batch_mot.addItem(label, m["id"])
+                self.combo_batch_mot.setItemData(idx, QBrush(QColor(c_info["bg"])), Qt.ItemDataRole.BackgroundRole)
+                self.combo_batch_mot.setItemData(idx, QBrush(QColor(c_info["tag_fg"])), Qt.ItemDataRole.ForegroundRole)
         self.combo_batch_mot.setCurrentIndex(0)
         self.combo_batch_mot.blockSignals(False)
 
@@ -1156,6 +1951,32 @@ class SegmentVisualBatchManagerDialog(QDialog):
         self.combo_batch_mode.addItem("素材模式 (Reference)", "VIDEO_REFERENCES")
         self.combo_batch_mode.setCurrentIndex(0)
         self.combo_batch_mode.blockSignals(False)
+
+        # 5. 模板预设组合下拉框
+        if hasattr(self, "combo_batch_tpl_group"):
+            self.combo_batch_tpl_group.blockSignals(True)
+            self.combo_batch_tpl_group.clear()
+            self.combo_batch_tpl_group.addItem("📦 选择模板组合平均分配...", None)
+            if self.template_manager:
+                for g in getattr(self.template_manager, "template_groups", []):
+                    valid_ids = [pid for pid in g.get("preset_ids", []) if self.template_manager.get_template(pid)]
+                    self.combo_batch_tpl_group.addItem(f"📦 {g.get('name', '未命名')} ({len(valid_ids)}个模板)", g.get("id"))
+            self.combo_batch_tpl_group.addItem("➕ 新建 / 管理模板组合...", "__MANAGE_TPL_GROUPS__")
+            self.combo_batch_tpl_group.setCurrentIndex(0)
+            self.combo_batch_tpl_group.blockSignals(False)
+
+        # 6. 运镜预设组合下拉框
+        if hasattr(self, "combo_batch_mot_group"):
+            self.combo_batch_mot_group.blockSignals(True)
+            self.combo_batch_mot_group.clear()
+            self.combo_batch_mot_group.addItem("📦 选择运镜组合平均分配...", None)
+            if self.template_manager:
+                for g in getattr(self.template_manager, "motion_groups", []):
+                    valid_ids = [pid for pid in g.get("preset_ids", []) if self.template_manager.get_motion(pid)]
+                    self.combo_batch_mot_group.addItem(f"📦 {g.get('name', '未命名')} ({len(valid_ids)}个运镜)", g.get("id"))
+            self.combo_batch_mot_group.addItem("➕ 新建 / 管理运镜组合...", "__MANAGE_MOT_GROUPS__")
+            self.combo_batch_mot_group.setCurrentIndex(0)
+            self.combo_batch_mot_group.blockSignals(False)
 
     # ───────────────────────────────────────────────────────────────────────
     # 资源图面板（展示、展开/收起、点击批量更换断句图片）
@@ -1338,6 +2159,117 @@ class SegmentVisualBatchManagerDialog(QDialog):
         self._save_and_sync_detail_widget(rows, update_prompts=True)
         self.grid_viewport.update()
         self._flash_save_badge(f"✅ 已为 {len(rows)} 个断句设置运镜: {mot_label}")
+
+    def _open_preset_group_and_color_dialog(self, initial_tab: int = 0):
+        def _on_changed():
+            self._populate_preset_combos()
+            self.grid_viewport.update()
+
+        dlg = PresetGroupAndColorDialog(
+            self.template_manager,
+            on_changed_callback=_on_changed,
+            initial_tab=initial_tab,
+            parent=self
+        )
+        dlg.exec()
+        self._populate_preset_combos()
+        self.grid_viewport.update()
+
+    def _on_apply_batch_tpl_group(self, idx: int):
+        if idx <= 0:
+            return
+        grp_id = self.combo_batch_tpl_group.currentData()
+        self.combo_batch_tpl_group.setCurrentIndex(0)
+        if not grp_id:
+            return
+        if grp_id == "__MANAGE_TPL_GROUPS__":
+            self._open_preset_group_and_color_dialog(initial_tab=1)
+            return
+
+        if not self.template_manager:
+            return
+        grp = self.template_manager.get_template_group(grp_id)
+        if not grp:
+            return
+        valid_ids = [pid for pid in grp.get("preset_ids", []) if self.template_manager.get_template(pid)]
+        if not valid_ids:
+            QMessageBox.warning(
+                self, "组合为空",
+                f"模板组合【{grp.get('name', '')}】中尚未勾选任何模板预设！\n将为您打开组合设置界面进行勾选。"
+            )
+            self._open_preset_group_and_color_dialog(initial_tab=1)
+            return
+
+        rows = self._ensure_has_selection()
+        if not rows or not self.project_model:
+            return
+
+        dist_mode = self.combo_group_dist_mode.currentData() if hasattr(self, "combo_group_dist_mode") else "cycle"
+        segs = self.project_model.spanish_segments
+        n_rows = len(rows)
+        n_presets = len(valid_ids)
+
+        for i, r in enumerate(rows):
+            if 0 <= r < len(segs):
+                if dist_mode == "block":
+                    p_idx = min(n_presets - 1, (i * n_presets) // n_rows)
+                else:
+                    p_idx = i % n_presets
+                segs[r]["template_id"] = valid_ids[p_idx]
+
+        self._save_and_sync_detail_widget(rows, update_prompts=True)
+        self.grid_viewport.update()
+        self._flash_save_badge(
+            f"✅ 已将模板组合【{grp.get('name', '')}】({n_presets}个模板) 按顺序平均分配到 {n_rows} 个任务卡片！"
+        )
+
+    def _on_apply_batch_mot_group(self, idx: int):
+        if idx <= 0:
+            return
+        grp_id = self.combo_batch_mot_group.currentData()
+        self.combo_batch_mot_group.setCurrentIndex(0)
+        if not grp_id:
+            return
+        if grp_id == "__MANAGE_MOT_GROUPS__":
+            self._open_preset_group_and_color_dialog(initial_tab=0)
+            return
+
+        if not self.template_manager:
+            return
+        grp = self.template_manager.get_motion_group(grp_id)
+        if not grp:
+            return
+        valid_ids = [pid for pid in grp.get("preset_ids", []) if self.template_manager.get_motion(pid)]
+        if not valid_ids:
+            QMessageBox.warning(
+                self, "组合为空",
+                f"运镜组合【{grp.get('name', '')}】中尚未勾选任何运镜预设！\n将为您打开组合设置界面进行勾选。"
+            )
+            self._open_preset_group_and_color_dialog(initial_tab=0)
+            return
+
+        rows = self._ensure_has_selection()
+        if not rows or not self.project_model:
+            return
+
+        dist_mode = self.combo_group_dist_mode.currentData() if hasattr(self, "combo_group_dist_mode") else "cycle"
+        segs = self.project_model.spanish_segments
+        n_rows = len(rows)
+        n_presets = len(valid_ids)
+
+        for i, r in enumerate(rows):
+            if 0 <= r < len(segs):
+                if dist_mode == "block":
+                    p_idx = min(n_presets - 1, (i * n_presets) // n_rows)
+                else:
+                    p_idx = i % n_presets
+                segs[r]["motion_id"] = valid_ids[p_idx]
+
+        self._save_and_sync_detail_widget(rows, update_prompts=True)
+        self.grid_viewport.update()
+        self._flash_save_badge(
+            f"✅ 已将运镜组合【{grp.get('name', '')}】({n_presets}个运镜) 按顺序平均分配到 {n_rows} 个任务卡片！"
+        )
 
     def _on_apply_batch_mode(self, idx: int):
         if idx <= 0:

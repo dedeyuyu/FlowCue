@@ -3,6 +3,145 @@ import os
 import json
 from pathlib import Path
 
+
+# 预设卡片专属浅色调色板（用于「批量选择预设」可视化卡片背景高亮）
+# 若某个预设未指定颜色 (color == "")，当任务卡片单独使用该预设时，默认显示为「浅粉红色」
+PRESET_COLOR_PALETTE = [
+    {
+        "key": "",
+        "name": "🌸 默认浅粉红 (未指定时默认)",
+        "short": "🌸浅粉红",
+        "bg": "#FCE7F3",
+        "border": "#F472B6",
+        "tag_bg": "#FBCFE8",
+        "tag_fg": "#9D174D",
+        "dark_bg": "#3B182B",
+        "dark_border": "#EC4899",
+    },
+    {
+        "key": "pink",
+        "name": "🌸 浅粉红色",
+        "short": "🌸浅粉红",
+        "bg": "#FCE7F3",
+        "border": "#F472B6",
+        "tag_bg": "#FBCFE8",
+        "tag_fg": "#9D174D",
+        "dark_bg": "#3B182B",
+        "dark_border": "#EC4899",
+    },
+    {
+        "key": "green",
+        "name": "🌿 浅绿色",
+        "short": "🌿浅绿色",
+        "bg": "#DCFCE7",
+        "border": "#4ADE80",
+        "tag_bg": "#BBF7D0",
+        "tag_fg": "#166534",
+        "dark_bg": "#133223",
+        "dark_border": "#22C55E",
+    },
+    {
+        "key": "blue",
+        "name": "💧 浅蓝色",
+        "short": "💧浅蓝色",
+        "bg": "#DBEAFE",
+        "border": "#60A5FA",
+        "tag_bg": "#BFDBFE",
+        "tag_fg": "#1E40AF",
+        "dark_bg": "#172554",
+        "dark_border": "#3B82F6",
+    },
+    {
+        "key": "yellow",
+        "name": "🌼 浅黄色",
+        "short": "🌼浅黄色",
+        "bg": "#FEF9C3",
+        "border": "#FACC15",
+        "tag_bg": "#FEF08A",
+        "tag_fg": "#854D0E",
+        "dark_bg": "#382E12",
+        "dark_border": "#EAB308",
+    },
+    {
+        "key": "purple",
+        "name": "🔮 浅紫色",
+        "short": "🔮浅紫色",
+        "bg": "#F3E8FF",
+        "border": "#C084FC",
+        "tag_bg": "#E9D5FF",
+        "tag_fg": "#6B21A8",
+        "dark_bg": "#2E1944",
+        "dark_border": "#A855F7",
+    },
+    {
+        "key": "orange",
+        "name": "🍊 浅橙色",
+        "short": "🍊浅橙色",
+        "bg": "#FFEDD5",
+        "border": "#FB923C",
+        "tag_bg": "#FED7AA",
+        "tag_fg": "#9A3412",
+        "dark_bg": "#3B2112",
+        "dark_border": "#F97316",
+    },
+    {
+        "key": "cyan",
+        "name": "🧊 浅青色",
+        "short": "🧊浅青色",
+        "bg": "#CFFAFE",
+        "border": "#22D3EE",
+        "tag_bg": "#A5F3FC",
+        "tag_fg": "#155E75",
+        "dark_bg": "#11323B",
+        "dark_border": "#06B6D4",
+    },
+    {
+        "key": "rose",
+        "name": "🌹 浅玫瑰色",
+        "short": "🌹浅玫瑰",
+        "bg": "#FFE4E6",
+        "border": "#FB7185",
+        "tag_bg": "#FECDD3",
+        "tag_fg": "#9F1239",
+        "dark_bg": "#3D1620",
+        "dark_border": "#F43F5E",
+    },
+    {
+        "key": "teal",
+        "name": "🍃 浅薄荷色",
+        "short": "🍃浅薄荷",
+        "bg": "#CCFBF1",
+        "border": "#2DD4BF",
+        "tag_bg": "#99F6E4",
+        "tag_fg": "#115E59",
+        "dark_bg": "#113330",
+        "dark_border": "#14B8A6",
+    },
+    {
+        "key": "lime",
+        "name": "🍋 浅柠檬绿",
+        "short": "🍋浅柠檬",
+        "bg": "#ECFCCB",
+        "border": "#A3E635",
+        "tag_bg": "#D9F99D",
+        "tag_fg": "#3F6212",
+        "dark_bg": "#233312",
+        "dark_border": "#84CC16",
+    },
+]
+
+for _c in PRESET_COLOR_PALETTE:
+    _c["label"] = _c["name"]
+
+_PRESET_COLOR_MAP = {c["key"]: c for c in PRESET_COLOR_PALETTE}
+
+
+def get_preset_color_info(color_key: str) -> dict:
+    """根据预设的 color 字段返回对应的浅色配置；未指定时默认返回浅粉红色。"""
+    k = str(color_key or "").strip().lower()
+    return _PRESET_COLOR_MAP.get(k, PRESET_COLOR_PALETTE[0])
+
+
 class TemplateManager:
     """Manages prompt templates and camera motion presets in the app root directory."""
     
@@ -10,6 +149,8 @@ class TemplateManager:
     MOTIONS_FILE = "camera_motions.json"
     BATCH_TEMPLATES_FILE = "batch_templates.json"
     BATCH_CATEGORIES_FILE = "batch_categories.json"
+    TEMPLATE_GROUPS_FILE = "template_groups.json"
+    MOTION_GROUPS_FILE = "motion_groups.json"
     
     def __init__(self, workspace_dir):
         self.workspace_dir = Path(workspace_dir)
@@ -17,11 +158,15 @@ class TemplateManager:
         self.motions_path = self.workspace_dir / self.MOTIONS_FILE
         self.batch_templates_path = self.workspace_dir / self.BATCH_TEMPLATES_FILE
         self.batch_categories_path = self.workspace_dir / self.BATCH_CATEGORIES_FILE
+        self.template_groups_path = self.workspace_dir / self.TEMPLATE_GROUPS_FILE
+        self.motion_groups_path = self.workspace_dir / self.MOTION_GROUPS_FILE
         
         self.templates = []
         self.motions = []
         self.batch_templates = []
         self.batch_categories = []
+        self.template_groups = []
+        self.motion_groups = []
         
         self.load_all()
 
@@ -30,6 +175,8 @@ class TemplateManager:
         self.load_motions()
         self.load_batch_templates()
         self.load_batch_categories()
+        self.load_template_groups()
+        self.load_motion_groups()
 
     def load_templates(self):
         """Loads prompt templates from file. Initializes defaults if missing."""
@@ -234,11 +381,13 @@ class TemplateManager:
         return None
 
     def export_all(self, export_path):
-        """Exports all templates and motions to a single JSON file."""
+        """Exports all templates, motions, groups, and batch templates to a single JSON file."""
         try:
             data = {
                 "templates": self.templates,
                 "motions": self.motions,
+                "template_groups": self.template_groups,
+                "motion_groups": self.motion_groups,
                 "batch_templates": self.batch_templates,
                 "batch_categories": self.get_batch_categories(),
             }
@@ -271,6 +420,7 @@ class TemplateManager:
                         continue
                     name = str(item.get("name", "")).strip()
                     content = str(item.get("content", "")).strip()
+                    color = str(item.get("color", "") or "").strip()
                     if not name and not content:
                         continue
                     if (name, content) in existing_pairs:
@@ -285,6 +435,7 @@ class TemplateManager:
                         "id": new_id,
                         "name": name or "导入提示词模板",
                         "content": content,
+                        "color": color,
                     })
                     added_tpl += 1
 
@@ -299,6 +450,7 @@ class TemplateManager:
                         continue
                     name = str(item.get("name", "")).strip()
                     content = str(item.get("content", "")).strip()
+                    color = str(item.get("color", "") or "").strip()
                     if not name and not content:
                         continue
                     if (name, content) in existing_pairs:
@@ -313,8 +465,45 @@ class TemplateManager:
                         "id": new_id,
                         "name": name or "导入运镜预设",
                         "content": content,
+                        "color": color,
                     })
                     added_mot += 1
+
+            if "template_groups" in data and isinstance(data["template_groups"], list):
+                existing_gnames = {str(g.get("name", "")).strip() for g in self.template_groups}
+                existing_gids = {str(g.get("id", "")).strip() for g in self.template_groups}
+                for g in data["template_groups"]:
+                    if not isinstance(g, dict):
+                        continue
+                    gname = str(g.get("name", "")).strip()
+                    pids = [str(x).strip() for x in (g.get("preset_ids") or []) if str(x).strip()]
+                    if not gname or gname in existing_gnames:
+                        continue
+                    gid = str(g.get("id", "")).strip()
+                    if not gid or gid in existing_gids:
+                        gid = f"tgrp_{uuid.uuid4().hex[:8]}"
+                    existing_gids.add(gid)
+                    existing_gnames.add(gname)
+                    self.template_groups.append({"id": gid, "name": gname, "preset_ids": pids})
+                self.save_template_groups()
+
+            if "motion_groups" in data and isinstance(data["motion_groups"], list):
+                existing_gnames = {str(g.get("name", "")).strip() for g in self.motion_groups}
+                existing_gids = {str(g.get("id", "")).strip() for g in self.motion_groups}
+                for g in data["motion_groups"]:
+                    if not isinstance(g, dict):
+                        continue
+                    gname = str(g.get("name", "")).strip()
+                    pids = [str(x).strip() for x in (g.get("preset_ids") or []) if str(x).strip()]
+                    if not gname or gname in existing_gnames:
+                        continue
+                    gid = str(g.get("id", "")).strip()
+                    if not gid or gid in existing_gids:
+                        gid = f"mgrp_{uuid.uuid4().hex[:8]}"
+                    existing_gids.add(gid)
+                    existing_gnames.add(gname)
+                    self.motion_groups.append({"id": gid, "name": gname, "preset_ids": pids})
+                self.save_motion_groups()
 
             if "batch_categories" in data and isinstance(data["batch_categories"], list):
                 for c in data["batch_categories"]:
@@ -372,6 +561,72 @@ class TemplateManager:
             return True, summary
         except Exception as e:
             return False, f"导入失败: {e}"
+
+    def load_template_groups(self):
+        """加载提示词模板组合列表 [{"id": str, "name": str, "preset_ids": [str, ...]}]"""
+        self.template_groups = []
+        if self.template_groups_path.exists():
+            try:
+                with open(self.template_groups_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, list):
+                    for g in raw:
+                        if isinstance(g, dict) and g.get("id") and g.get("name"):
+                            self.template_groups.append({
+                                "id": str(g["id"]),
+                                "name": str(g["name"]),
+                                "preset_ids": [str(x) for x in (g.get("preset_ids") or []) if x],
+                            })
+            except Exception as e:
+                print(f"Error loading template groups: {e}")
+
+    def save_template_groups(self):
+        try:
+            with open(self.template_groups_path, "w", encoding="utf-8") as f:
+                json.dump(self.template_groups, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"Error saving template groups: {e}")
+            return False
+
+    def get_template_group(self, group_id: str):
+        for g in self.template_groups:
+            if g.get("id") == group_id:
+                return g
+        return None
+
+    def load_motion_groups(self):
+        """加载运镜预设组合列表 [{"id": str, "name": str, "preset_ids": [str, ...]}]"""
+        self.motion_groups = []
+        if self.motion_groups_path.exists():
+            try:
+                with open(self.motion_groups_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, list):
+                    for g in raw:
+                        if isinstance(g, dict) and g.get("id") and g.get("name"):
+                            self.motion_groups.append({
+                                "id": str(g["id"]),
+                                "name": str(g["name"]),
+                                "preset_ids": [str(x) for x in (g.get("preset_ids") or []) if x],
+                            })
+            except Exception as e:
+                print(f"Error loading motion groups: {e}")
+
+    def save_motion_groups(self):
+        try:
+            with open(self.motion_groups_path, "w", encoding="utf-8") as f:
+                json.dump(self.motion_groups, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"Error saving motion groups: {e}")
+            return False
+
+    def get_motion_group(self, group_id: str):
+        for g in self.motion_groups:
+            if g.get("id") == group_id:
+                return g
+        return None
 
     def load_batch_templates(self):
         if self.batch_templates_path.exists():

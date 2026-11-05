@@ -5,8 +5,9 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QFileDialog, QAbstractItemView, QComboBox, QInputDialog,
                              QTableWidget, QTableWidgetItem, QHeaderView)
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtGui import QGuiApplication, QColor, QBrush
 from bs4 import BeautifulSoup
+from models.template_manager import PRESET_COLOR_PALETTE, get_preset_color_info
 import csv
 import io
 import re
@@ -651,6 +652,24 @@ class TemplateConfigDialog(QDialog):
         
         layout.addLayout(btn_bottom_layout)
 
+    def _populate_color_combo(self, combo: QComboBox):
+        combo.blockSignals(True)
+        combo.clear()
+        for c in PRESET_COLOR_PALETTE:
+            idx = combo.count()
+            combo.addItem(c["label"], c["key"])
+            combo.setItemData(idx, QBrush(QColor(c["bg"])), Qt.ItemDataRole.BackgroundRole)
+            combo.setItemData(idx, QBrush(QColor(c["tag_fg"])), Qt.ItemDataRole.ForegroundRole)
+        combo.blockSignals(False)
+
+    def _format_preset_list_label(self, preset_dict: dict) -> str:
+        name = preset_dict.get("name", "未命名预设")
+        ck = (preset_dict.get("color") or "").strip()
+        if ck:
+            c_info = get_preset_color_info(ck)
+            return f"[{c_info['label']}] {name}"
+        return name
+
     def init_templates_tab(self):
         tab = QWidget()
         layout = QHBoxLayout(tab)
@@ -716,6 +735,14 @@ class TemplateConfigDialog(QDialog):
         right_layout.addWidget(QLabel("模板名称:"))
         self.txt_tpl_name = QLineEdit()
         right_layout.addWidget(self.txt_tpl_name)
+
+        tpl_color_row = QHBoxLayout()
+        tpl_color_row.addWidget(QLabel("🎨 卡片专属浅色 (在「批量选择预设」中单独应用该模板时的卡片底色):"))
+        self.cb_tpl_color = QComboBox()
+        self._populate_color_combo(self.cb_tpl_color)
+        self.cb_tpl_color.currentIndexChanged.connect(self._on_tpl_color_changed)
+        tpl_color_row.addWidget(self.cb_tpl_color, stretch=1)
+        right_layout.addLayout(tpl_color_row)
         
         right_layout.addWidget(QLabel("模板内容 (必须包含 {spanish_text} 和 {camera_motion} 占位符):"))
         self.txt_tpl_content = QTextEdit()
@@ -800,6 +827,14 @@ class TemplateConfigDialog(QDialog):
         right_layout.addWidget(QLabel("运镜预设名称:"))
         self.txt_motion_name = QLineEdit()
         right_layout.addWidget(self.txt_motion_name)
+
+        mot_color_row = QHBoxLayout()
+        mot_color_row.addWidget(QLabel("🎨 卡片专属浅色 (在「批量选择预设」中单独应用该运镜时的卡片底色):"))
+        self.cb_motion_color = QComboBox()
+        self._populate_color_combo(self.cb_motion_color)
+        self.cb_motion_color.currentIndexChanged.connect(self._on_motion_color_changed)
+        mot_color_row.addWidget(self.cb_motion_color, stretch=1)
+        right_layout.addLayout(mot_color_row)
         
         right_layout.addWidget(QLabel("运镜描述内容:"))
         self.txt_motion_content = QTextEdit()
@@ -953,13 +988,13 @@ class TemplateConfigDialog(QDialog):
         # Load templates
         self.list_templates.clear()
         for t in self.tm.templates:
-            item = self._create_draggable_item(t["name"], t["id"])
+            item = self._create_draggable_item(self._format_preset_list_label(t), t["id"])
             self.list_templates.addItem(item)
             
         # Load motions
         self.list_motions.clear()
         for m in self.tm.motions:
-            item = self._create_draggable_item(m["name"], m["id"])
+            item = self._create_draggable_item(self._format_preset_list_label(m), m["id"])
             self.list_motions.addItem(item)
 
         # Select first items by default
@@ -967,6 +1002,34 @@ class TemplateConfigDialog(QDialog):
             self.list_templates.setCurrentRow(0)
         if self.list_motions.count() > 0:
             self.list_motions.setCurrentRow(0)
+
+    def _on_tpl_color_changed(self, _idx):
+        row = self.list_templates.currentRow()
+        if row < 0:
+            return
+        item = self.list_templates.item(row)
+        tpl_id = item.data(Qt.ItemDataRole.UserRole)
+        color_key = self.cb_tpl_color.currentData() or ""
+        for t in self.tm.templates:
+            if t["id"] == tpl_id:
+                t["color"] = color_key
+                item.setText(self._format_preset_list_label(t))
+                self.tm.save_templates()
+                break
+
+    def _on_motion_color_changed(self, _idx):
+        row = self.list_motions.currentRow()
+        if row < 0:
+            return
+        item = self.list_motions.item(row)
+        motion_id = item.data(Qt.ItemDataRole.UserRole)
+        color_key = self.cb_motion_color.currentData() or ""
+        for m in self.tm.motions:
+            if m["id"] == motion_id:
+                m["color"] = color_key
+                item.setText(self._format_preset_list_label(m))
+                self.tm.save_motions()
+                break
 
     # --- Template Handlers ---
     def on_template_selected(self, row):
@@ -981,19 +1044,26 @@ class TemplateConfigDialog(QDialog):
         if tpl:
             self.txt_tpl_name.setText(tpl["name"])
             self.txt_tpl_content.setText(tpl["content"])
+            if hasattr(self, "cb_tpl_color"):
+                self.cb_tpl_color.blockSignals(True)
+                ck = (tpl.get("color") or "").strip()
+                c_idx = self.cb_tpl_color.findData(ck)
+                self.cb_tpl_color.setCurrentIndex(c_idx if c_idx >= 0 else 0)
+                self.cb_tpl_color.blockSignals(False)
 
     def new_template(self):
         new_id = f"tpl_{uuid.uuid4().hex[:8]}"
         new_tpl = {
             "id": new_id,
             "name": "未命名提示词模板",
-            "content": "这里是您的提示词模板，包含占位符 {spanish_text} 和 {camera_motion}。"
+            "content": "这里是您的提示词模板，包含占位符 {spanish_text} 和 {camera_motion}。",
+            "color": ""
         }
         self.tm.templates.append(new_tpl)
         self.tm.save_templates()
         
         # Add to list
-        item = self._create_draggable_item(new_tpl["name"], new_id)
+        item = self._create_draggable_item(self._format_preset_list_label(new_tpl), new_id)
         self.list_templates.addItem(item)
         self.list_templates.setCurrentItem(item)
         self.txt_tpl_name.setFocus()
@@ -1020,6 +1090,7 @@ class TemplateConfigDialog(QDialog):
             
         name = self.txt_tpl_name.text().strip()
         content = self.txt_tpl_content.toPlainText().strip()
+        color_key = self.cb_tpl_color.currentData() if hasattr(self, "cb_tpl_color") else ""
         
         if not name:
             QMessageBox.warning(self, "错误", "模板名称不能为空。")
@@ -1033,16 +1104,22 @@ class TemplateConfigDialog(QDialog):
         tpl_id = item.data(Qt.ItemDataRole.UserRole)
         
         # Update model
+        target_tpl = None
         for t in self.tm.templates:
             if t["id"] == tpl_id:
                 t["name"] = name
                 t["content"] = content
+                t["color"] = color_key or ""
+                target_tpl = t
                 break
                 
         # Save to file
         if self.tm.save_templates():
             # Update list display name
-            item.setText(name)
+            if target_tpl:
+                item.setText(self._format_preset_list_label(target_tpl))
+            else:
+                item.setText(name)
             QMessageBox.information(self, "成功", "提示词模板保存成功！")
         else:
             QMessageBox.critical(self, "错误", "模板保存失败。")
@@ -1060,18 +1137,25 @@ class TemplateConfigDialog(QDialog):
         if motion:
             self.txt_motion_name.setText(motion["name"])
             self.txt_motion_content.setText(motion["content"])
+            if hasattr(self, "cb_motion_color"):
+                self.cb_motion_color.blockSignals(True)
+                ck = (motion.get("color") or "").strip()
+                c_idx = self.cb_motion_color.findData(ck)
+                self.cb_motion_color.setCurrentIndex(c_idx if c_idx >= 0 else 0)
+                self.cb_motion_color.blockSignals(False)
 
     def new_motion(self):
         new_id = f"motion_{uuid.uuid4().hex[:8]}"
         new_mot = {
             "id": new_id,
             "name": "未命名运镜预设",
-            "content": "运镜细节描述文本"
+            "content": "运镜细节描述文本",
+            "color": ""
         }
         self.tm.motions.append(new_mot)
         self.tm.save_motions()
         
-        item = self._create_draggable_item(new_mot["name"], new_id)
+        item = self._create_draggable_item(self._format_preset_list_label(new_mot), new_id)
         self.list_motions.addItem(item)
         self.list_motions.setCurrentItem(item)
         self.txt_motion_name.setFocus()
@@ -1098,6 +1182,7 @@ class TemplateConfigDialog(QDialog):
             
         name = self.txt_motion_name.text().strip()
         content = self.txt_motion_content.toPlainText().strip()
+        color_key = self.cb_motion_color.currentData() if hasattr(self, "cb_motion_color") else ""
         
         if not name:
             QMessageBox.warning(self, "错误", "预设名称不能为空。")
@@ -1106,14 +1191,20 @@ class TemplateConfigDialog(QDialog):
         item = self.list_motions.item(row)
         motion_id = item.data(Qt.ItemDataRole.UserRole)
         
+        target_mot = None
         for m in self.tm.motions:
             if m["id"] == motion_id:
                 m["name"] = name
                 m["content"] = content
+                m["color"] = color_key or ""
+                target_mot = m
                 break
                 
         if self.tm.save_motions():
-            item.setText(name)
+            if target_mot:
+                item.setText(self._format_preset_list_label(target_mot))
+            else:
+                item.setText(name)
             QMessageBox.information(self, "成功", "运镜预设保存成功！")
         else:
             QMessageBox.critical(self, "错误", "运镜保存失败。")
