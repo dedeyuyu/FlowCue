@@ -249,30 +249,127 @@ class TemplateManager:
             return False, f"导出失败: {e}"
 
     def import_all(self, import_path):
-        """Imports templates and motions from a single JSON file."""
+        """Imports templates and motions from a single JSON file by ADDING/MERGING without replacing existing presets."""
+        import uuid
         try:
             with open(import_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                
+
+            added_tpl = 0
+            added_mot = 0
+            added_bt = 0
+            skipped_dup = 0
+
             if "templates" in data and isinstance(data["templates"], list):
-                self.templates = data["templates"]
+                existing_ids = {str(t.get("id", "")).strip() for t in self.templates}
+                existing_pairs = {
+                    (str(t.get("name", "")).strip(), str(t.get("content", "")).strip())
+                    for t in self.templates
+                }
+                for item in data["templates"]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip()
+                    content = str(item.get("content", "")).strip()
+                    if not name and not content:
+                        continue
+                    if (name, content) in existing_pairs:
+                        skipped_dup += 1
+                        continue
+                    new_id = str(item.get("id", "")).strip()
+                    if not new_id or new_id in existing_ids:
+                        new_id = f"tpl_{uuid.uuid4().hex[:8]}"
+                    existing_ids.add(new_id)
+                    existing_pairs.add((name, content))
+                    self.templates.append({
+                        "id": new_id,
+                        "name": name or "导入提示词模板",
+                        "content": content,
+                    })
+                    added_tpl += 1
+
             if "motions" in data and isinstance(data["motions"], list):
-                self.motions = data["motions"]
-            if "batch_templates" in data and isinstance(data["batch_templates"], list):
-                self.batch_templates = data["batch_templates"]
-                for t in self.batch_templates:
-                    if "category" not in t:
-                        t["category"] = ""
-                self.save_batch_templates()
+                existing_ids = {str(m.get("id", "")).strip() for m in self.motions}
+                existing_pairs = {
+                    (str(m.get("name", "")).strip(), str(m.get("content", "")).strip())
+                    for m in self.motions
+                }
+                for item in data["motions"]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip()
+                    content = str(item.get("content", "")).strip()
+                    if not name and not content:
+                        continue
+                    if (name, content) in existing_pairs:
+                        skipped_dup += 1
+                        continue
+                    new_id = str(item.get("id", "")).strip()
+                    if not new_id or new_id in existing_ids:
+                        new_id = f"motion_{uuid.uuid4().hex[:8]}"
+                    existing_ids.add(new_id)
+                    existing_pairs.add((name, content))
+                    self.motions.append({
+                        "id": new_id,
+                        "name": name or "导入运镜预设",
+                        "content": content,
+                    })
+                    added_mot += 1
+
             if "batch_categories" in data and isinstance(data["batch_categories"], list):
-                self.batch_categories = [str(c).strip() for c in data["batch_categories"] if str(c).strip()]
+                for c in data["batch_categories"]:
+                    cat_str = str(c or "").strip()
+                    if cat_str and cat_str not in self.batch_categories:
+                        self.batch_categories.append(cat_str)
                 self.save_batch_categories()
-            else:
-                self._sync_categories_from_templates()
-                
+
+            if "batch_templates" in data and isinstance(data["batch_templates"], list):
+                existing_ids = {str(t.get("id", "")).strip() for t in self.batch_templates}
+                existing_triples = {
+                    (
+                        str(t.get("name", "")).strip(),
+                        str(t.get("content", "")).strip(),
+                        str(t.get("category", "")).strip(),
+                    )
+                    for t in self.batch_templates
+                }
+                for item in data["batch_templates"]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip()
+                    content = str(item.get("content", "")).strip()
+                    category = str(item.get("category", "") or "").strip()
+                    if not name and not content:
+                        continue
+                    if (name, content, category) in existing_triples:
+                        skipped_dup += 1
+                        continue
+                    new_id = str(item.get("id", "")).strip()
+                    if not new_id or new_id in existing_ids:
+                        new_id = f"bt-{uuid.uuid4().hex[:8]}"
+                    existing_ids.add(new_id)
+                    existing_triples.add((name, content, category))
+                    self.batch_templates.append({
+                        "id": new_id,
+                        "name": name or "导入批量模板",
+                        "content": content,
+                        "category": category,
+                    })
+                    added_bt += 1
+                self.save_batch_templates()
+
+            self._sync_categories_from_templates()
             self.save_templates()
             self.save_motions()
-            return True, "导入成功"
+            summary = (
+                f"已保留原有全部预设，并成功新增导入：\n"
+                f"• 提示词模板：{added_tpl} 条\n"
+                f"• 运镜预设：{added_mot} 条\n"
+                f"• 批量模板：{added_bt} 条"
+            )
+            if skipped_dup > 0:
+                summary += f"\n（自动跳过 {skipped_dup} 条完全相同的重复预设）"
+            return True, summary
         except Exception as e:
             return False, f"导入失败: {e}"
 

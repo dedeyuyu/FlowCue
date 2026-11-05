@@ -46,11 +46,30 @@ MIRROR_PREFIXES = [
 ]
 
 
+def _safe_is_dir(p) -> bool:
+    """Safely checks if p is an existing directory, catching all OSError (e.g. WinError 87 on invalid drives)."""
+    try:
+        return bool(p) and os.path.isdir(str(p))
+    except Exception:
+        return False
+
+
+def _safe_is_file(p) -> bool:
+    """Safely checks if p is an existing file, catching all OSError (e.g. WinError 87 on invalid drives)."""
+    try:
+        return bool(p) and os.path.isfile(str(p))
+    except Exception:
+        return False
+
+
 def get_runtime_base_dir() -> Path:
     """返回用户级永久运行时目录 (%LOCALAPPDATA%\\FlowCue\\runtime)，重装或升级软件绝不丢失"""
     local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
     base = Path(local_appdata) / "FlowCue" / "runtime"
-    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     return base
 
 
@@ -63,21 +82,76 @@ def get_runtime_videokit_dir() -> Path:
 
 
 def _is_valid_videokit_dir(p: Path) -> bool:
-    if not p or not p.is_dir():
+    try:
+        if not p or not _safe_is_dir(p):
+            return False
+        electron_exe = p / "node_modules" / "electron" / "dist" / "electron.exe"
+        index_html = p / "src" / "index.html"
+        main_js = p / "electron" / "main.js"
+        return _safe_is_file(electron_exe) and _safe_is_file(index_html) and _safe_is_file(main_js)
+    except Exception:
         return False
-    electron_exe = p / "node_modules" / "electron" / "dist" / "electron.exe"
-    index_html = p / "src" / "index.html"
-    main_js = p / "electron" / "main.js"
-    return electron_exe.is_file() and index_html.is_file() and main_js.is_file()
+
+
+def _iter_potential_runtime_roots() -> list[Path]:
+    """返回用户电脑上所有可能存放 runtime (ffmpeg / videokit) 的根目录（兼容 Local、Roaming、软件安装目录等）"""
+    roots = []
+    local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+    roaming_appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+
+    for base_str in (local_appdata, roaming_appdata):
+        if base_str:
+            b = Path(base_str)
+            roots.extend([
+                b / "FlowCue" / "runtime",
+                b / "FlowCue",
+                b / "videokit",
+                b / "Programs" / "FlowCue" / "runtime",
+                b / "Programs" / "FlowCue",
+            ])
+
+    if getattr(sys, "frozen", False):
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            roots.extend([
+                exe_dir / "runtime",
+                exe_dir / "vendor",
+                exe_dir,
+                exe_dir / "_internal" / "runtime",
+                exe_dir / "_internal" / "vendor",
+            ])
+        except Exception:
+            pass
+    else:
+        try:
+            code_root = Path(__file__).resolve().parent.parent
+            roots.extend([
+                code_root / "runtime",
+                code_root / "vendor",
+                code_root,
+                code_root.parent,
+            ])
+        except Exception:
+            pass
+
+    # 去重同时保持优先级顺序
+    unique_roots = []
+    seen = set()
+    for r in roots:
+        key = str(r).lower()
+        if key not in seen and _safe_is_dir(r):
+            seen.add(key)
+            unique_roots.append(r)
+    return unique_roots
 
 
 def get_videokit_root() -> str:
     """
     智能解析可用的 VideoKit 运行时根目录：
     1. 环境变量 FLOWCUE_VIDEOKIT_ROOT
-    2. 用户级永久运行时目录 %LOCALAPPDATA%\\FlowCue\\runtime\\videokit
-    3. 开发者本机目录 D:\\Antigravity\\videokit
-    4. 软件安装目录内嵌的 vendor/videokit（若有）
+    2. 用户级永久运行时目录 %LOCALAPPDATA%\\FlowCue\\runtime\\videokit（以及解压产生的一层或多层嵌套子目录）
+    3. %APPDATA%\\FlowCue、软件安装目录等同级或子目录
+    4. 开发者本机目录（仅在安全检测存在时使用，绝不在无 D 盘的电脑上抛出 WinError 87）
     若均未安装，默认返回 %LOCALAPPDATA%\\FlowCue\\runtime\\videokit（供自动安装器落盘）。
     """
     candidates = []
@@ -85,16 +159,37 @@ def get_videokit_root() -> str:
     if env_root:
         candidates.append(Path(env_root))
 
-    # 优先检查开发机目录或用户已安装的 runtime 目录
-    dev_dir = Path(r"D:\Antigravity\videokit")
     runtime_dir = get_runtime_videokit_dir()
-    candidates.extend([dev_dir, runtime_dir])
+    candidates.append(runtime_dir)
 
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        candidates.append(exe_dir / "vendor" / "videokit")
+    for root in _iter_potential_runtime_roots():
+        candidates.extend([
+            root / "videokit",
+            root / "videokit" / "videokit",
+            root / "FlowCue-VideoKit-Runtime-win64",
+            root / "FlowCue-VideoKit-Runtime-win64" / "videokit",
+            root / "videokit" / "FlowCue-VideoKit-Runtime-win64",
+            root,
+        ])
+        # 自动扫描一层子目录（防止用户手动右键“解压到当前文件夹/同名文件夹”导致多嵌套一层）
+        try:
+            for sub in root.iterdir():
+                if _safe_is_dir(sub) and ("videokit" in sub.name.lower() or "runtime" in sub.name.lower()):
+                    candidates.append(sub)
+                    candidates.append(sub / "videokit")
+        except Exception:
+            pass
 
+    # 仅在最后安全检查开发机目录（_is_valid_videokit_dir 内部使用 _safe_is_dir 捕获一切 WinError 87）
+    if not getattr(sys, "frozen", False):
+        candidates.append(Path(r"D:\Antigravity\videokit"))
+
+    seen = set()
     for c in candidates:
+        key = str(c).lower()
+        if key in seen:
+            continue
+        seen.add(key)
         if _is_valid_videokit_dir(c):
             return str(c)
 
@@ -120,20 +215,20 @@ def sync_ffmpeg_into_videokit_vendor():
         from services.ffmpeg_helper import FFmpegHelper
         ffmpeg_p = Path(FFmpegHelper.get_ffmpeg_path())
         ffprobe_p = Path(FFmpegHelper.get_ffprobe_path())
-        if not ffmpeg_p.is_file() or not ffprobe_p.is_file():
+        if not _safe_is_file(ffmpeg_p) or not _safe_is_file(ffprobe_p):
             return
 
-        vk_dir = get_runtime_videokit_dir()
-        if not vk_dir.is_dir():
+        vk_dir = Path(get_videokit_root())
+        if not _safe_is_dir(vk_dir):
             return
 
         target_bin = vk_dir / "vendor" / "windows" / "ffmpeg" / "bin"
         target_bin.mkdir(parents=True, exist_ok=True)
         for src_exe in (ffmpeg_p, ffprobe_p):
             dst_exe = target_bin / src_exe.name
-            if dst_exe.is_file() and dst_exe.stat().st_size == src_exe.stat().st_size:
+            if _safe_is_file(dst_exe) and dst_exe.stat().st_size == src_exe.stat().st_size:
                 continue
-            if dst_exe.exists():
+            if _safe_is_file(dst_exe):
                 try:
                     dst_exe.unlink()
                 except Exception:

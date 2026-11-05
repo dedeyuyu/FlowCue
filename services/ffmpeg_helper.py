@@ -20,6 +20,22 @@ from pathlib import Path
 _SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
+def _safe_is_file(p) -> bool:
+    """Safely checks if p is an existing file, catching all OSError (e.g. WinError 87 on invalid drives)."""
+    try:
+        return bool(p) and os.path.isfile(str(p))
+    except Exception:
+        return False
+
+
+def _safe_is_dir(p) -> bool:
+    """Safely checks if p is an existing directory, catching all OSError (e.g. WinError 87 on invalid drives)."""
+    try:
+        return bool(p) and os.path.isdir(str(p))
+    except Exception:
+        return False
+
+
 class FFmpegHelper:
     """Locates ffmpeg/ffprobe binaries and provides fast audio/video utilities."""
 
@@ -40,47 +56,110 @@ class FFmpegHelper:
         env_ffmpeg = os.environ.get("FFMPEG_PATH", "")
         if env_ffmpeg:
             p = Path(env_ffmpeg)
-            candidates.append(p.parent if p.is_file() else p)
+            candidates.append(p.parent if _safe_is_file(p) else p)
 
-        # 2. Permanent user-level auto-installed runtime (%LOCALAPPDATA%\FlowCue\runtime)
+        # 2. Permanent user-level auto-installed or manually extracted runtime
+        #    Supports %LOCALAPPDATA%\FlowCue\runtime, %LOCALAPPDATA%\FlowCue,
+        #    %APPDATA%\FlowCue\runtime, %APPDATA%\FlowCue, and nested folders after unzipping.
         local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
-        runtime_base = Path(local_appdata) / "FlowCue" / "runtime"
-        candidates.extend([
-            runtime_base / "ffmpeg" / "bin",
-            runtime_base / "ffmpeg",
-            runtime_base / "videokit" / "vendor" / "windows" / "ffmpeg" / "bin",
-            runtime_base / "videokit" / "vendor" / "ffmpeg" / "bin",
-        ])
+        roaming_appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+
+        search_roots = []
+        for base_str in (local_appdata, roaming_appdata):
+            if base_str:
+                b = Path(base_str)
+                search_roots.extend([
+                    b / "FlowCue" / "runtime",
+                    b / "FlowCue",
+                    b / "videokit",
+                    b / "Programs" / "FlowCue" / "runtime",
+                    b / "Programs" / "FlowCue",
+                ])
 
         # 3. Frozen PyInstaller bundle or FlowCue project vendor folder
         if getattr(sys, "frozen", False):
-            base_dir = Path(sys.executable).resolve().parent
+            try:
+                base_dir = Path(sys.executable).resolve().parent
+                search_roots.extend([
+                    base_dir / "runtime",
+                    base_dir / "vendor",
+                    base_dir,
+                    base_dir / "_internal" / "runtime",
+                    base_dir / "_internal" / "vendor",
+                ])
+            except Exception:
+                pass
+        else:
+            try:
+                code_root = Path(__file__).resolve().parent.parent
+                search_roots.extend([
+                    code_root / "runtime",
+                    code_root / "vendor",
+                    code_root,
+                ])
+            except Exception:
+                pass
+
+        for root in search_roots:
+            if not _safe_is_dir(root):
+                continue
             candidates.extend([
-                base_dir / "vendor" / "ffmpeg" / "bin",
-                base_dir / "vendor" / "windows" / "ffmpeg" / "bin",
-                base_dir / "ffmpeg" / "bin",
-                base_dir,
+                root / "ffmpeg" / "bin",
+                root / "ffmpeg",
+                root / "ffmpeg" / "ffmpeg" / "bin",
+                root / "ffmpeg" / "FlowCue-FFmpeg-win64" / "bin",
+                root / "FlowCue-FFmpeg-win64" / "bin",
+                root / "FlowCue-FFmpeg-win64",
+                root / "videokit" / "vendor" / "windows" / "ffmpeg" / "bin",
+                root / "videokit" / "vendor" / "ffmpeg" / "bin",
+                root / "windows" / "ffmpeg" / "bin",
+                root / "bin",
+                root,
             ])
-        code_root = Path(__file__).resolve().parent.parent
-        candidates.extend([
-            code_root / "vendor" / "ffmpeg" / "bin",
-            code_root / "vendor" / "windows" / "ffmpeg" / "bin",
-            # VideoKit shared vendor binary path on developer's machine
-            Path(r"D:\Antigravity\videokit\vendor\windows\ffmpeg\bin"),
-            code_root.parent.parent / "videokit" / "vendor" / "windows" / "ffmpeg" / "bin",
-        ])
+            # Scan 1 level of subdirectories for any folder containing 'ffmpeg' or 'videokit'
+            try:
+                for sub in root.iterdir():
+                    if not _safe_is_dir(sub):
+                        continue
+                    sname = sub.name.lower()
+                    if "ffmpeg" in sname:
+                        candidates.extend([
+                            sub / "bin",
+                            sub,
+                            sub / "ffmpeg" / "bin",
+                        ])
+                        try:
+                            for sub2 in sub.iterdir():
+                                if _safe_is_dir(sub2):
+                                    candidates.extend([sub2 / "bin", sub2])
+                        except Exception:
+                            pass
+                    elif "videokit" in sname:
+                        candidates.extend([
+                            sub / "vendor" / "windows" / "ffmpeg" / "bin",
+                            sub / "videokit" / "vendor" / "windows" / "ffmpeg" / "bin",
+                        ])
+            except Exception:
+                pass
+
+        # 4. Developer machine fallback (only when not frozen and safely checked)
+        if not getattr(sys, "frozen", False):
+            dev_vk_bin = Path(r"D:\Antigravity\videokit\vendor\windows\ffmpeg\bin")
+            if _safe_is_dir(dev_vk_bin):
+                candidates.append(dev_vk_bin)
+
         return candidates
 
     @classmethod
     def get_ffmpeg_path(cls) -> str:
         """Returns the path to ffmpeg executable."""
-        if cls._ffmpeg_path_cache and Path(cls._ffmpeg_path_cache).exists():
+        if cls._ffmpeg_path_cache and _safe_is_file(cls._ffmpeg_path_cache):
             return cls._ffmpeg_path_cache
 
         exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
         for d in cls._candidate_dirs():
             cand = d / exe_name
-            if cand.is_file():
+            if _safe_is_file(cand):
                 cls._ffmpeg_path_cache = str(cand)
                 return cls._ffmpeg_path_cache
 
@@ -94,13 +173,13 @@ class FFmpegHelper:
     @classmethod
     def get_ffprobe_path(cls) -> str:
         """Returns the path to ffprobe executable."""
-        if cls._ffprobe_path_cache and Path(cls._ffprobe_path_cache).exists():
+        if cls._ffprobe_path_cache and _safe_is_file(cls._ffprobe_path_cache):
             return cls._ffprobe_path_cache
 
         exe_name = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
         for d in cls._candidate_dirs():
             cand = d / exe_name
-            if cand.is_file():
+            if _safe_is_file(cand):
                 cls._ffprobe_path_cache = str(cand)
                 return cls._ffprobe_path_cache
 

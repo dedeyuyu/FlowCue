@@ -71,7 +71,7 @@ class VisualReviewTabWidget(QWidget):
     """
 
     project_review_updated = pyqtSignal(str)
-    VIDEOKIT_ROOT = r"D:\Antigravity\videokit"
+    VIDEOKIT_ROOT = ""
 
     def __init__(self, storage_manager=None, config_manager=None, parent=None):
         super().__init__(parent)
@@ -361,8 +361,11 @@ class VisualReviewTabWidget(QWidget):
             os.path.join(vk_root, "node_modules", "electron", "dist", "electron.exe"),
         ]
         for c in candidates:
-            if os.path.isfile(c):
-                return c
+            try:
+                if os.path.isfile(c):
+                    return c
+            except Exception:
+                pass
         return ""
 
     def _on_install_runtime_clicked(self):
@@ -376,15 +379,21 @@ class VisualReviewTabWidget(QWidget):
 
     def _get_bootstrap_script(self) -> str:
         candidates = []
-        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            candidates.append(os.path.join(sys._MEIPASS, "services", "reels_electron_bootstrap.js"))
+        if getattr(sys, "frozen", False):
+            if hasattr(sys, "_MEIPASS"):
+                candidates.append(os.path.join(sys._MEIPASS, "services", "reels_electron_bootstrap.js"))
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            candidates.append(os.path.join(exe_dir, "_internal", "services", "reels_electron_bootstrap.js"))
+            candidates.append(os.path.join(exe_dir, "services", "reels_electron_bootstrap.js"))
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         candidates.append(os.path.join(base_dir, "services", "reels_electron_bootstrap.js"))
-        candidates.append(r"D:\Antigravity\FlowCue\Flow口播工具\services\reels_electron_bootstrap.js")
         for c in candidates:
-            if os.path.isfile(c):
-                return c
-        return candidates[-1]
+            try:
+                if os.path.isfile(c):
+                    return c
+            except Exception:
+                pass
+        return candidates[0] if candidates else ""
 
     def ensure_engine_started(self):
         if self._is_process_alive():

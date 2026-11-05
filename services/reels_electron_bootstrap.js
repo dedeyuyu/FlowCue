@@ -16,16 +16,35 @@ const dgram = require('dgram');
 const fs = require('fs');
 const path = require('path');
 
+function safeExistsSync(p) {
+    try {
+        return Boolean(p) && fs.existsSync(p);
+    } catch (_) {
+        return false;
+    }
+}
+
 function resolveDefaultVideokitRoot() {
-    if (process.env.VIDEOKIT_ROOT && fs.existsSync(process.env.VIDEOKIT_ROOT)) {
+    if (process.env.VIDEOKIT_ROOT && safeExistsSync(process.env.VIDEOKIT_ROOT)) {
         return process.env.VIDEOKIT_ROOT;
     }
     const localAppData = process.env.LOCALAPPDATA || path.join(app.getPath('home'), 'AppData', 'Local');
-    const runtimeVk = path.join(localAppData, 'FlowCue', 'runtime', 'videokit');
-    if (fs.existsSync(path.join(runtimeVk, 'src', 'index.html'))) {
-        return runtimeVk;
+    const roamingAppData = process.env.APPDATA || path.join(app.getPath('home'), 'AppData', 'Roaming');
+    const cands = [
+        path.join(localAppData, 'FlowCue', 'runtime', 'videokit'),
+        path.join(localAppData, 'FlowCue', 'runtime', 'videokit', 'videokit'),
+        path.join(localAppData, 'FlowCue', 'runtime', 'FlowCue-VideoKit-Runtime-win64'),
+        path.join(localAppData, 'FlowCue', 'videokit'),
+        path.join(roamingAppData, 'FlowCue', 'runtime', 'videokit'),
+        path.join(roamingAppData, 'FlowCue', 'videokit'),
+        process.cwd(),
+    ];
+    for (const c of cands) {
+        if (safeExistsSync(path.join(c, 'src', 'index.html'))) {
+            return c;
+        }
     }
-    return 'D:\\Antigravity\\videokit';
+    return path.join(localAppData, 'FlowCue', 'runtime', 'videokit');
 }
 
 const VIDEOKIT_ROOT = resolveDefaultVideokitRoot();

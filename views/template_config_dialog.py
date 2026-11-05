@@ -94,8 +94,8 @@ class TableTemplateImportDialog(QDialog):
         ctrl_row.addStretch()
         ctrl_row.addWidget(QLabel("重名处理:"))
         self.cb_dup_mode = QComboBox()
-        self.cb_dup_mode.addItem("🔄 同名更新覆盖，新名称追加 (推荐)", "upsert")
-        self.cb_dup_mode.addItem("➕ 全部作为新预设追加", "append")
+        self.cb_dup_mode.addItem("➕ 保留原有预设，全部作为新预设追加 (推荐)", "append")
+        self.cb_dup_mode.addItem("🔄 同名更新覆盖，新名称追加", "upsert")
         ctrl_row.addWidget(self.cb_dup_mode)
         layout.addLayout(ctrl_row)
 
@@ -1157,24 +1157,17 @@ class TemplateConfigDialog(QDialog):
                 QMessageBox.critical(self, "导出失败", msg)
 
     def import_config(self):
-        """Imports both templates and motions from a selected JSON file."""
+        """Imports templates and motions from a selected JSON file by merging/adding without replacing existing presets."""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "导入模板与运镜配置", "", "JSON Files (*.json)"
+            self, "导入模板与运镜配置（保留原有预设并新增）", "", "JSON Files (*.json)"
         )
         if file_path:
-            reply = QMessageBox.question(
-                self, "确认导入",
-                "导入配置将会覆盖当前的模板和运镜设置，是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                success, msg = self.tm.import_all(file_path)
-                if success:
-                    self.load_data()  # Refresh UI
-                    QMessageBox.information(self, "导入成功", "模板与运镜配置已成功导入！")
-                else:
-                    QMessageBox.critical(self, "导入失败", msg)
+            success, msg = self.tm.import_all(file_path)
+            if success:
+                self.load_data()  # Refresh UI
+                QMessageBox.information(self, "导入成功", msg)
+            else:
+                QMessageBox.critical(self, "导入失败", msg)
 
     def init_batch_templates_tab(self):
         tab = QWidget()
