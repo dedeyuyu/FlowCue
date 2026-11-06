@@ -36,6 +36,8 @@ class ConfigManager:
         ("fr", "法语 (French)"),
         ("de", "德语 (German)"),
         ("it", "意大利语 (Italian)"),
+        ("ro", "罗马尼亚语 (Romanian)"),
+        ("el", "希腊语 (Greek)"),
         ("ja", "日语 (Japanese)"),
         ("ko", "韩语 (Korean)"),
         ("ar", "阿拉伯语 (Arabic)"),

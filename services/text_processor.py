@@ -62,7 +62,7 @@ class TextProcessor:
             text = re.sub(r' +([।॥,?!;])', r'\1', text)
             text = re.sub(r'([।॥]+)(?=[^\s।॥])', r'\1 ', text)
         else:
-            text = re.sub(r' +([.,?!;])', r'\1', text)
+            text = re.sub(r' +([.,?!;\u037e])', r'\1', text)
             
         # 6. Clean up spacing
         text = re.sub(r' +', ' ', text)
@@ -84,7 +84,7 @@ class TextProcessor:
         if not text:
             return [], []
         is_nepali = (language == "ne")
-        sent_endings = ('।', '॥', '!', '?', ';', '…') if is_nepali else ('.', '!', '?', ';', '…')
+        sent_endings = ('।', '॥', '!', '?', ';', '…') if is_nepali else ('.', '!', '?', ';', '\u037e', '…')
         raw_tokens = text.split()
         words = []
         break_types = []

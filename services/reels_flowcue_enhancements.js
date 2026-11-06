@@ -532,6 +532,89 @@
     // 2. 数字框（含进度条后面的数字框、字幕/覆层/内容视频数字框）在鼠标单击确认聚焦后，滚动鼠标滚轮直接上下调整数值！
     // 3. 只调整「已聚焦 且 鼠标正悬停在其上」的那个数字框：鼠标在其他位置（包括其他未聚焦的数字框）滚动时
     //    不拦截滚轮，面板正常滚动，绝不改动任何其他字段（修复：位置X/位置Y 上滚动时「不透明」也跟着变）。
+    // 智能分级计算鼠标滚轮步长（+10 / +3 / +1）：
+    // - 调整 1 几乎没啥变化的大数值参数（X/Y坐标位置、宽高尺寸、缩放%、移动速度等） → 每次滚轮 ±10
+    // - 调整 1 变化不大的中等数值参数（字号/字体大小、边距、圆角、间距、旋转、透明度等） → 每次滚轮 ±3
+    // - 整体较小、调整 1 就有明显变化的参数（描边粗细、边框粗细、阴影、字间距、行距等） → 每次滚轮 ±1（时间秒数保持小数步长）
+    function findLabelTextForInput(el, pairedRange) {
+        if (!el) return '';
+        const parts = [];
+        if (el.title) parts.push(el.title);
+        if (pairedRange && pairedRange.title) parts.push(pairedRange.title);
+        const checkPrevLabel = (node) => {
+            if (!node) return;
+            let prev = node.previousElementSibling;
+            if (prev && prev.tagName === 'LABEL') {
+                parts.push(prev.textContent || '');
+            } else if (node.parentElement) {
+                const pPrev = node.parentElement.previousElementSibling;
+                if (pPrev && pPrev.tagName === 'LABEL') {
+                    parts.push(pPrev.textContent || '');
+                }
+                const inParentLbl = node.parentElement.querySelector('label');
+                if (inParentLbl) parts.push(inParentLbl.textContent || '');
+            }
+        };
+        checkPrevLabel(el);
+        if (pairedRange) checkPrevLabel(pairedRange);
+        return parts.join(' ').trim();
+    }
+
+    function getSmartWheelStep(active, pairedRange) {
+        const rawId = String(active.id || active.getAttribute('data-link') || pairedRange?.id || '').toLowerCase();
+        const baseId = rawId.replace(/(-val-num|-num|-val|-range)$/i, '');
+        const labelTxt = findLabelTextForInput(active, pairedRange);
+        const combined = `${baseId} ${labelTxt}`.toLowerCase();
+
+        // 0. 内容视频专属 X/Y 若有步长选择器则优先遵循，默认 10
+        if (baseId === 'reels-cv-x' || baseId === 'reels-cv-y' || rawId === 'reels-cv-x-val' || rawId === 'reels-cv-y-val') {
+            const stepSel = document.getElementById('reels-cv-step');
+            return parseFloat(stepSel?.value || '10') || 10;
+        }
+
+        // 1. 时间/秒数/倍速等小数参数：保持原有的精细小数步长（如 0.1s / 0.05s）
+        const isStrokeOrShadow = /(stroke-width|border-width|deco-thickness|shadow-blur|shadow-x|shadow-y|shadow-offset|描边|边框粗细|阴影)/i.test(combined);
+        if (!isStrokeOrShadow) {
+            const isTimeOrRate = /(^|-)(start|end|dur|duration|lead|trim|video-offset|transition-duration|flipper-duration|speed-rate|rate|delay|interval)($|-)/i.test(baseId) ||
+                /(开始|结束|时长|秒|\(s\)|提前完成|切换间隔|起始秒)/i.test(labelTxt);
+            if (isTimeOrRate) {
+                const attrStep = parseFloat(active.step) || (pairedRange ? parseFloat(pairedRange.step) : NaN);
+                if (Number.isFinite(attrStep) && attrStep > 0 && attrStep < 1) return attrStep;
+                return 0.1;
+            }
+        }
+
+        // 2. 第一档（±1）：整体较小、调整 1 就有明显变化的参数（如描边粗细、边框粗细、阴影模糊/偏移、字间距、行距、行数等）
+        if (isStrokeOrShadow ||
+            /(letterspacing|linespacing|letter-spacing|line-spacing|max-lines|flipper-lines|max-words|max-chars|字符间距|字间距|字距|行距|行间距|缩放行|每组显示|每行)/i.test(combined)) {
+            return 1;
+        }
+
+        // 3. 第三档（±10）：调整 1 几乎没啥变化的大数值参数（X/Y轴位置与坐标偏移、宽高尺寸、长度、缩放%、移动速度等）
+        if (/(^|-)(x|y|w|h|width|height|max-height|maxh|textw|override-w|override-h|card-x|card-y|card-width|card-height|offset-x|offset-y|from-x|from-y|to-x|to-y|start-x|start-y|end-x|end-y|final-y|start-offset|title-x|title-y|brush-x|brush-y|brush-w|brush-h|clamp-min-y|clamp-max-y|pos-x|pos-y|margin-v|sub-y|wm-x|wm-y|deco-length|scale|start-scale|end-scale|anim-speed|scroll-speed|glow-radius)($|-)/i.test(baseId) ||
+            /(位置x|位置y|坐标|x偏移|y偏移|起点|终点|横向位置|纵向位置|垂直边距|宽度|高度|最大高度|最大高|边界高|笔刷宽|笔刷高|裁切x|裁切y|裁切宽|裁切高|换行宽|长度|缩放|移动速度|滚动速度|发光半径)/i.test(labelTxt)) {
+            return 10;
+        }
+
+        // 4. 第二档（±3）：调整 1 变化不大的中等数值参数（字体大小/字号、边距/内距、间距、圆角、旋转、不透明度/透明度、模糊强度、羽化等）
+        if (/(fontsize|font-size|min-fontsize|pad-top|pad-bottom|pad-left|pad-right|pad-h|padding|gap|radius|rotation|rotate|opacity|blur-amount|feather|solid|title-ratio|voicevol|bgmvol|volume)/i.test(baseId) ||
+            /(字号|字体大小|最小字号|边距|内距|内边距|间距|距离|圆角|旋转|不透明|透明|模糊强度|羽化|实心度|标题宽度%|音量)/i.test(labelTxt)) {
+            return 3;
+        }
+
+        // 5. 兜底规则：按控件的数值跨度 (max - min) 自动归入 10 / 3 / 1 三档
+        let minV = parseFloat(active.min);
+        if (Number.isNaN(minV) && pairedRange) minV = parseFloat(pairedRange.min);
+        let maxV = parseFloat(active.max);
+        if (Number.isNaN(maxV) && pairedRange) maxV = parseFloat(pairedRange.max);
+        if (Number.isFinite(minV) && Number.isFinite(maxV)) {
+            const span = Math.abs(maxV - minV);
+            if (span >= 300) return 10;
+            if (span >= 40) return 3;
+        }
+        return 1;
+    }
+
     window.addEventListener('wheel', (e) => {
         const target = e.target;
         const active = document.activeElement;
@@ -556,19 +639,7 @@
         e.stopPropagation();
 
         const pairedRange = findPairedRangeForNumberInput(active);
-        let rawStep = parseFloat(active.step);
-        if (Number.isNaN(rawStep) || rawStep <= 0) {
-            rawStep = pairedRange ? parseFloat(pairedRange.step) : NaN;
-        }
-        if (Number.isNaN(rawStep) || rawStep <= 0) {
-            if (active.id === 'reels-cv-x-val' || active.id === 'reels-cv-y-val') {
-                const stepSel = document.getElementById('reels-cv-step');
-                rawStep = parseFloat(stepSel?.value || '10') || 10;
-            } else {
-                const curStr = String(active.value || '');
-                rawStep = curStr.includes('.') ? 0.1 : 1;
-            }
-        }
+        const rawStep = getSmartWheelStep(active, pairedRange);
 
         // Shift 键 10 倍速调节，Alt 键 0.1 倍精细调节
         let step = rawStep;
@@ -1485,6 +1556,41 @@
             const rbtLangList = document.getElementById('rbt-lang-list');
             const mainLangSelect = document.getElementById('reels-align-lang');
 
+            // 确保批量Reels语言列表和下拉框包含罗马尼亚语 (ro) 和希腊语 (el)
+            const extraLangs = [
+                { code: 'ro', label: '罗马尼亚语 (ro)', shortLabel: '罗马尼亚语 (Romanian)' },
+                { code: 'el', label: '希腊语 (el)', shortLabel: '希腊语 (Greek)' },
+            ];
+            if (rbtLangList) {
+                extraLangs.forEach(({ code, label }) => {
+                    if (!rbtLangList.querySelector(`[data-lang="${code}"]`)) {
+                        const item = document.createElement('div');
+                        item.className = 'rbt-lang-item';
+                        item.setAttribute('data-lang', code);
+                        item.style.cssText = 'padding:5px 10px;cursor:pointer;font-size:12px;color:#eee;';
+                        item.textContent = label;
+                        item.addEventListener('click', () => {
+                            if (rbtLangInput) rbtLangInput.value = code;
+                            if (rbtLangBtn) rbtLangBtn.textContent = `${label} ▾`;
+                            rbtLangList.style.display = 'none';
+                            localStorage.setItem('reels_align_language', code);
+                            schedulePresetBackupToDisk(60);
+                        });
+                        rbtLangList.appendChild(item);
+                    }
+                });
+            }
+            if (mainLangSelect) {
+                extraLangs.forEach(({ code, shortLabel }) => {
+                    if (!Array.from(mainLangSelect.options || []).some(o => o.value === code)) {
+                        const opt = document.createElement('option');
+                        opt.value = code;
+                        opt.textContent = shortLabel;
+                        mainLangSelect.appendChild(opt);
+                    }
+                });
+            }
+
             if (savedLang) {
                 if (rbtLangInput && rbtLangInput.value !== savedLang) {
                     rbtLangInput.value = savedLang;
@@ -1628,11 +1734,426 @@
 
     const origSetItem = Storage.prototype.setItem;
     Storage.prototype.setItem = function (key, value) {
-        origSetItem.call(this, key, value);
+        try {
+            origSetItem.call(this, key, value);
+        } catch (err) {
+            // 当覆层预设因包含大量 base64 缩略图而超出 localStorage 5MB 配额时，自动剥离缩略图重试，绝不让保存/更新静默失败！
+            if (String(key) === 'reels_overlay_group_presets' && typeof value === 'string') {
+                try {
+                    const parsed = JSON.parse(value);
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                        const slim = {};
+                        for (const [k, v] of Object.entries(parsed)) {
+                            if (v && typeof v === 'object' && !Array.isArray(v)) {
+                                const copy = { ...v };
+                                delete copy.thumbnail;
+                                slim[k] = copy;
+                            } else {
+                                slim[k] = v;
+                            }
+                        }
+                        origSetItem.call(this, key, JSON.stringify(slim));
+                    }
+                } catch (_) {
+                    throw err;
+                }
+            } else {
+                throw err;
+            }
+        }
         if (PRESET_STORAGE_KEYS.includes(String(key))) {
             schedulePresetBackupToDisk();
         }
     };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 5B. 修复覆层预设点击「更新」后未保存或下次选择仍回退旧预设的问题
+    // ═══════════════════════════════════════════════════════════════════════
+    function syncUpdatedPresetToMatchingTasks(presetName, serializedLayers, activeTaskRef = null) {
+        try {
+            const tasks = window._reelsState?.tasks;
+            if (!Array.isArray(tasks) || !Array.isArray(serializedLayers) || !presetName) return 0;
+            let syncedCount = 0;
+            tasks.forEach((task) => {
+                if (!task || task === activeTaskRef) return;
+                if (task._overlayPresetName !== presetName) return;
+                const oldOverlays = Array.isArray(task.overlays) ? task.overlays : [];
+                const oldTextByType = new Map();
+                const usedOld = new Set();
+                const extractText = (ov) => {
+                    if (!ov || typeof ov !== 'object') return null;
+                    const t = {};
+                    let has = false;
+                    ['title_text', 'body_text', 'footer_text', 'content', 'scroll_title'].forEach((k) => {
+                        if (typeof ov[k] === 'string' && ov[k].length > 0) {
+                            t[k] = ov[k];
+                            has = true;
+                        }
+                    });
+                    return has ? t : null;
+                };
+                oldOverlays.forEach((ov) => {
+                    const d = extractText(ov);
+                    if (!d) return;
+                    const tp = ov.type || 'unknown';
+                    if (!oldTextByType.has(tp)) oldTextByType.set(tp, []);
+                    oldTextByType.get(tp).push({ ov, d });
+                });
+                const nextText = (tp) => {
+                    const list = oldTextByType.get(tp);
+                    if (list) {
+                        for (const item of list) {
+                            if (!usedOld.has(item.ov)) {
+                                usedOld.add(item.ov);
+                                return item.d;
+                            }
+                        }
+                    }
+                    return null;
+                };
+                const idMap = {};
+                const nextOverlays = serializedLayers.map((layer, i) => {
+                    const clone = JSON.parse(JSON.stringify(layer));
+                    const oldId = clone.id;
+                    clone.id = 'ov_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+                    if (oldId) idMap[oldId] = clone.id;
+                    if (!clone.fixed_text) {
+                        const indexedOv = oldOverlays[i];
+                        let tData = null;
+                        if (indexedOv && !usedOld.has(indexedOv) && indexedOv.type === clone.type) {
+                            tData = extractText(indexedOv);
+                            if (tData) usedOld.add(indexedOv);
+                        }
+                        if (!tData) tData = nextText(clone.type);
+                        if (tData) {
+                            Object.assign(clone, tData);
+                        }
+                    }
+                    return clone;
+                });
+                const firstScroll = nextOverlays.find(o => o.type === 'scroll');
+                nextOverlays.forEach((ov) => {
+                    if (ov.bind_scroll_overlay_id) {
+                        if (idMap[ov.bind_scroll_overlay_id]) {
+                            ov.bind_scroll_overlay_id = idMap[ov.bind_scroll_overlay_id];
+                        } else if (firstScroll) {
+                            ov.bind_scroll_overlay_id = firstScroll.id;
+                        }
+                    }
+                });
+                task.overlays = nextOverlays;
+                syncedCount++;
+            });
+            return syncedCount;
+        } catch (e) {
+            console.warn('[FlowCue] syncUpdatedPresetToMatchingTasks error:', e);
+            return 0;
+        }
+    }
+
+    function installOverlayPresetUpdateFix() {
+        // 1. 防止 initBuiltinOverlayGroupPresets 在启动时把用户更新过的同名预设覆盖回初始内置参数
+        if (typeof window.initBuiltinOverlayGroupPresets === 'function' && !window.initBuiltinOverlayGroupPresets._flowcuePatched) {
+            const origInitBuiltin = window.initBuiltinOverlayGroupPresets;
+            const wrappedInitBuiltin = function () {
+                let userModifiedMap = {};
+                try {
+                    const existing = JSON.parse(localStorage.getItem('reels_overlay_group_presets') || '{}');
+                    for (const [k, v] of Object.entries(existing)) {
+                        if (v && typeof v === 'object' && !Array.isArray(v) && (v.meta?.userModified || v.updatedAt)) {
+                            userModifiedMap[k] = v;
+                        }
+                    }
+                } catch (_) {}
+                const res = origInitBuiltin.apply(this, arguments);
+                try {
+                    if (Object.keys(userModifiedMap).length > 0) {
+                        const after = JSON.parse(localStorage.getItem('reels_overlay_group_presets') || '{}');
+                        let restored = false;
+                        for (const [k, savedVal] of Object.entries(userModifiedMap)) {
+                            after[k] = savedVal;
+                            if (window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS && window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS[k] && Array.isArray(savedVal.layers)) {
+                                window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS[k] = savedVal.layers;
+                            }
+                            restored = true;
+                        }
+                        if (restored) {
+                            localStorage.setItem('reels_overlay_group_presets', JSON.stringify(after));
+                        }
+                    }
+                } catch (_) {}
+                return res;
+            };
+            wrappedInitBuiltin._flowcuePatched = true;
+            window.initBuiltinOverlayGroupPresets = wrappedInitBuiltin;
+        }
+
+        // 2. 同步内存中的 REELS_BUILTIN_OVERLAY_GROUP_PRESETS 与用户已修改的预设，确保任何地方读取都能拿到最新更新的预设
+        try {
+            if (window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS) {
+                const stored = JSON.parse(localStorage.getItem('reels_overlay_group_presets') || '{}');
+                for (const [k, v] of Object.entries(stored)) {
+                    if (v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.layers) && (v.meta?.userModified || v.updatedAt)) {
+                        if (window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS[k]) {
+                            window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS[k] = v.layers;
+                        }
+                    }
+                }
+            }
+        } catch (_) {}
+
+        // 3. 钩住 reelsSelectTask：切换任务时自动将右侧「覆层组预设」下拉框同步为当前任务的 _overlayPresetName
+        if (typeof window.reelsSelectTask === 'function' && !window.reelsSelectTask._flowcuePresetSyncWrapped) {
+            const origSelectTask = window.reelsSelectTask;
+            const wrappedSelectTask = function (idx) {
+                const res = origSelectTask.apply(this, arguments);
+                try {
+                    const task = window._reelsState?.tasks?.[idx];
+                    const panel = window._reelsState?.overlayPanel;
+                    const select = document.querySelector('#rop-group-preset-select');
+                    const presetName = task?._overlayPresetName || '';
+                    if (panel) panel._activePresetName = presetName;
+                    if (select) {
+                        if (presetName && !Array.from(select.options || []).some(o => o.value === presetName)) {
+                            panel?._refreshOverlayGroupPresetSelect?.();
+                        }
+                        select.value = presetName;
+                    }
+                } catch (_) {}
+                return res;
+            };
+            wrappedSelectTask._flowcuePresetSyncWrapped = true;
+            window.reelsSelectTask = wrappedSelectTask;
+            try { reelsSelectTask = wrappedSelectTask; } catch (_) {}
+        }
+
+        // 4. 增强 ReelsOverlayPanel 原型与实例方法
+        const PanelProto = window.ReelsOverlayPanel?.prototype || (window._reelsState?.overlayPanel ? Object.getPrototypeOf(window._reelsState.overlayPanel) : null);
+        if (PanelProto && !PanelProto._flowcuePresetUpdatePatched) {
+            PanelProto._flowcuePresetUpdatePatched = true;
+
+            // (a) _loadOverlayGroupPreset：加载预设后同步任务引用与 _overlayPresetName
+            const origLoadPreset = PanelProto._loadOverlayGroupPreset;
+            if (typeof origLoadPreset === 'function') {
+                PanelProto._loadOverlayGroupPreset = async function (specificMode = null) {
+                    const select = this.container?.querySelector('#rop-group-preset-select') || document.querySelector('#rop-group-preset-select');
+                    const chosenName = select ? select.value : '';
+                    const res = await origLoadPreset.call(this, specificMode);
+                    if (chosenName) {
+                        this._activePresetName = chosenName;
+                        if (select) select.value = chosenName;
+                        if (!this.videoCanvas?.scopedTask && window._reelsState) {
+                            const task = window._reelsState.tasks?.[window._reelsState.selectedIdx];
+                            if (task) {
+                                task._overlayPresetName = chosenName;
+                                if (typeof window._syncCurrentOverlayEditorToSelectedTask === 'function') {
+                                    window._syncCurrentOverlayEditorToSelectedTask();
+                                } else if (this.videoCanvas?.overlayMgr?.overlays) {
+                                    task.overlays = this.videoCanvas.overlayMgr.overlays;
+                                }
+                                if (typeof window._batchAutoSave === 'function') window._batchAutoSave();
+                            }
+                        }
+                    }
+                    return res;
+                };
+            }
+
+            // (b) _applyPresetFromGallery：从预设库选择应用预设后，必须同步下拉框选中项与当前任务 overlays 引用
+            const origApplyFromGallery = PanelProto._applyPresetFromGallery;
+            if (typeof origApplyFromGallery === 'function') {
+                PanelProto._applyPresetFromGallery = async function (presetData, mode, presetName = '') {
+                    const resolvedName = presetName || presetData?.name || '';
+                    const ok = await origApplyFromGallery.call(this, presetData, mode, resolvedName);
+                    if (ok && resolvedName) {
+                        this._activePresetName = resolvedName;
+                        const select = this.container?.querySelector('#rop-group-preset-select') || document.querySelector('#rop-group-preset-select');
+                        if (select) {
+                            if (!Array.from(select.options || []).some(o => o.value === resolvedName)) {
+                                this._refreshOverlayGroupPresetSelect?.();
+                            }
+                            select.value = resolvedName;
+                        }
+                        if (!this.videoCanvas?.scopedTask && window._reelsState) {
+                            const task = window._reelsState.tasks?.[window._reelsState.selectedIdx];
+                            if (task) {
+                                task._overlayPresetName = resolvedName;
+                                if (typeof window._syncCurrentOverlayEditorToSelectedTask === 'function') {
+                                    window._syncCurrentOverlayEditorToSelectedTask();
+                                } else if (this.videoCanvas?.overlayMgr?.overlays) {
+                                    task.overlays = this.videoCanvas.overlayMgr.overlays;
+                                }
+                                if (typeof window._batchAutoSave === 'function') window._batchAutoSave();
+                            }
+                        }
+                    }
+                    return ok;
+                };
+            }
+
+            // (c) _updateOverlayGroupPreset：支持直接覆盖更新任何已选预设（含内置预设及预设库加载的预设）
+            PanelProto._updateOverlayGroupPreset = async function () {
+                const select = this.container?.querySelector('#rop-group-preset-select') || document.querySelector('#rop-group-preset-select');
+                const activeTask = (!this.videoCanvas?.scopedTask && window._reelsState)
+                    ? window._reelsState.tasks?.[window._reelsState.selectedIdx]
+                    : null;
+                const name = (select && select.value) || this._activePresetName || activeTask?._overlayPresetName || '';
+                if (!name) {
+                    alert('请先在「覆层组预设」下拉框或预设库中选择一个预设，再点击更新');
+                    return;
+                }
+                if (select && select.value !== name) {
+                    select.value = name;
+                }
+                if (!confirm(`确定要使用当前画布的图层覆盖更新预设 "${name}" 吗？`)) {
+                    return;
+                }
+                await this._executeSavePreset(name, true);
+            };
+
+            // (c2) _syncToOverlay：当覆层含单段 display_ranges 时，面板修改起止时间同步更新 display_ranges[0]
+            const origSyncToOverlay = PanelProto._syncToOverlay;
+            if (typeof origSyncToOverlay === 'function') {
+                PanelProto._syncToOverlay = function () {
+                    const res = origSyncToOverlay.apply(this, arguments);
+                    try {
+                        const ov = this._selectedOv;
+                        if (ov && Array.isArray(ov.display_ranges) && ov.display_ranges.length === 1) {
+                            const s = Number(ov.start);
+                            const e = Number(ov.end);
+                            if (Number.isFinite(s)) ov.display_ranges[0].start = s;
+                            if (Number.isFinite(e)) ov.display_ranges[0].end = e;
+                        }
+                    } catch (_) {}
+                    return res;
+                };
+            }
+
+            // (d) _executeSavePreset：保存/更新前先将面板输入框最新值同步到覆层对象，修复 local-media:// 媒体打包失败，并持久化 userModified 标记与立即双备份
+            const origExecuteSave = PanelProto._executeSavePreset;
+            if (typeof origExecuteSave === 'function') {
+                PanelProto._executeSavePreset = async function (name, isUpdate = false, category = '') {
+                    try {
+                        if (this._selectedOv && typeof this._syncToOverlay === 'function') {
+                            this._syncToOverlay();
+                        }
+                        if (!this.videoCanvas?.scopedTask && typeof window._syncCurrentOverlayEditorToSelectedTask === 'function') {
+                            window._syncCurrentOverlayEditorToSelectedTask();
+                        }
+                    } catch (_) {}
+
+                    // 更新已有预设时，若原预设已经是 linked（保留原路径），直接沿用 linked，避免二次弹窗或打包中断更新
+                    const existingPresetsBefore = this._getOverlayGroupPresets?.() || {};
+                    const existingMetaStorage = existingPresetsBefore[name]?.meta?.mediaStorage;
+                    const origDialog = this._showPresetMediaStorageDialog;
+                    if (isUpdate && (existingMetaStorage === 'linked' || existingMetaStorage === 'packaged')) {
+                        this._showPresetMediaStorageDialog = async () => existingMetaStorage;
+                    }
+
+                    // 包装 saveOverlayPresetAssets：将 local-media:// 转为标准 file://，且万一复制失败自动回退为保留原路径而不中断预设保存
+                    const api = window.electronAPI;
+                    const origSaveAssets = api?.saveOverlayPresetAssets;
+                    if (api && typeof origSaveAssets === 'function' && !origSaveAssets._flowcueSafeWrapped) {
+                        const safeSaveAssets = async function (presetObj) {
+                            try {
+                                const cloned = JSON.parse(JSON.stringify(presetObj || {}));
+                                if (Array.isArray(cloned.layers)) {
+                                    for (const layer of cloned.layers) {
+                                        if (layer && typeof layer.content === 'string' && /^local-media:\/\//i.test(layer.content)) {
+                                            const hashIdx = layer.content.indexOf('#');
+                                            const clean = hashIdx !== -1 ? layer.content.slice(0, hashIdx) : layer.content;
+                                            layer.content = clean.replace(/^local-media:/i, 'file:');
+                                        }
+                                    }
+                                }
+                                const r = await origSaveAssets.call(this, cloned);
+                                if (r && r.ok) return r;
+                                console.warn('[FlowCue] saveOverlayPresetAssets fallback to linked:', r?.error);
+                            } catch (err) {
+                                console.warn('[FlowCue] saveOverlayPresetAssets exception fallback to linked:', err);
+                            }
+                            const fallbackPreset = JSON.parse(JSON.stringify(presetObj || {}));
+                            fallbackPreset.meta = { ...(fallbackPreset.meta || {}), mediaStorage: 'linked', packagedMediaCount: 0 };
+                            return { ok: true, preset: fallbackPreset, copied: 0 };
+                        };
+                        safeSaveAssets._flowcueSafeWrapped = true;
+                        try { api.saveOverlayPresetAssets = safeSaveAssets; } catch (_) {}
+                    }
+
+                    try {
+                        await origExecuteSave.call(this, name, isUpdate, category);
+                    } finally {
+                        if (this._showPresetMediaStorageDialog !== origDialog) {
+                            this._showPresetMediaStorageDialog = origDialog;
+                        }
+                    }
+
+                    try {
+                        this._activePresetName = name;
+                        const presets = this._getOverlayGroupPresets();
+                        if (presets && presets[name]) {
+                            presets[name].updatedAt = new Date().toISOString();
+                            presets[name].meta = presets[name].meta || {};
+                            presets[name].meta.userModified = true;
+                            if (window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS && window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS[name] && Array.isArray(presets[name].layers)) {
+                                window.REELS_BUILTIN_OVERLAY_GROUP_PRESETS[name] = presets[name].layers;
+                            }
+                            this._setOverlayGroupPresets(presets);
+                        }
+                        const activeTask = (!this.videoCanvas?.scopedTask && window._reelsState)
+                            ? window._reelsState.tasks?.[window._reelsState.selectedIdx]
+                            : null;
+                        if (activeTask) {
+                            activeTask._overlayPresetName = name;
+                        }
+                        if (isUpdate && presets?.[name]?.layers) {
+                            syncUpdatedPresetToMatchingTasks(name, presets[name].layers, activeTask);
+                        }
+                        if (typeof window._batchAutoSave === 'function') window._batchAutoSave();
+                        schedulePresetBackupToDisk(20);
+                    } catch (e) {
+                        console.warn('[FlowCue] Post _executeSavePreset sync warning:', e);
+                    }
+                };
+            }
+        }
+
+        // 5. 确保已创建的 overlayPanel 实例绑定好 onOverlayChange 链与下拉框监听
+        const livePanel = window._reelsState?.overlayPanel;
+        if (livePanel && livePanel.videoCanvas && !livePanel.videoCanvas._flowcueOnOverlayChangeChained) {
+            const prevOnChange = livePanel.videoCanvas.onOverlayChange;
+            livePanel.videoCanvas.onOverlayChange = function (ov) {
+                if (typeof prevOnChange === 'function') {
+                    prevOnChange.call(this, ov);
+                }
+                try {
+                    if (typeof window._syncCurrentOverlayEditorToSelectedTask === 'function') {
+                        window._syncCurrentOverlayEditorToSelectedTask();
+                    }
+                    const selIdx = window._reelsState?.selectedIdx;
+                    if (selIdx >= 0 && window._reelsState?.tasks?.[selIdx]) {
+                        if (typeof window._updateTimelineForTask === 'function') {
+                            window._updateTimelineForTask(window._reelsState.tasks[selIdx]);
+                        }
+                    }
+                    if (typeof window.reelsUpdatePreview === 'function') {
+                        window.reelsUpdatePreview();
+                    }
+                } catch (_) {}
+            };
+            livePanel.videoCanvas._flowcueOnOverlayChangeChained = true;
+        }
+
+        const presetSelect = document.querySelector('#rop-group-preset-select');
+        if (presetSelect && presetSelect.dataset.flowcueActiveBound !== '1') {
+            presetSelect.dataset.flowcueActiveBound = '1';
+            presetSelect.addEventListener('change', () => {
+                if (window._reelsState?.overlayPanel) {
+                    window._reelsState.overlayPanel._activePresetName = presetSelect.value || '';
+                }
+            });
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // 6. 批量Reels 批量导出标题和覆层预设名称 (支持复制两列 TSV / 单独整列 / 保存文件)
@@ -2274,6 +2795,7 @@
             ensureAllRangeSlidersHaveNumberInput(document);
             updateUnder3MinCheckboxUI();
             installUnder3MinSpeedScalingOverride();
+            installOverlayPresetUpdateFix();
             hookBatchTableRender();
             enhanceBatchTablePresetColumns();
             syncSavedAlignLanguageUI();

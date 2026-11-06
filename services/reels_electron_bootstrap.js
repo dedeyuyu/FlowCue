@@ -134,13 +134,37 @@ function readPresetSnapshotFile(filePath) {
     try {
         if (!fs.existsSync(filePath)) return {};
         const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        if (parsed && typeof parsed.entries === 'object' && parsed.entries) {
-            return parsed.entries;
+        const hasEntries = parsed && typeof parsed.entries === 'object' && parsed.entries;
+        const hasValues = parsed && typeof parsed.values === 'object' && parsed.values;
+        if (hasEntries && hasValues) {
+            return mergePresetEntries([parsed.entries, parsed.values]);
         }
+        if (hasValues) return parsed.values;
+        if (hasEntries) return parsed.entries;
         return {};
     } catch (_) {
         return {};
     }
+}
+
+function pickNewerPresetItem(existingItem, incomingItem) {
+    if (existingItem === undefined) return incomingItem;
+    if (incomingItem === undefined) return existingItem;
+    if (existingItem && incomingItem && typeof existingItem === 'object' && typeof incomingItem === 'object' && !Array.isArray(existingItem) && !Array.isArray(incomingItem)) {
+        const oldMod = !!(existingItem.meta && existingItem.meta.userModified);
+        const newMod = !!(incomingItem.meta && incomingItem.meta.userModified);
+        const tOld = existingItem.updatedAt ? Date.parse(existingItem.updatedAt) : 0;
+        const tNew = incomingItem.updatedAt ? Date.parse(incomingItem.updatedAt) : 0;
+        if (Number.isFinite(tOld) && Number.isFinite(tNew) && tOld > 0 && tNew > 0 && tOld !== tNew) {
+            return tNew >= tOld ? incomingItem : existingItem;
+        }
+        if (oldMod && !newMod) return existingItem;
+        if (newMod && !oldMod) return incomingItem;
+    } else if (existingItem && typeof existingItem === 'object' && !Array.isArray(existingItem) && Array.isArray(incomingItem)) {
+        // 已升级并带 updatedAt/meta 的预设对象优先生效，防止被旧纯数组覆盖
+        if (existingItem.updatedAt || existingItem.meta) return existingItem;
+    }
+    return incomingItem;
 }
 
 function mergePresetEntries(entriesList) {
@@ -154,7 +178,9 @@ function mergePresetEntries(entriesList) {
             try {
                 const parsed = JSON.parse(rawStr);
                 if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                    combinedObj = { ...combinedObj, ...parsed };
+                    for (const [pName, pVal] of Object.entries(parsed)) {
+                        combinedObj[pName] = pickNewerPresetItem(combinedObj[pName], pVal);
+                    }
                     hasAny = true;
                 } else if (Array.isArray(parsed) && parsed.length > 0) {
                     combinedObj = parsed;
@@ -198,6 +224,7 @@ function syncAndBackupPresetFiles(extraEntries = null) {
             version: 1,
             updatedAt: new Date().toISOString(),
             entries: merged,
+            values: merged,
         }, null, 2);
 
         for (const targetFile of [PRESET_FILE_PRIMARY, PRESET_FILE_BACKUP]) {
@@ -372,22 +399,67 @@ async function activateBatchReelsInRenderer(win) {
                 'reels_autosave',
                 'flowcue_dismissed_archive_paths',
             ]);
+            const safeSetPresetJson = (key, objOrStr) => {
+                const raw = typeof objOrStr === 'string' ? objOrStr : JSON.stringify(objOrStr);
+                try {
+                    localStorage.setItem(key, raw);
+                } catch (_) {
+                    try {
+                        const parsed = typeof objOrStr === 'string' ? JSON.parse(objOrStr) : objOrStr;
+                        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                            const slim = {};
+                            for (const [pk, pv] of Object.entries(parsed)) {
+                                if (pv && typeof pv === 'object' && !Array.isArray(pv)) {
+                                    const copy = { ...pv };
+                                    delete copy.thumbnail;
+                                    slim[pk] = copy;
+                                } else {
+                                    slim[pk] = pv;
+                                }
+                            }
+                            localStorage.setItem(key, JSON.stringify(slim));
+                        }
+                    } catch (_) {}
+                }
+            };
+            const pickNewerItem = (a, b) => {
+                if (a === undefined) return b;
+                if (b === undefined) return a;
+                if (a && b && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
+                    const aMod = !!(a.meta && a.meta.userModified);
+                    const bMod = !!(b.meta && b.meta.userModified);
+                    const tA = a.updatedAt ? Date.parse(a.updatedAt) : 0;
+                    const tB = b.updatedAt ? Date.parse(b.updatedAt) : 0;
+                    if (Number.isFinite(tA) && Number.isFinite(tB) && tA > 0 && tB > 0 && tA !== tB) {
+                        return tB >= tA ? b : a;
+                    }
+                    if (aMod && !bMod) return a;
+                    if (bMod && !aMod) return b;
+                } else if (a && typeof a === 'object' && !Array.isArray(a) && Array.isArray(b)) {
+                    if (a.updatedAt || a.meta) return a;
+                }
+                return b;
+            };
             if (diskPresets && typeof diskPresets === 'object') {
                 for (const [k, diskValStr] of Object.entries(diskPresets)) {
                     if (typeof diskValStr !== 'string' || !diskValStr) continue;
                     if (latestValueKeys.has(k)) {
-                        localStorage.setItem(k, diskValStr);
+                        safeSetPresetJson(k, diskValStr);
                         continue;
                     }
                     const curStr = localStorage.getItem(k);
                     if (!curStr || curStr === '{}' || curStr === '[]') {
-                        localStorage.setItem(k, diskValStr);
+                        safeSetPresetJson(k, diskValStr);
                     } else {
                         try {
                             const diskObj = JSON.parse(diskValStr);
                             const curObj = JSON.parse(curStr);
                             if (diskObj && curObj && typeof diskObj === 'object' && typeof curObj === 'object' && !Array.isArray(diskObj)) {
-                                localStorage.setItem(k, JSON.stringify({ ...diskObj, ...curObj }));
+                                const mergedObj = { ...diskObj };
+                                for (const [pk, pv] of Object.entries(curObj)) {
+                                    mergedObj[pk] = pickNewerItem(mergedObj[pk], pv);
+                                }
+                                safeSetPresetJson(k, mergedObj);
                             }
                         } catch (_) {}
                     }
@@ -1425,6 +1497,84 @@ const ctrlServer = http.createServer(async (req, res) => {
 ctrlServer.listen(CTRL_PORT, '127.0.0.1', () => {
     console.log(`[FlowCue-Reels] Control server listening on http://127.0.0.1:${CTRL_PORT}`);
 });
+
+// 3.9 预加载并热修补 VideoKit 主进程服务（解决 local-media:// 覆层媒体无法复制到预设库、以及预设快照新旧时间戳合并被旧版本覆盖的问题）
+(function patchVideokitMainServices() {
+    try {
+        const pkgModPath = path.join(VIDEOKIT_ROOT, 'electron', 'services', 'overlayPresetPackage.js');
+        if (safeExistsSync(pkgModPath)) {
+            const { pathToFileURL } = require('url');
+            const pkgMod = require(pkgModPath);
+            const normalizeLayersForSave = (presetObj) => {
+                if (!presetObj || typeof presetObj !== 'object') return presetObj;
+                const cloned = JSON.parse(JSON.stringify(presetObj));
+                if (Array.isArray(cloned.layers)) {
+                    for (const layer of cloned.layers) {
+                        if (layer && typeof layer.content === 'string' && /^local-media:\/\//i.test(layer.content)) {
+                            const hashIdx = layer.content.indexOf('#');
+                            const clean = hashIdx !== -1 ? layer.content.slice(0, hashIdx) : layer.content;
+                            layer.content = clean.replace(/^local-media:/i, 'file:');
+                        }
+                    }
+                }
+                return cloned;
+            };
+            if (typeof pkgMod.savePresetAssets === 'function') {
+                const origSave = pkgMod.savePresetAssets;
+                pkgMod.savePresetAssets = async function (opts = {}) {
+                    const nextOpts = { ...opts, preset: normalizeLayersForSave(opts.preset) };
+                    return origSave.call(this, nextOpts);
+                };
+            }
+            if (typeof pkgMod.exportPackage === 'function') {
+                const origExport = pkgMod.exportPackage;
+                pkgMod.exportPackage = async function (opts = {}) {
+                    const nextPresets = {};
+                    if (opts.presets && typeof opts.presets === 'object') {
+                        for (const [k, v] of Object.entries(opts.presets)) {
+                            nextPresets[k] = normalizeLayersForSave(v);
+                        }
+                    }
+                    return origExport.call(this, { ...opts, presets: nextPresets });
+                };
+            }
+        }
+    } catch (e) {
+        console.warn('[FlowCue-Reels] patch overlayPresetPackage warning:', e.message);
+    }
+
+    try {
+        const storeModPath = path.join(VIDEOKIT_ROOT, 'electron', 'services', 'persistentPresetStore.js');
+        if (safeExistsSync(storeModPath)) {
+            const storeMod = require(storeModPath);
+            if (typeof storeMod.writeSnapshot === 'function') {
+                const origWrite = storeMod.writeSnapshot;
+                storeMod.writeSnapshot = function (values) {
+                    const res = origWrite.call(this, values);
+                    try {
+                        if (values && typeof values === 'object') {
+                            syncAndBackupPresetFiles(values);
+                        }
+                    } catch (_) {}
+                    return res;
+                };
+            }
+            if (typeof storeMod.hydrate === 'function') {
+                const origHydrate = storeMod.hydrate;
+                storeMod.hydrate = function (currentValues) {
+                    const res = origHydrate.call(this, currentValues);
+                    try {
+                        return syncAndBackupPresetFiles(res && typeof res === 'object' ? res : currentValues);
+                    } catch (_) {
+                        return res;
+                    }
+                };
+            }
+        }
+    } catch (e) {
+        console.warn('[FlowCue-Reels] patch persistentPresetStore warning:', e.message);
+    }
+})();
 
 // 4. 加载 VideoKit 原生 Electron 主进程（包含全部 80+ IPC 与 FFmpeg/WebCodecs 管线）
 require(path.join(VIDEOKIT_ROOT, 'electron', 'main.js'));

@@ -297,7 +297,26 @@
         saved[`downloadedUrls_${key}`].forEach(u => downloadedUrlsSet.add(u));
       }
       if (!isLiveRunning) {
-        if (saved[`isRunning_${key}`] !== undefined) state.isRunning = saved[`isRunning_${key}`];
+        // 重新打开浏览器或刷新界面（含 Flow 与 Vids）时，严禁自动恢复运行未完成的任务
+        state.isRunning = false;
+        if (Array.isArray(state.tasks)) {
+          state.tasks.forEach(t => {
+            if (!t) return;
+            if (Array.isArray(t.status)) {
+              t.status = t.status.map(s => s === "running" ? "pending" : s);
+            } else if (t.status === "running") {
+              t.status = "pending";
+            }
+          });
+        }
+        if (saved[`isRunning_${key}`]) {
+          sendToExtension("setStorage", {
+            data: {
+              [`isRunning_${key}`]: false,
+              [`tasks_${key}`]: state.tasks
+            }
+          });
+        }
         if (saved[`currentIndex_${key}`] !== undefined) state.currentIndex = saved[`currentIndex_${key}`];
         if (saved[`currentLineIndex_${key}`] !== undefined) state.currentLineIndex = saved[`currentLineIndex_${key}`];
         if (saved[`retryCount_${key}`] !== undefined) state.retryCount = saved[`retryCount_${key}`];
@@ -3167,9 +3186,58 @@
       }
     }
 
-    // 关闭设置菜单
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-    await delay(250);
+    // 选择完所有选项后，点击一下当前选项卡（如“添加动画”）将选项面板取消关闭，防止遮挡后续上传图片区域
+    await dismissVidsSettingsPopover(settingsBtn, true);
+  }
+
+  async function dismissVidsSettingsPopover(settingsBtn = null, forceClickTab = false) {
+    const isPopoverVisible = () => {
+      const pop = document.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonPopoverContainer");
+      if (!pop || pop.offsetParent === null) return false;
+      const r = pop.getBoundingClientRect();
+      return r.width > 10 && r.height > 10;
+    };
+
+    if (!forceClickTab && !isPopoverVisible()) {
+      return;
+    }
+
+    const findActiveVidsTab = () => {
+      const animateRe = /(添加动画|加入動畫|新增動畫|加上動畫|動畫|动画|Animate|Add animation|Image)/i;
+      const tabs = Array.from(document.querySelectorAll(
+        'button.collapsiblePromptBoxTabButton[role="tab"], button.collapsiblePromptBoxTabButton, .collapsiblePromptBoxContainerWithTabs button[role="tab"]'
+      ));
+      return tabs.find(b => b.getAttribute("aria-selected") === "true") ||
+             tabs.find(b => animateRe.test(b.textContent || "") || animateRe.test(b.getAttribute("aria-label") || "")) ||
+             (tabs.length >= 2 ? tabs[1] : tabs[0]) ||
+             null;
+    };
+
+    // 点击当前选项卡（如“添加动画”）以取消/收起选项面板
+    const activeTab = findActiveVidsTab();
+    if (activeTab) {
+      console.log("[Vids] 点击选项卡以关闭生成设置选项面板，防止遮挡图片上传区域...");
+      simulateClick(activeTab);
+      await delay(300);
+    }
+
+    // 若选项面板仍未关闭，再次点击选项卡或设置按钮并发送 Escape 保底关闭
+    if (isPopoverVisible()) {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+      if (activeTab) {
+        simulateClick(activeTab);
+      } else if (settingsBtn) {
+        simulateClick(settingsBtn);
+      }
+      await delay(300);
+    }
+
+    if (isPopoverVisible() && settingsBtn) {
+      simulateClick(settingsBtn);
+      await delay(250);
+    }
+
+    await ensureVidsPromptBoxExpanded();
   }
 
   function hasVidsUploadedImagePreview() {
@@ -3210,6 +3278,8 @@
     }
 
     await ensureVidsPromptBoxExpanded();
+    // 上传图片前确保生成设置选项面板已通过点击选项卡关闭，避免遮挡上传区域
+    await dismissVidsSettingsPopover();
 
     // 策略 1：使用后台 Chrome Debugger 原生文件拖放 (Input.dispatchDragEvent) 把本地路径图片直接拖入 Vids 提示词框
     if (localPath && /^([a-zA-Z]:[\\/]|\/|\\\\)/.test(localPath)) {
@@ -3289,6 +3359,8 @@
 
   async function fillVidsPromptAndSubmit(finalPrompt) {
     await ensureVidsPromptBoxExpanded();
+    // 上传图片前确保生成设置选项面板已通过点击选项卡关闭，避免遮挡上传区域
+    await dismissVidsSettingsPopover();
     const editor = document.querySelector("div.promptTextAreaPromptRichTextInputInternal[contenteditable='true']") ||
                    document.querySelector("[jsname='ZeIRi'][role='textbox']");
     if (!editor) {
@@ -6822,22 +6894,9 @@ ${presetAfter || ""}`.trim();
       createUI();
     }, 3500);
 
-    // 加载先前保存的状态
+    // 加载先前保存的状态（重新打开浏览器或刷新界面时，绝不自动启动未完成的任务，Flow 与 Vids 均保持停止待命）
     await loadState();
-    
-    // 如果网页刚才由于刷新中断且处于 Running 状态，则自动断点续跑启动批量任务
-    if (state.isRunning) {
-      console.log("[FlowUI] 检测到批量运行状态为 TRUE，自动恢复运行断点续传。任务索引:", state.currentIndex, "子行索引:", state.currentLineIndex);
-      showToast("正在自动恢复未完成的生成任务，请保持浏览器窗口在前台...");
-      
-      // 启动安全监测
-      startActivityCheck();
-      
-      // 等待 2.5 秒，保证页面 NextJS 初始化以及 trpc Webpack 完成，然后自启
-      setTimeout(() => {
-        startBatch();
-      }, 2500);
-    }
+    state.isRunning = false;
   }
 
   // 多时机激进挂载：保证在任何阶段都能立即渲染悬浮按钮
