@@ -1,4 +1,4 @@
 # -*- coding: utf-8 -*-
 """FlowCue version. Bump here and pass the same value to ISCC via /DAppVersion."""
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 GITHUB_REPO = "dedeyuyu/FlowCue"

@@ -123,6 +123,81 @@ chrome.runtime.onMessage.addListener((message) => {
 
 console.log("%c[FlowIsolated] 消息桥梁脚本已成功注入当前页面！URL=" + location.href, "background: #3b82f6; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;");
 
+// ===== WebSocket 中转：MAIN 页面 ⇄ 后台 Service Worker ⇄ ws://127.0.0.1 桌面软件 =====
+// 新版 Chrome 的「本地网络访问 (Local Network Access)」会拦截 https 网页直连本机回环地址
+// (ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS)，开启 VPN 时尤为常见。改由插件后台建立连接即可绕开网页限制。
+const WS_RELAY_URL_RE = /^ws:\/\/(127\.0\.0\.1|localhost|\[::1\]):(18188|8000|8765)\/?$/;
+const wsRelayPorts = new Map();
+function postWsEvent(id, msg) {
+  window.postMessage({ sender: "flow-isolated-ws", id, ...msg }, "*");
+}
+window.addEventListener("message", (event) => {
+  if (event.source !== window || !event.data || event.data.sender !== "flow-main-ws") return;
+  const { id, op } = event.data;
+  if (!id || typeof id !== "string") return;
+
+  if (op === "open") {
+    const url = String(event.data.url || "");
+    if (!WS_RELAY_URL_RE.test(url)) {
+      postWsEvent(id, { event: "ack", error: "url-not-allowed" });
+      postWsEvent(id, { event: "close", code: 1008, reason: "url-not-allowed" });
+      return;
+    }
+    let port;
+    try {
+      port = chrome.runtime.connect({ name: "flowcue-ws" });
+    } catch (e) {
+      postWsEvent(id, { event: "ack", error: String(e?.message || e) });
+      postWsEvent(id, { event: "close", code: 1006, reason: "extension-context-invalidated" });
+      return;
+    }
+    const entry = { port, closed: false, keepAlive: null };
+    wsRelayPorts.set(id, entry);
+    postWsEvent(id, { event: "ack" });
+    port.onMessage.addListener((m) => {
+      if (!m || !m.event) return;
+      postWsEvent(id, m);
+      if (m.event === "close") cleanup(id, false);
+    });
+    port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      if (!entry.closed) postWsEvent(id, { event: "close", code: 1006, reason: "relay-disconnected" });
+      cleanup(id, false);
+    });
+    // 每 20 秒发送一次保活，防止后台 Service Worker 因空闲被浏览器回收导致连接中断
+    entry.keepAlive = setInterval(() => {
+      try { port.postMessage({ op: "keepalive" }); } catch (_) {}
+    }, 20000);
+    try { port.postMessage({ op: "open", url }); } catch (e) {
+      postWsEvent(id, { event: "close", code: 1006, reason: String(e?.message || e) });
+      cleanup(id, false);
+    }
+    return;
+  }
+
+  const entry = wsRelayPorts.get(id);
+  if (!entry) return;
+  if (op === "send") {
+    try { entry.port.postMessage({ op: "send", data: String(event.data.data ?? "") }); } catch (_) {}
+  } else if (op === "close") {
+    try { entry.port.postMessage({ op: "close" }); } catch (_) {}
+  }
+});
+function cleanup(id, disconnect) {
+  const entry = wsRelayPorts.get(id);
+  if (!entry) return;
+  entry.closed = true;
+  if (entry.keepAlive) clearInterval(entry.keepAlive);
+  wsRelayPorts.delete(id);
+  if (disconnect) { try { entry.port.disconnect(); } catch (_) {} }
+}
+window.addEventListener("pagehide", () => {
+  for (const id of Array.from(wsRelayPorts.keys())) {
+    postWsEvent(id, { event: "close", code: 1001, reason: "pagehide" });
+    cleanup(id, true);
+  }
+});
+
 // 4. 守护保底：若主世界 UI 脚本未能成功挂载悬浮按钮，由独立世界兜底注入
 function ensureFabMounted() {
   if (document.getElementById("flow-batch-fab")) return;

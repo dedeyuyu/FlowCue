@@ -5397,27 +5397,76 @@
     if (addMenuBtn) {
       console.log("[FlowUI] 尝试点击输入框左下角加号菜单添加素材...");
       simulateClick(addMenuBtn);
-      await delay(350);
 
-      const menuPanels = Array.from(document.querySelectorAll(".cdk-overlay-pane, .flow-add-menu-dropdown-panel, .mat-mdc-menu-panel, [role='menu']"));
-      for (const panel of menuPanels) {
-        const options = Array.from(panel.querySelectorAll("button, [role='menuitem'], [role='option'], .flow-add-menu-dropdown-option-text, span"));
-        let clickedOpt = false;
-        for (const opt of options) {
-          const optText = opt.textContent || "";
-          if (imgName && isImageNameMatch(imgName, optText)) {
-            console.log(`[FlowUI] 在素材菜单中找到匹配素材: ${optText.trim()}，点击添加`);
-            simulateClick(opt);
-            clickedOpt = true;
-            await delay(300);
-            break;
+      const exactTarget = getFilenameFromPath(image.localImagePath || "") || image.targetName || imgName;
+      const PANEL_SEL = ".cdk-overlay-pane, .flow-add-menu-dropdown-panel, .mat-mdc-menu-panel, [role='menu'], [role='dialog'], mat-dialog-container";
+      const OPT_SEL = "[role='menuitem'], [role='option'], button, .flow-add-menu-dropdown-option-text, span";
+      const visiblePanels = () => Array.from(document.querySelectorAll(PANEL_SEL))
+        .filter(p => fcIsVisible(p) && !p.closest("#flow-batch-overlay, #flow-import-dialog, #flow-alarm-dialog"));
+      // 在菜单中查找目标素材：优先「文件名完全一致」，其次沿用旧的模糊匹配；点击目标取最近的可点击祖先（菜单项 / 按钮）
+      const findOption = () => {
+        let fuzzy = null;
+        for (const panel of visiblePanels()) {
+          for (const opt of panel.querySelectorAll(OPT_SEL)) {
+            if (!fcIsVisible(opt)) continue;
+            const names = [opt.textContent || "", opt.getAttribute("aria-label") || "", opt.getAttribute("title") || ""];
+            opt.querySelectorAll("img[alt], [title], [aria-label]").forEach(n => names.push(n.getAttribute("alt") || n.getAttribute("title") || n.getAttribute("aria-label") || ""));
+            const exact = exactTarget && names.some(n => isExactAssetNameMatch(exactTarget, String(n).trim()));
+            if (exact) return { opt, panel, exact: true };
+            if (!fuzzy && imgName && names.some(n => isImageNameMatch(imgName, n))) fuzzy = { opt, panel, exact: false };
           }
         }
-        if (clickedOpt) {
-          await delay(300);
-          return;
+        return fuzzy;
+      };
+
+      // 轮询等待菜单 / 弹窗渲染（最多 3 秒），菜单内容异步加载时 350ms 往往还没出现素材列表
+      let hit = null;
+      let pickerDialog = null;
+      for (let w = 0; w < 15 && !hit; w++) {
+        await delay(200);
+        hit = findOption();
+        if (!hit) {
+          pickerDialog = findAssetPickerDialog(null);
+          if (pickerDialog && findAssetSearchInput(pickerDialog)) break;
         }
       }
+
+      // 「+」打开的是素材选择弹窗（带搜索框 /「添加到提示」按钮）：走精确选图流程（会点击「添加到提示」）
+      if (!hit || (pickerDialog && findAddToPromptButton(pickerDialog, true))) {
+        pickerDialog = pickerDialog || findAssetPickerDialog(null);
+        if (pickerDialog && exactTarget) {
+          const pickKey = (image.displayName && isExactAssetNameMatch(exactTarget, image.displayName)) ? imgKey : "";
+          const pick = await selectAssetInPickerDialog(pickerDialog, exactTarget, { imgKey: pickKey, slotLabel: "参考图" });
+          if (pick.status === "selected") {
+            console.log(`[FlowUI] ✅ 通过素材选择弹窗添加参考图 [${exactTarget}]`);
+            await delay(400);
+            return;
+          }
+          console.warn(`[FlowUI] 素材选择弹窗中未能添加 [${exactTarget}] (status=${pick.status})`);
+          await closeAssetPickerDialog(pickerDialog);
+        }
+      }
+
+      if (hit) {
+        const CLICKABLE = "[role='menuitem'], [role='option'], button, a[href], [tabindex]";
+        let clickEl = hit.opt;
+        const anc = hit.opt.closest(CLICKABLE);
+        if (anc && hit.panel.contains(anc) && anc !== hit.panel) clickEl = anc;
+        console.log(`[FlowUI] 在素材菜单中找到${hit.exact ? "文件名完全一致的" : "匹配"}素材: ${(hit.opt.textContent || "").trim()}，点击添加`);
+        simulateClick(clickEl);
+        await delay(300);
+        // 部分版本点击素材后会弹出「添加到提示」确认，自动点击
+        const confirmDlg = findAssetPickerDialog(null);
+        const confirmBtn = confirmDlg ? findAddToPromptButton(confirmDlg, true) : null;
+        if (confirmBtn && fcIsButtonEnabled(confirmBtn)) {
+          console.log(`[FlowUI] 点击「${fcButtonLabel(confirmBtn)}」`);
+          simulateClick(confirmBtn);
+          await delay(400);
+        }
+        await delay(300);
+        return;
+      }
+      console.warn(`[FlowUI] ⚠️ 「+」菜单中未找到素材 [${exactTarget || imgName}]`);
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
       await delay(200);
     }
@@ -5527,6 +5576,29 @@
       return true;
     }
 
+    // 4. 新版界面：参考图以芯片形式内嵌在提示词编辑器 (ProseMirror) 中，或显示在输入框容器内的缩略图
+    try {
+      const ed = document.querySelector("flow-rich-text-editor div.ProseMirror") || document.querySelector("div.ProseMirror[contenteditable='true']");
+      if (ed) {
+        if (ed.querySelector("img, [contenteditable='false'], [data-media-id], [data-ingredient-id], [style*='background-image']")) return true;
+        const view = ed.pmViewDesc && ed.pmViewDesc.view;
+        if (view) {
+          let hasAtom = false;
+          view.state.doc.descendants(node => {
+            if (hasAtom) return false;
+            if (node.isInline && !node.isText && !/hard_?break/i.test(node.type.name)) { hasAtom = true; return false; }
+            return true;
+          });
+          if (hasAtom) return true;
+        }
+        const promptRoot = ed.closest("flow-prompt-box, .prompt-box-container, .prompt-box, form");
+        if (promptRoot) {
+          const thumbs = Array.from(promptRoot.querySelectorAll("img")).filter(i => fcIsVisible(i) && !i.closest("button.generate-icon-button, flow-generate-icon-button"));
+          if (thumbs.length) return true;
+        }
+      }
+    } catch (_) {}
+
     return false;
   }
 
@@ -5592,6 +5664,53 @@
     return null;
   }
 
+  // 把光标移到提示词编辑器末尾（折叠选区），确保随后从「+」菜单插入的图片芯片不会替换掉已填入的文本
+  function placeCaretAtEditorEnd(editor) {
+    if (!editor) return;
+    try { editor.focus(); } catch (_) {}
+    try {
+      const view = editor.pmViewDesc && editor.pmViewDesc.view;
+      if (view) {
+        const SelCls = view.state.selection.constructor;
+        if (SelCls && typeof SelCls.atEnd === "function") {
+          view.dispatch(view.state.tr.setSelection(SelCls.atEnd(view.state.doc)));
+          return;
+        }
+      }
+    } catch (_) {}
+    try {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch (_) {}
+  }
+
+  // 挂图后复核提示词是否仍在编辑器中（个别界面插入芯片时会替换选区），丢失则在末尾补回，绝不覆盖已插入的图片芯片
+  function ensurePromptTextPresent(editor, finalPrompt) {
+    if (!editor || !finalPrompt) return;
+    const norm = s => String(s || "").replace(/\s+/g, "");
+    const probe = norm(finalPrompt).slice(0, 40);
+    if (!probe || norm(editor.textContent).includes(probe)) return;
+    console.warn("[FlowUI] ⚠️ 挂载图片后提示词丢失，正在编辑器末尾补回提示词（保留图片芯片）...");
+    placeCaretAtEditorEnd(editor);
+    let ok = false;
+    try {
+      const view = editor.pmViewDesc && editor.pmViewDesc.view;
+      if (view) {
+        view.dispatch(view.state.tr.insertText(finalPrompt.replace(/\n+/g, " ")));
+        ok = true;
+      }
+    } catch (_) {}
+    if (!ok) {
+      try { ok = document.execCommand("insertText", false, finalPrompt); } catch (_) {}
+    }
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: finalPrompt }));
+    editor.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
   // 注入提示词至 ProseMirror 并触发 Angular 提交
   async function submitTaskToPage(params) {
     const { image, lineText, presetBefore, presetAfter, footageType, count, duration, rowIndex, lineIndex, resolution, aspectRatio, videoModel } = params;
@@ -5623,17 +5742,11 @@
     // 提交前清理历史弹窗与遮罩，确保输入框与按钮处于可交互视口
     await cleanupPageOverlays();
 
-    // 关键修复 2：在目标模式设置好后，再挂载参考图片/首帧素材原料！
-    if (image && (image.displayName || image.src || image.primaryMediaKey)) {
-      try {
-        await attachImageToPage(image, targetFootage);
-      } catch (imgErr) {
-        // 精确选图明确失败（素材库中确实找不到该文件名）：中止提交并把原因上报（托管模式经 hostedStatusHook 回传 FlowCue），
-        // 避免不带首帧或带错首帧去生成、白白消耗积分
-        if (imgErr && imgErr.imageSelectionError) throw imgErr;
-        console.warn("[FlowUI] 注入图片原料异常 (继续执行):", imgErr);
-      }
-    }
+    // 关键修复 2：图片改为在「填入提示词之后」再挂载。
+    //   新版 Flow 界面（输入框带「智能体」按钮、无 flow-ingredient-bar）里，从左下角「+」菜单添加的参考图
+    //   是以芯片形式插入在提示词编辑器内部的；若先挂图再「全选 + 插入文本」填提示词，会把图片芯片一起覆盖掉，
+    //   导致生成时没有带图。旧版界面的图片在独立的素材栏中，先填文本后挂图同样不受影响。
+    const hasImageToAttach = !!(image && (image.displayName || image.src || image.primaryMediaKey));
 
     // 3. 定位 ProseMirror 输入框
     let editor = document.querySelector("flow-rich-text-editor div.ProseMirror") || 
@@ -5740,8 +5853,23 @@ ${presetAfter || ""}`.trim();
     window.promptBoxStore?.getState?.().actions?.setPrompt?.(finalPrompt);
     await delay(300);
 
+    // 5.5 填好提示词后再挂载参考图片 / 首帧素材
+    if (hasImageToAttach) {
+      placeCaretAtEditorEnd(editor);
+      try {
+        await attachImageToPage(image, targetFootage);
+      } catch (imgErr) {
+        // 精确选图明确失败（素材库中确实找不到该文件名）：中止提交并把原因上报（托管模式经 hostedStatusHook 回传 FlowCue），
+        // 避免不带首帧或带错首帧去生成、白白消耗积分
+        if (imgErr && imgErr.imageSelectionError) throw imgErr;
+        console.warn("[FlowUI] 注入图片原料异常 (继续执行):", imgErr);
+      }
+      await delay(300);
+      ensurePromptTextPresent(editor, finalPrompt);
+    }
+
     // 6. 提交前图片挂载状态二次复核与补救
-    if (image && (image.displayName || image.src || image.primaryMediaKey)) {
+    if (hasImageToAttach) {
       let isMounted = verifyImageAttached(image, targetFootage);
       if (!isMounted) {
         console.warn(`[FlowUI] ⚠️ 提交前首次检查发现素材 [${image.displayName || "图片"}] 尚未挂载，等待后复检...`);
@@ -5750,8 +5878,10 @@ ${presetAfter || ""}`.trim();
       }
       if (!isMounted) {
         console.warn(`[FlowUI] ⚠️ 正在执行二次挂载素材重试...`);
+        placeCaretAtEditorEnd(editor);
         await attachImageToPage(image, targetFootage);
         await delay(600);
+        ensurePromptTextPresent(editor, finalPrompt);
         isMounted = verifyImageAttached(image, targetFootage);
       }
       if (isMounted) {
@@ -7469,6 +7599,102 @@ ${presetAfter || ""}`.trim();
       }
     }
 
+    // ===== 通过插件后台中转 WebSocket（解决 Chrome「本地网络访问 (Local Network Access)」拦截）=====
+    // 新版 Chrome 会阻止 https 网页直接连接 127.0.0.1 / localhost（报错 ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS），
+    // 开启 VPN / TUN 模式时更容易触发。插件后台 Service Worker 拥有 host_permissions，不受此限制，
+    // 因此改为：MAIN 页面 → content-isolated.js → 后台 Service Worker → ws://127.0.0.1 桌面软件。
+    // 若中转通道不可用（旧版插件后台 / 子框架），自动回退为页面直连 WebSocket。
+    let wsRelayMode = "auto";   // "auto" | "relay" | "native"
+    let relayNoAckCount = 0;
+    const RELAY_SENDER_MAIN = "flow-main-ws";
+    const RELAY_SENDER_ISO = "flow-isolated-ws";
+    const relaySockets = new Map();
+    window.addEventListener("message", (event) => {
+      if (event.source !== window || !event.data || event.data.sender !== RELAY_SENDER_ISO) return;
+      const rs = relaySockets.get(event.data.id);
+      if (rs) rs._handle(event.data);
+    });
+
+    class RelaySocket {
+      constructor(url) {
+        this.url = url;
+        this.readyState = 0; // CONNECTING
+        this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null;
+        this._id = "ws_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 9);
+        this._acked = false;
+        this._closedFired = false;
+        relaySockets.set(this._id, this);
+        this._post({ op: "open", url });
+        // 1.5 秒内中转脚本无回应 → 视为中转通道不可用
+        this._ackTimer = setTimeout(() => {
+          if (!this._acked) { this._noAck = true; this._fireClose(1006, "relay-no-ack"); }
+        }, 1500);
+        // 12 秒内既未连上也未关闭 → 视为失败
+        this._openTimer = setTimeout(() => {
+          if (this.readyState === 0) { this._post({ op: "close" }); this._fireClose(1006, "relay-timeout"); }
+        }, 12000);
+      }
+      _post(msg) {
+        try { window.postMessage({ sender: RELAY_SENDER_MAIN, id: this._id, ...msg }, "*"); } catch (_) {}
+      }
+      _handle(m) {
+        if (m.event === "ack") {
+          this._acked = true; clearTimeout(this._ackTimer);
+          if (m.error) { this._relayError = m.error; }
+          return;
+        }
+        this._acked = true; clearTimeout(this._ackTimer);
+        if (m.event === "open") {
+          if (this.readyState !== 0) return;
+          clearTimeout(this._openTimer);
+          this.readyState = 1;
+          try { this.onopen && this.onopen({ type: "open" }); } catch (e) { console.error(e); }
+        } else if (m.event === "message") {
+          if (this.readyState !== 1) return;
+          try { this.onmessage && this.onmessage({ type: "message", data: m.data }); } catch (e) { console.error(e); }
+        } else if (m.event === "error") {
+          try { this.onerror && this.onerror({ type: "error" }); } catch (_) {}
+        } else if (m.event === "close") {
+          this._fireClose(m.code || 1006, m.reason || "");
+        }
+      }
+      _fireClose(code, reason) {
+        if (this._closedFired) return;
+        this._closedFired = true;
+        clearTimeout(this._ackTimer); clearTimeout(this._openTimer);
+        if (reason === "relay-no-ack") {
+          // 中转脚本连续无应答 → 回退为页面直连
+          relayNoAckCount++;
+          if (relayNoAckCount >= 2 && wsRelayMode === "auto") {
+            wsRelayMode = "native";
+            log("⚠️ 插件后台中转通道无响应（插件可能未完全更新，请在扩展管理页刷新插件），已回退为页面直连模式");
+          }
+        } else if (this._acked && wsRelayMode === "auto") {
+          wsRelayMode = "relay";
+        }
+        this.readyState = 3;
+        relaySockets.delete(this._id);
+        try { this.onclose && this.onclose({ type: "close", code, reason, wasClean: code === 1000 }); } catch (e) { console.error(e); }
+      }
+      send(data) {
+        if (this.readyState !== 1) return;
+        this._post({ op: "send", data: String(data) });
+      }
+      close() {
+        if (this.readyState >= 2) return;
+        this.readyState = 2;
+        this._post({ op: "close" });
+        // 等待后台回报 close；兜底 1.5 秒后本地触发
+        setTimeout(() => this._fireClose(1000, "client-close"), 1500);
+      }
+    }
+
+    function createBridgeSocket(wsUrl) {
+      const isTop = (() => { try { return window.top === window; } catch (_) { return false; } })();
+      if (wsRelayMode !== "native" && isTop) return new RelaySocket(wsUrl);
+      return new WebSocket(wsUrl);
+    }
+
     function connect() {
       if (handshakeTimer) {
         clearTimeout(handshakeTimer);
@@ -7479,7 +7705,7 @@ ${presetAfter || ""}`.trim();
       let currentSocket = null;
       let opened = false;
       try {
-        currentSocket = new WebSocket(wsUrl);
+        currentSocket = createBridgeSocket(wsUrl);
         socket = currentSocket;
       } catch (e) {
         nextDormantEndpoint();

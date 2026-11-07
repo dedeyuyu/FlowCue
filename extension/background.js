@@ -559,3 +559,56 @@ chrome.downloads.onChanged.addListener(delta => {
     notifyDownload(delta.id, delta.state.current, delta.error?.current);
   }
 });
+
+// ===== WebSocket 中转（解决 Chrome「本地网络访问 / Local Network Access」拦截）=====
+// 网页 (https://flow.google.com 等) 直接连接 ws://127.0.0.1 会被新版 Chrome 拦截：
+//   net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS（开启 VPN / TUN 模式时尤为常见）。
+// 插件后台拥有 host_permissions（ws://127.0.0.1/*、ws://localhost/*），由后台建立连接后通过 Port 转发给页面。
+const FLOWCUE_WS_URL_RE = /^ws:\/\/(127\.0\.0\.1|localhost|\[::1\]):(18188|8000|8765)\/?$/;
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "flowcue-ws") return;
+  let ws = null;
+  let portAlive = true;
+  const post = (msg) => {
+    if (!portAlive) return;
+    try { port.postMessage(msg); } catch (_) { portAlive = false; }
+  };
+  port.onDisconnect.addListener(() => {
+    portAlive = false;
+    void chrome.runtime.lastError;
+    try { if (ws && ws.readyState <= 1) ws.close(1000, "page-disconnected"); } catch (_) {}
+    ws = null;
+  });
+  port.onMessage.addListener((m) => {
+    if (!m || !m.op) return;
+    if (m.op === "open") {
+      if (ws) return;
+      const url = String(m.url || "");
+      if (!FLOWCUE_WS_URL_RE.test(url)) {
+        post({ event: "close", code: 1008, reason: "url-not-allowed" });
+        return;
+      }
+      try {
+        ws = new WebSocket(url);
+      } catch (e) {
+        post({ event: "close", code: 1006, reason: String(e?.message || e) });
+        return;
+      }
+      const sock = ws;
+      sock.onopen = () => post({ event: "open" });
+      sock.onmessage = (ev) => post({ event: "message", data: typeof ev.data === "string" ? ev.data : "" });
+      sock.onerror = () => post({ event: "error" });
+      sock.onclose = (ev) => {
+        post({ event: "close", code: ev.code || 1006, reason: ev.reason || "" });
+        if (ws === sock) ws = null;
+        try { if (portAlive) port.disconnect(); } catch (_) {}
+        portAlive = false;
+      };
+    } else if (m.op === "send") {
+      try { if (ws && ws.readyState === 1) ws.send(String(m.data ?? "")); } catch (_) {}
+    } else if (m.op === "close") {
+      try { if (ws && ws.readyState <= 1) ws.close(1000, "client-close"); } catch (_) {}
+    }
+    // op === "keepalive"：仅用于重置 Service Worker 空闲计时，无需处理
+  });
+});
