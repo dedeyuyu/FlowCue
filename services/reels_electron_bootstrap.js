@@ -205,15 +205,44 @@ function mergePresetEntries(entriesList) {
             }
         }
     }
+    // 其余所有键（字幕预设 reels_subtitle_presets、水印预设 reels_watermark_presets / reels_watermarks、
+    // 卡片模板、画笔、封面预设等）原样保留：按 entriesList 顺序取最后一次有效值（越靠后越新）。
+    // 旧版本只保留上面白名单中的键，重写预设文件时会把字幕预设、水印预设等全部丢掉 —— 这是预设丢失的根因。
+    const handled = new Set([...PRESET_DICT_KEYS, ...LATEST_VALUE_KEYS]);
+    for (const entries of entriesList) {
+        if (!entries || typeof entries !== 'object') continue;
+        for (const [key, rawStr] of Object.entries(entries)) {
+            if (handled.has(key)) continue;
+            if (typeof key !== 'string' || key.length > 200) continue;
+            if (typeof rawStr === 'string' && rawStr.length > 0) mergedEntries[key] = rawStr;
+        }
+    }
     return mergedEntries;
+}
+
+function pickDictKeys(entries) {
+    const out = {};
+    if (!entries || typeof entries !== 'object') return out;
+    for (const key of PRESET_DICT_KEYS) {
+        if (typeof entries[key] === 'string' && entries[key]) out[key] = entries[key];
+    }
+    return out;
 }
 
 function syncAndBackupPresetFiles(extraEntries = null) {
     try {
         const eLegacy  = readPresetSnapshotFile(PRESET_FILE_LEGACY);
         const eBackup  = readPresetSnapshotFile(PRESET_FILE_BACKUP);
+        // VideoKit 允许用户自定义缓存目录（main.js 会把 userData 改到该目录），那里同样有一份预设快照
+        let eUserData = {};
+        try {
+            const udFile = path.join(app.getPath('userData'), 'videokit-presets', 'local-storage-presets.json');
+            if (path.resolve(udFile).toLowerCase() !== path.resolve(PRESET_FILE_PRIMARY).toLowerCase()) {
+                eUserData = readPresetSnapshotFile(udFile);
+            }
+        } catch (_) {}
         const ePrimary = readPresetSnapshotFile(PRESET_FILE_PRIMARY);
-        const list = [eLegacy, eBackup, ePrimary];
+        const list = [eLegacy, eBackup, eUserData, ePrimary];
         if (extraEntries && typeof extraEntries === 'object') {
             list.push(extraEntries);
         }
@@ -232,11 +261,27 @@ function syncAndBackupPresetFiles(extraEntries = null) {
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(targetFile, payload, 'utf8');
         }
+        writeDailyPresetSnapshot(payload);
         return merged;
     } catch (e) {
         console.warn('[FlowCue-Reels] syncAndBackupPresetFiles warning:', e.message);
         return {};
     }
+}
+
+// 每天保留一份预设快照（最近 14 天），即使出现意外覆盖也能找回字幕 / 水印 / 覆层等预设
+function writeDailyPresetSnapshot(payload) {
+    try {
+        const dir = path.join(flowcueBackupDir, 'daily');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const d = new Date();
+        const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+        fs.writeFileSync(path.join(dir, `local-storage-presets.${stamp}.json`), payload, 'utf8');
+        const files = fs.readdirSync(dir).filter(f => /^local-storage-presets\.\d{8}\.json$/.test(f)).sort();
+        while (files.length > 14) {
+            try { fs.unlinkSync(path.join(dir, files.shift())); } catch (_) { break; }
+        }
+    } catch (_) {}
 }
 
 // 启动时立即合并同步一次预设文件（结果缓存供首次页面激活直接复用，避免重复读写磁盘）
@@ -1550,10 +1595,20 @@ ctrlServer.listen(CTRL_PORT, '127.0.0.1', () => {
             if (typeof storeMod.writeSnapshot === 'function') {
                 const origWrite = storeMod.writeSnapshot;
                 storeMod.writeSnapshot = function (values) {
-                    const res = origWrite.call(this, values);
+                    let toWrite = values;
+                    // 「视觉审核」工作台与批量 Reels 共用同一份预设文件，但它不是编辑预设的地方，
+                    // 其页面里的预设可能不完整：只允许它补充新键 / 新预设，绝不覆盖或删除磁盘上已有的预设
+                    if (WORKBENCH_MODE === 'visual-review' && values && typeof values === 'object'
+                        && typeof storeMod.mergeSnapshots === 'function' && typeof storeMod.getPresetFilePath === 'function') {
+                        try {
+                            const onDisk = readPresetSnapshotFile(storeMod.getPresetFilePath());
+                            toWrite = storeMod.mergeSnapshots(values, onDisk);
+                        } catch (_) {}
+                    }
+                    const res = origWrite.call(this, toWrite);
                     try {
-                        if (values && typeof values === 'object') {
-                            syncAndBackupPresetFiles(values);
+                        if (toWrite && typeof toWrite === 'object') {
+                            syncAndBackupPresetFiles(toWrite);
                         }
                     } catch (_) {}
                     return res;
@@ -1564,7 +1619,11 @@ ctrlServer.listen(CTRL_PORT, '127.0.0.1', () => {
                 storeMod.hydrate = function (currentValues) {
                     const res = origHydrate.call(this, currentValues);
                     try {
-                        return syncAndBackupPresetFiles(res && typeof res === 'object' ? res : currentValues);
+                        const full = (res && typeof res === 'object') ? res : (currentValues || {});
+                        const synced = syncAndBackupPresetFiles(full);
+                        // 必须返回「完整」的预设集合给页面恢复 localStorage：
+                        // 旧版本这里只返回白名单键，导致字幕预设、水印预设等在重启后无法从磁盘恢复而丢失
+                        return { ...synced, ...full, ...pickDictKeys(synced) };
                     } catch (_) {
                         return res;
                     }

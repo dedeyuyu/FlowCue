@@ -3082,6 +3082,93 @@
     }
   }
 
+  // 设置 Vids「视频时长」滑块：读取滑块真实范围（Omni 1.2: 3-15 秒；旧模型: 3-10 秒），
+  // 先模拟在轨道对应位置按下/抬起指针，再用原生 setter + input/change 事件兜底，最后复核滑块值，最多重试 3 次
+  async function setVidsDurationSlider(popover, sliderInput, wantSeconds) {
+    const num = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
+    const min = num(sliderInput.getAttribute("min") ?? sliderInput.min, 3);
+    const max = num(sliderInput.getAttribute("max") ?? sliderInput.max, 15);
+    const step = num(sliderInput.getAttribute("step") ?? sliderInput.step, 1) || 1;
+    let target = Math.round(num(wantSeconds, 8) / step) * step;
+    if (target > max) {
+      console.warn(`[Vids] ⚠️ 目标时长 ${wantSeconds}s 超过当前模型支持的最大值 ${max}s，已改为 ${max}s`);
+      target = max;
+    }
+    if (target < min) {
+      console.warn(`[Vids] ⚠️ 目标时长 ${wantSeconds}s 低于当前模型支持的最小值 ${min}s，已改为 ${min}s`);
+      target = min;
+    }
+    const sliderRoot = sliderInput.closest(".javascriptMaterialdesignGm3WizSlider-slider") || sliderInput.parentElement?.parentElement || popover;
+    const labelEl = () => popover.querySelector(".appsDocsAiGenerativeaiVideoUiSidebarWizVideogencreationviewMenubuttonsMenubuttonDurationLabel");
+    const current = () => {
+      const v = num(sliderInput.value, NaN);
+      if (Number.isFinite(v)) return v;
+      const m = String(sliderInput.getAttribute("aria-valuetext") || labelEl()?.textContent || "").match(/(\d+)/);
+      return m ? Number(m[1]) : NaN;
+    };
+    const labelOk = () => {
+      const t = String(labelEl()?.textContent || sliderInput.getAttribute("aria-valuetext") || "");
+      const m = t.match(/(\d+)/);
+      return !m || Number(m[1]) === target;
+    };
+
+    if (current() === target && labelOk()) {
+      console.log(`[Vids] 视频时长已经是 ${target}s（滑块范围 ${min}-${max}s）`);
+      return target;
+    }
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      console.log(`[Vids] 调整视频时长滑块: ${current()}s -> ${target}s（滑块范围 ${min}-${max}s，尝试 ${attempt}/3）`);
+      // ① 模拟在轨道上对应位置点击（与真人操作一致，触发 Vids 的 pointerdown 处理器）
+      try {
+        const track = sliderRoot.querySelector(".javascriptMaterialdesignGm3WizSlider-slider__track") || sliderRoot;
+        const rect = track.getBoundingClientRect();
+        if (rect.width > 20 && max > min) {
+          const ratio = (target - min) / (max - min);
+          const clientX = Math.round(rect.left + ratio * rect.width);
+          const clientY = Math.round(rect.top + rect.height / 2);
+          const pInit = { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY, pointerId: 1, pointerType: "mouse", isPrimary: true, button: 0, buttons: 1 };
+          const target0 = document.elementFromPoint(clientX, clientY);
+          const downEl = (target0 && sliderRoot.contains(target0)) ? target0 : track;
+          downEl.dispatchEvent(new PointerEvent("pointerdown", pInit));
+          downEl.dispatchEvent(new PointerEvent("pointermove", pInit));
+          document.dispatchEvent(new PointerEvent("pointermove", pInit));
+          const upInit = { ...pInit, buttons: 0 };
+          downEl.dispatchEvent(new PointerEvent("pointerup", upInit));
+          document.dispatchEvent(new PointerEvent("pointerup", upInit));
+          await delay(250);
+        }
+      } catch (pErr) {
+        console.warn("[Vids] 模拟拖动时长滑块异常:", pErr);
+      }
+
+      // ② 原生 setter + input / change 兜底（滑块 input 上绑定了 change 处理器）
+      if (current() !== target) {
+        try {
+          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          try { sliderInput.focus(); } catch (_) {}
+          sliderInput.dispatchEvent(new Event("focus", { bubbles: true }));
+          if (nativeSetter) nativeSetter.call(sliderInput, String(target));
+          else sliderInput.value = String(target);
+          sliderInput.dispatchEvent(new Event("input", { bubbles: true }));
+          sliderInput.dispatchEvent(new Event("change", { bubbles: true }));
+          sliderInput.dispatchEvent(new Event("blur", { bubbles: true }));
+          await delay(300);
+        } catch (sErr) {
+          console.warn("[Vids] 设置时长滑块值异常:", sErr);
+        }
+      }
+
+      await delay(150);
+      if (current() === target && labelOk()) {
+        console.log(`[Vids] ✅ 视频时长已设置为 ${target}s`);
+        return target;
+      }
+    }
+    console.warn(`[Vids] ⚠️ 视频时长滑块未能确认设置为 ${target}s（当前显示 ${labelEl()?.textContent || current()}）`);
+    return current();
+  }
+
   async function syncVidsVideoSettings({ aspectRatio, resolution, duration }) {
     await ensureVidsPromptBoxExpanded();
     const settingsBtn = document.querySelector(
@@ -3099,7 +3186,8 @@
       : /(横屏|橫屏|横向|橫向|橫式|16:9|Landscape)/i;
     const targetAspectLabel = wantPortrait ? "竖屏/直向(9:16)" : "横屏/橫向(16:9)";
     const targetResLabel = String(resolution || "").includes("1080") ? "1080p" : "720p";
-    const targetDuration = Math.min(10, Math.max(3, Math.round(Number(duration) || 8)));
+    // Omni 1.2 起 Vids 时长滑块范围为 3 - 15 秒（旧模型为 3 - 10 秒），实际范围以页面滑块的 min/max 为准
+    let targetDuration = Math.min(15, Math.max(3, Math.round(Number(duration) || 8)));
 
     const ariaSummary = settingsBtn.getAttribute("aria-label") || "";
     const textSummary = (settingsBtn.textContent || "").replace(/\s+/g, "");
@@ -3147,42 +3235,10 @@
         }
       }
 
-      // (c) 视频时长滑块 (3s - 10s)
+      // (c) 视频时长滑块：按页面滑块真实的 min / max / step 计算（Omni 1.2 为 3 - 15 秒，旧模型 3 - 10 秒）
       const sliderInput = popover.querySelector("input.javascriptMaterialdesignGm3WizSlider-slider__input[type='range'], input[type='range']");
-      if (sliderInput && Number(sliderInput.value) !== targetDuration) {
-        console.log(`[Vids] 调整视频时长滑块: ${sliderInput.value}s -> ${targetDuration}s`);
-        try {
-          const track = popover.querySelector(".javascriptMaterialdesignGm3WizSlider-slider__track");
-          if (track) {
-            const rect = track.getBoundingClientRect();
-            if (rect.width > 20) {
-              const ratio = (targetDuration - 3) / (10 - 3);
-              const clientX = Math.round(rect.left + ratio * rect.width);
-              const clientY = Math.round(rect.top + rect.height / 2);
-              const pInit = { bubbles: true, cancelable: true, view: window, clientX, clientY, pointerId: 1, isPrimary: true };
-              track.dispatchEvent(new PointerEvent("pointerdown", pInit));
-              track.dispatchEvent(new PointerEvent("pointermove", pInit));
-              track.dispatchEvent(new PointerEvent("pointerup", pInit));
-              track.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window, clientX, clientY }));
-              await delay(200);
-            }
-          }
-          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-          if (nativeSetter) {
-            nativeSetter.call(sliderInput, String(targetDuration));
-          } else {
-            sliderInput.value = String(targetDuration);
-          }
-          sliderInput.setAttribute("value", String(targetDuration));
-          sliderInput.setAttribute("aria-valuetext", `${targetDuration} 秒`);
-          sliderInput.dispatchEvent(new Event("focus", { bubbles: true }));
-          sliderInput.dispatchEvent(new Event("input", { bubbles: true }));
-          sliderInput.dispatchEvent(new Event("change", { bubbles: true }));
-          sliderInput.dispatchEvent(new Event("blur", { bubbles: true }));
-          await delay(300);
-        } catch (sErr) {
-          console.warn("[Vids] 调整时长滑块异常:", sErr);
-        }
+      if (sliderInput) {
+        await setVidsDurationSlider(popover, sliderInput, targetDuration);
       }
     }
 
