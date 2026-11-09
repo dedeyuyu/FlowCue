@@ -123,6 +123,11 @@ class PluginServer(QObject):
             socket.abort()
             return
         
+        try:
+            logger.info(f"🔌 收到插件连接: origin={origin or '(无)'}, peerPort={socket.peerPort()}, 本地端口={socket.localPort()}")
+        except Exception:
+            pass
+
         temp_id = f"Worker_{self.client_id_counter}"
         self.client_id_counter += 1
 

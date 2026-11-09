@@ -5,10 +5,11 @@ import subprocess
 from pathlib import Path
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QProgressBar, QTextEdit, QMessageBox, QApplication, QFileDialog)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 
 from version import __version__
-from services.updater import CheckUpdateThread, DownloadUpdateThread, launch_installer, FALLBACK_EXT_URL
+from services.updater import CheckUpdateThread, DownloadUpdateThread, launch_installer, FALLBACK_EXT_URL, RELEASES_PAGE_URL
 
 
 class UpdateDialog(QDialog):
@@ -63,11 +64,15 @@ class UpdateDialog(QDialog):
             "QPushButton:hover{background:#047857;}"
             "QPushButton:disabled{background:#9CA3AF;}"
         )
+        self.btn_browser = QPushButton("🌐 浏览器下载")
+        self.btn_browser.setToolTip("软件内下载失败时，用浏览器打开 GitHub 发布页手动下载安装包 / 插件")
+        self.btn_browser.setVisible(False)
         self.btn_close = QPushButton("关闭")
         row.addWidget(self.btn_check)
         row.addWidget(self.btn_download_ext)
         row.addWidget(self.btn_download_runtime)
         row.addStretch()
+        row.addWidget(self.btn_browser)
         row.addWidget(self.btn_update)
         row.addWidget(self.btn_close)
         lay.addLayout(row)
@@ -76,9 +81,18 @@ class UpdateDialog(QDialog):
         self.btn_download_ext.clicked.connect(self.start_download_extension)
         self.btn_download_runtime.clicked.connect(self.start_download_runtime)
         self.btn_update.clicked.connect(self.start_update)
+        self.btn_browser.clicked.connect(self._open_release_page)
         self.btn_close.clicked.connect(self.close)
         if auto_check:
             self.start_check()
+
+    def _open_release_page(self):
+        url = (self.info or {}).get("page_url") or RELEASES_PAGE_URL
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _show_download_failed_hint(self):
+        # 软件内下载失败（常见于 VPN / 代理网关超时）：露出「浏览器下载」按钮作为兜底
+        self.btn_browser.setVisible(True)
 
     # ── 检查 ──
     def start_check(self):
@@ -96,6 +110,7 @@ class UpdateDialog(QDialog):
         self.btn_download_ext.setEnabled(True)
         if not res["ok"]:
             self.lbl_status.setText(f"❌ {res['error']}")
+            self._show_download_failed_hint()
         elif res["has_update"]:
             mb = f"（{res['size'] / 1048576:.1f} MB）" if res["size"] else ""
             self.lbl_status.setText(f"🎉 发现新版本 v{res['version']} {mb}")
@@ -136,7 +151,10 @@ class UpdateDialog(QDialog):
         self.bar.setVisible(True)
         self.bar.setValue(0)
         self.lbl_status.setText("正在下载最新浏览器插件压缩包…")
-        self.ext_dl_thread = DownloadUpdateThread(ext_url, ext_name, ext_size, dest_path=save_path)
+        self.ext_dl_thread = DownloadUpdateThread(
+            ext_url, ext_name, ext_size, dest_path=save_path,
+            sha256=(self.info or {}).get("ext_sha256", ""), asset_id=(self.info or {}).get("ext_asset_id", 0))
+        self.ext_dl_thread.status_signal.connect(self._on_dl_status)
         self.ext_dl_thread.progress_signal.connect(self._on_ext_progress)
         self.ext_dl_thread.finished_signal.connect(self._on_ext_downloaded)
         self.ext_dl_thread.start()
@@ -155,7 +173,8 @@ class UpdateDialog(QDialog):
         self.btn_download_ext.setEnabled(True)
         if not ok:
             self.lbl_status.setText(f"❌ 插件下载失败：{msg}")
-            QMessageBox.warning(self, "下载失败", f"最新插件下载失败：\n{msg}")
+            self._show_download_failed_hint()
+            QMessageBox.warning(self, "下载失败", f"最新插件下载失败：\n{msg}\n\n可点击「🌐 浏览器下载」在 GitHub 发布页手动下载。")
             return
 
         self.lbl_status.setText(f"✅ 最新插件已下载至：{msg}")
@@ -249,16 +268,23 @@ class UpdateDialog(QDialog):
         self.bar.setVisible(True)
         self.bar.setValue(0)
         self.lbl_status.setText("正在下载更新…")
-        self.dl_thread = DownloadUpdateThread(self.info["url"], self.info["name"], self.info["size"])
+        self.dl_thread = DownloadUpdateThread(
+            self.info["url"], self.info["name"], self.info["size"],
+            sha256=self.info.get("sha256", ""), asset_id=self.info.get("asset_id", 0))
+        self.dl_thread.status_signal.connect(self._on_dl_status)
         self.dl_thread.progress_signal.connect(self._on_progress)
         self.dl_thread.finished_signal.connect(self._on_downloaded)
         self.dl_thread.start()
+
+    def _on_dl_status(self, text):
+        # 显示当前下载线路 / 重试提示（进度条仍由 progress 信号驱动）
+        self.lbl_status.setText(text)
 
     def _on_progress(self, done, total):
         if total:
             self.bar.setMaximum(total)
             self.bar.setValue(done)
-            self.lbl_status.setText(f"正在下载更新… {done / 1048576:.1f} / {total / 1048576:.1f} MB")
+            self.lbl_status.setText(f"正在下载更新… {done / 1048576:.1f} / {total / 1048576:.1f} MB（连接不稳定时会自动重试 / 续传）")
         else:
             self.bar.setMaximum(0)
 
@@ -269,6 +295,7 @@ class UpdateDialog(QDialog):
             self.btn_update.setEnabled(True)
             self.btn_download_ext.setEnabled(True)
             self.lbl_status.setText(f"❌ {msg}")
+            self._show_download_failed_hint()
             return
         self.lbl_status.setText("下载完成，正在启动安装程序，软件即将自动重启…")
         try:

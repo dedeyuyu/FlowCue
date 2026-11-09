@@ -7452,11 +7452,15 @@ ${presetAfter || ""}`.trim();
       }
       retryDelay = 2000;
       bridgeActive = true;
+      relayBrokenCount = 0;
+      refusedStreak = 0;
+      failLogCount = 0;
       try { localStorage.setItem("flowcue_ws_ep", String(endpointIdx % WS_ENDPOINTS.length)); } catch (_) {}
+      try { localStorage.setItem("flowcue_ws_mode", lastMode === "native" ? "native" : "relay"); } catch (_) {}
       preferredIdx = endpointIdx % WS_ENDPOINTS.length;
       startBadge();
       sendToExtension("keepTabAwake", {}).catch(() => {});
-      log(`✅ 已连接桌面软件 (${wsUrl})，全局托管功能已启用`);
+      log(`✅ 已连接桌面软件 (${wsUrl}，通道=${lastMode === "native" ? "页面直连" : "插件后台中转"})，全局托管功能已启用`);
     }
 
     async function handleMessage(msg, wsUrl) {
@@ -7660,8 +7664,19 @@ ${presetAfter || ""}`.trim();
     // 开启 VPN / TUN 模式时更容易触发。插件后台 Service Worker 拥有 host_permissions，不受此限制，
     // 因此改为：MAIN 页面 → content-isolated.js → 后台 Service Worker → ws://127.0.0.1 桌面软件。
     // 若中转通道不可用（旧版插件后台 / 子框架），自动回退为页面直连 WebSocket。
-    let wsRelayMode = "auto";   // "auto" | "relay" | "native"
-    let relayNoAckCount = 0;
+    // 连接通道策略（relay = 经插件后台中转；native = 页面直连）：
+    //   · 优先使用中转（绕开 Chrome「本地网络访问」拦截）；
+    //   · 中转通道自身故障（后台没有中转处理器 / 无应答 / 上下文失效）→ 立即改用页面直连；
+    //   · 中转能连但一直被拒绝（软件未开启识别属正常）→ 偶尔穿插一次页面直连，两条路都覆盖；
+    //   · 以「握手成功」为准记住上次可用的通道，绝不再因为「收到应答」就锁死在中转上。
+    let relayBrokenCount = 0;   // 中转通道自身故障次数
+    let refusedStreak = 0;      // 连续被拒绝 / 失败次数（未握手成功）
+    let attemptNo = 0;          // 连接尝试序号
+    let relaySupport = null;    // 插件后台是否支持中转：null 未知 / true / false（旧版后台）
+    let failLogCount = 0;
+    let lastMode = "relay";     // 最近一次尝试使用的通道
+    const diagState = { lastReason: "", lastEndpoint: "", lastMode: "", attempts: 0, bg: null };
+    try { window.flowcueBridgeDiag = () => ({ ...diagState, relayBrokenCount, refusedStreak, relaySupport }); } catch (_) {}
     const RELAY_SENDER_MAIN = "flow-main-ws";
     const RELAY_SENDER_ISO = "flow-isolated-ws";
     const relaySockets = new Map();
@@ -7674,6 +7689,7 @@ ${presetAfter || ""}`.trim();
     class RelaySocket {
       constructor(url) {
         this.url = url;
+        this.isRelay = true;
         this.readyState = 0; // CONNECTING
         this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null;
         this._id = "ws_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 9);
@@ -7683,11 +7699,11 @@ ${presetAfter || ""}`.trim();
         this._post({ op: "open", url });
         // 1.5 秒内中转脚本无回应 → 视为中转通道不可用
         this._ackTimer = setTimeout(() => {
-          if (!this._acked) { this._noAck = true; this._fireClose(1006, "relay-no-ack"); }
+          if (!this._acked) this._fireClose(1006, "relay-no-ack", false);
         }, 1500);
         // 12 秒内既未连上也未关闭 → 视为失败
         this._openTimer = setTimeout(() => {
-          if (this.readyState === 0) { this._post({ op: "close" }); this._fireClose(1006, "relay-timeout"); }
+          if (this.readyState === 0) { this._post({ op: "close" }); this._fireClose(1006, "relay-timeout", false); }
         }, 12000);
       }
       _post(msg) {
@@ -7696,7 +7712,6 @@ ${presetAfter || ""}`.trim();
       _handle(m) {
         if (m.event === "ack") {
           this._acked = true; clearTimeout(this._ackTimer);
-          if (m.error) { this._relayError = m.error; }
           return;
         }
         this._acked = true; clearTimeout(this._ackTimer);
@@ -7704,6 +7719,7 @@ ${presetAfter || ""}`.trim();
           if (this.readyState !== 0) return;
           clearTimeout(this._openTimer);
           this.readyState = 1;
+          this._everOpened = true;
           try { this.onopen && this.onopen({ type: "open" }); } catch (e) { console.error(e); }
         } else if (m.event === "message") {
           if (this.readyState !== 1) return;
@@ -7711,26 +7727,16 @@ ${presetAfter || ""}`.trim();
         } else if (m.event === "error") {
           try { this.onerror && this.onerror({ type: "error" }); } catch (_) {}
         } else if (m.event === "close") {
-          this._fireClose(m.code || 1006, m.reason || "");
+          this._fireClose(m.code || 1006, m.reason || "", !!(m.opened || this._everOpened));
         }
       }
-      _fireClose(code, reason) {
+      _fireClose(code, reason, opened) {
         if (this._closedFired) return;
         this._closedFired = true;
         clearTimeout(this._ackTimer); clearTimeout(this._openTimer);
-        if (reason === "relay-no-ack") {
-          // 中转脚本连续无应答 → 回退为页面直连
-          relayNoAckCount++;
-          if (relayNoAckCount >= 2 && wsRelayMode === "auto") {
-            wsRelayMode = "native";
-            log("⚠️ 插件后台中转通道无响应（插件可能未完全更新，请在扩展管理页刷新插件），已回退为页面直连模式");
-          }
-        } else if (this._acked && wsRelayMode === "auto") {
-          wsRelayMode = "relay";
-        }
         this.readyState = 3;
         relaySockets.delete(this._id);
-        try { this.onclose && this.onclose({ type: "close", code, reason, wasClean: code === 1000 }); } catch (e) { console.error(e); }
+        try { this.onclose && this.onclose({ type: "close", code, reason, opened: !!opened, wasClean: code === 1000 }); } catch (e) { console.error(e); }
       }
       send(data) {
         if (this.readyState !== 1) return;
@@ -7741,14 +7747,46 @@ ${presetAfter || ""}`.trim();
         this.readyState = 2;
         this._post({ op: "close" });
         // 等待后台回报 close；兜底 1.5 秒后本地触发
-        setTimeout(() => this._fireClose(1000, "client-close"), 1500);
+        setTimeout(() => this._fireClose(1000, "client-close", !!this._everOpened), 1500);
       }
     }
 
-    function createBridgeSocket(wsUrl) {
-      const isTop = (() => { try { return window.top === window; } catch (_) { return false; } })();
-      if (wsRelayMode !== "native" && isTop) return new RelaySocket(wsUrl);
-      return new WebSocket(wsUrl);
+    function isTopWindow() { try { return window.top === window; } catch (_) { return false; } }
+
+    // 选择本次尝试使用的通道
+    function pickMode() {
+      attemptNo++;
+      if (!isTopWindow() || relaySupport === false) return "native";
+      let saved = "";
+      try { saved = localStorage.getItem("flowcue_ws_mode") || ""; } catch (_) {}
+      // 中转通道自身故障：改用页面直连，每 8 次尝试再试一次中转（用户可能刚刷新了插件）
+      if (relayBrokenCount >= 2) return attemptNo % 8 === 0 ? "relay" : "native";
+      // 上次是靠页面直连连上的：继续直连；若连续失败多次，每 3 次穿插一次中转
+      if (saved === "native") return (refusedStreak >= 4 && attemptNo % 3 === 0) ? "relay" : "native";
+      // 默认中转；一直被拒绝时每 3 次穿插一次页面直连，防止「后台连不上本机但页面能连」的情况漏掉
+      return (refusedStreak >= 6 && attemptNo % 3 === 0) ? "native" : "relay";
+    }
+
+    function createBridgeSocket(wsUrl, mode) {
+      if (mode === "relay") return new RelaySocket(wsUrl);
+      const ws = new WebSocket(wsUrl);
+      ws.isRelay = false;
+      return ws;
+    }
+
+    function noteConnectFailure(mode, url, reason, opened) {
+      failLogCount++;
+      diagState.lastReason = reason; diagState.lastEndpoint = url; diagState.lastMode = mode; diagState.attempts = attemptNo;
+      if (failLogCount <= 3 || failLogCount % 12 === 0) {
+        const r = String(reason || "").trim();
+        const broken = /^relay-|Receiving end|context invalidated|extension-context|url-not-allowed/i.test(r);
+        const hint = broken
+          ? "（插件中转通道异常：请在 chrome://extensions 点击 FlowCue 插件的「刷新」，再刷新本页面）"
+          : opened
+            ? "（已连到本机端口，但不是 FlowCue 软件：可能被其它程序 / 代理占用）"
+            : "（软件未点击「开始识别」或未运行时属正常；若已开启识别仍连不上，请查看是否有防火墙 / VPN 拦截了本机回环地址）";
+        log(`连接桌面软件失败 #${failLogCount}：通道=${mode === "relay" ? "插件后台中转" : "页面直连"}，端点=${url}，原因=${r || "连接被拒绝"} ${hint}`);
+      }
     }
 
     function connect() {
@@ -7760,10 +7798,14 @@ ${presetAfter || ""}`.trim();
       const wsUrl = WS_ENDPOINTS[endpointIdx % WS_ENDPOINTS.length];
       let currentSocket = null;
       let opened = false;
+      const mode = pickMode();
+      lastMode = mode;
       try {
-        currentSocket = createBridgeSocket(wsUrl);
+        currentSocket = createBridgeSocket(wsUrl, mode);
         socket = currentSocket;
       } catch (e) {
+        noteConnectFailure(mode, wsUrl, "创建连接异常：" + String((e && e.message) || e), false);
+        refusedStreak++;
         nextDormantEndpoint();
         scheduleReconnect(DORMANT_PROBE_MS);
         return;
@@ -7809,7 +7851,7 @@ ${presetAfter || ""}`.trim();
         try { msg = JSON.parse(ev.data); } catch (e) { return; }
         handleMessage(msg, wsUrl);
       };
-      currentSocket.onclose = () => {
+      currentSocket.onclose = (closeEv) => {
         if (handshakeTimer) {
           clearTimeout(handshakeTimer);
           handshakeTimer = null;
@@ -7824,11 +7866,22 @@ ${presetAfter || ""}`.trim();
           scheduleReconnect(3000);
         } else if (opened) {
           // 连上了但不是 FlowCue（被代理劫持）→ 快速换下一个通道
+          refusedStreak++;
+          noteConnectFailure(mode, wsUrl, "已连上端口但未收到 FlowCue 握手", true);
           scheduleReconnect(600);
         } else {
-          // 连接被拒绝 = 软件未开启识别 / 未运行 → 休眠，稍后再轻量探测一次
+          // 没连上：软件未开启识别 / 未运行属正常；但若是中转通道自身故障，需要改用页面直连并提示用户刷新插件
+          const reason = String((closeEv && closeEv.reason) || "");
+          const relayBroken = mode === "relay" && /^relay-|Receiving end|context invalidated|extension-context|url-not-allowed/i.test(reason);
+          if (relayBroken) {
+            relayBrokenCount++;
+            if (relayBrokenCount === 2) log("⚠️ 插件后台中转通道异常（" + reason + "），已改用页面直连；请在 chrome://extensions 点击 FlowCue 插件的「刷新」后再刷新本页面");
+          } else {
+            refusedStreak++;
+          }
+          noteConnectFailure(mode, wsUrl, reason, false);
           nextDormantEndpoint();
-          scheduleReconnect(DORMANT_PROBE_MS);
+          scheduleReconnect(relayBroken ? 800 : DORMANT_PROBE_MS);
         }
       };
       currentSocket.onerror = () => { /* onclose 会负责重连 */ };
@@ -7854,7 +7907,24 @@ ${presetAfter || ""}`.trim();
     }
 
     // 页面加载完成后再开始休眠探测；在软件点击「开始识别」之前不读取任何浏览器 ID / 邮箱 / 积分
-    setTimeout(connect, 3000);
+    // 开始前先确认插件后台是否支持连接中转（旧版后台没有中转处理器，会导致一直连不上），并在控制台给出明确提示
+    setTimeout(async () => {
+      try {
+        const r = await Promise.race([sendToExtension("getBgVersion", {}), sleep(2500).then(() => null)]);
+        diagState.bg = r || null;
+        if (r && r.version) {
+          relaySupport = !!r.relay;
+          log(`插件后台版本=${r.version}，插件版本=${r.ext_version || "未知"}，连接中转=${relaySupport ? "支持" : "不支持（旧版后台）"}`);
+          if (!relaySupport) {
+            log("⚠️ 插件后台是旧版本，不支持连接中转。请到 chrome://extensions 点击 FlowCue 插件卡片上的「刷新」按钮，然后再刷新本页面。");
+            try { showToast("⚠️ FlowCue 插件后台是旧版本：请到 chrome://extensions 点击插件的「刷新」，再刷新本页面", 8000); } catch (_) {}
+          }
+        } else {
+          log("⚠️ 未收到插件后台响应（插件可能已被停用 / 需要刷新）：将同时尝试页面直连");
+        }
+      } catch (_) {}
+      connect();
+    }, 3000);
   })();
 
 })();

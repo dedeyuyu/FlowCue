@@ -280,14 +280,18 @@ class _RuntimeInstallWorker(QThread):
         return urls
 
     def _download_with_fallback(self, direct_url: str, dest_zip: Path, title_label: str, step_idx: int, total_steps: int) -> bool:
-        candidate_urls = self._build_candidate_urls(direct_url)
+        # 每条线路尝试 2 次（VPN / 代理网关偶发 502 / 504 / 超时，重试一次通常即可恢复）
+        candidate_urls = [u for u in self._build_candidate_urls(direct_url) for _ in range(2)]
         last_err = ""
         headers = {"User-Agent": "FlowCue-Runtime-Installer/1.0"}
 
         for attempt_idx, url in enumerate(candidate_urls):
             if self._cancelled:
                 return False
-            route_name = "GitHub 官方直连" if attempt_idx == 0 else f"高速镜像线路 {attempt_idx}"
+            route_idx = attempt_idx // 2
+            route_name = "GitHub 官方直连" if route_idx == 0 else f"高速镜像线路 {route_idx}"
+            if attempt_idx % 2 == 1:
+                time.sleep(2)
             self.status_signal.emit(f"[{step_idx}/{total_steps}] 正在连接 {route_name} 下载 {title_label}...")
             try:
                 with requests.get(url, headers=headers, stream=True, timeout=(10, 30), allow_redirects=True) as resp:

@@ -148,7 +148,7 @@ window.addEventListener("message", (event) => {
       port = chrome.runtime.connect({ name: "flowcue-ws" });
     } catch (e) {
       postWsEvent(id, { event: "ack", error: String(e?.message || e) });
-      postWsEvent(id, { event: "close", code: 1006, reason: "extension-context-invalidated" });
+      postWsEvent(id, { event: "close", code: 1006, reason: "extension-context-invalidated: " + String(e?.message || e) });
       return;
     }
     const entry = { port, closed: false, keepAlive: null };
@@ -160,8 +160,9 @@ window.addEventListener("message", (event) => {
       if (m.event === "close") cleanup(id, false);
     });
     port.onDisconnect.addListener(() => {
-      void chrome.runtime.lastError;
-      if (!entry.closed) postWsEvent(id, { event: "close", code: 1006, reason: "relay-disconnected" });
+      // 把浏览器给出的真实原因带回页面（如旧版后台没有中转处理器时：Could not establish connection. Receiving end does not exist.）
+      const lastErr = (chrome.runtime.lastError && chrome.runtime.lastError.message) || "";
+      if (!entry.closed) postWsEvent(id, { event: "close", code: 1006, reason: "relay-disconnected" + (lastErr ? ": " + lastErr : "") });
       cleanup(id, false);
     });
     // 每 20 秒发送一次保活，防止后台 Service Worker 因空闲被浏览器回收导致连接中断

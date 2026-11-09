@@ -4,7 +4,13 @@
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 后台版本握手：用于检测「网页脚本已更新但插件后台仍是旧版本」的情况
   if (message.action === "getBgVersion") {
-    sendResponse({ version: "1.3.2-hosted", nativeDrag: !!(chrome.debugger && chrome.debugger.attach) });
+    // relay: true 表示本后台带有「WebSocket 中转」处理器（chrome.runtime.onConnect "flowcue-ws"），页面据此决定是否走中转
+    sendResponse({
+      version: "1.3.3-hosted-relay",
+      relay: true,
+      ext_version: (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "",
+      nativeDrag: !!(chrome.debugger && chrome.debugger.attach)
+    });
     return;
   }
 
@@ -595,15 +601,25 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
       }
       const sock = ws;
-      sock.onopen = () => post({ event: "open" });
-      sock.onmessage = (ev) => post({ event: "message", data: typeof ev.data === "string" ? ev.data : "" });
-      sock.onerror = () => post({ event: "error" });
-      sock.onclose = (ev) => {
-        post({ event: "close", code: ev.code || 1006, reason: ev.reason || "" });
+      let everOpened = false;
+      let closedPosted = false;
+      const postClose = (code, reason) => {
+        if (closedPosted) return;
+        closedPosted = true;
+        post({ event: "close", code: code || 1006, reason: reason || "", opened: everOpened });
         if (ws === sock) ws = null;
         try { if (portAlive) port.disconnect(); } catch (_) {}
         portAlive = false;
       };
+      sock.onopen = () => { everOpened = true; post({ event: "open" }); };
+      sock.onmessage = (ev) => post({ event: "message", data: typeof ev.data === "string" ? ev.data : "" });
+      sock.onerror = () => {
+        post({ event: "error" });
+        // 个别环境连接失败时只触发 error、迟迟没有 close：主动补发 close，页面不必等 12 秒超时
+        setTimeout(() => { if (sock.readyState !== 1) { try { sock.close(); } catch (_) {} postClose(1006, "connect-failed"); } }, 250);
+      };
+      sock.onclose = (ev) => postClose(ev.code, ev.reason);
+    
     } else if (m.op === "send") {
       try { if (ws && ws.readyState === 1) ws.send(String(m.data ?? "")); } catch (_) {}
     } else if (m.op === "close") {
