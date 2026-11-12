@@ -288,18 +288,16 @@ class PropertyPanelMixin:
 
         chosen_img_obj = None
 
-        # 1. 优先检查 seg 中的显式绑定
+        # 1. 优先检查 seg 中的显式绑定（支持精确文件名、忽略大小写、无后缀 stem 及图片序号匹配）
         explicit_name = seg.get("image_name", "").strip() if isinstance(seg, dict) else ""
         if explicit_name:
-            if use_cache:
-                for img in all_imgs:
-                    if img.name == explicit_name:
-                        chosen_img_obj = img
-                        break
-            else:
+            if not use_cache:
                 cand = downloads_dir / explicit_name
                 if cand.exists() and cand.is_file():
                     chosen_img_obj = cand
+            if not chosen_img_obj:
+                from services.batch_planner import match_explicit_image
+                chosen_img_obj = match_explicit_image(explicit_name, all_imgs)
 
         # 2. 按序号匹配 (1.jpg, 01.jpg, 1_*.jpg 等)
         if not chosen_img_obj:

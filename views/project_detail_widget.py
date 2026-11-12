@@ -467,6 +467,17 @@ class ProjectDetailWidget(SegmentsTableMixin, PropertyPanelMixin, BulkEditMixin,
         self.btn_copy_table.setStyleSheet("background-color: #0F766E; color: white; font-weight: bold;")
         self.btn_copy_table.clicked.connect(self.copy_segments_as_table)
         table_buttons_layout.addWidget(self.btn_copy_table)
+
+        self.btn_paste_table_import = QPushButton("📋 表格复制导入")
+        self.btn_paste_table_import.setToolTip(
+            "针对当前选中的单个任务，从剪贴板表格直接导入「断行后的文案 + 图片名称」两列：\n"
+            "• 自动按文案字符数计算时长\n"
+            "• 提示词保持当前模板与运镜选择\n"
+            "• 精确按导入行数生成分句（绝不多出空任务）"
+        )
+        self.btn_paste_table_import.setStyleSheet("background-color: #2563EB; color: white; font-weight: bold;")
+        self.btn_paste_table_import.clicked.connect(self.open_table_paste_import_dialog)
+        table_buttons_layout.addWidget(self.btn_paste_table_import)
         
         table_buttons_layout.addStretch()
         

@@ -127,30 +127,88 @@ class UpdateDialog(QDialog):
                 self.txt_notes.setPlainText(f"【当前最新插件与软件版本 v{ver_txt} 更新说明】\n\n{res['notes']}")
 
     # ── 下载最新插件 ──
+    def _get_config_manager(self):
+        mw = self.parent()
+        return getattr(mw, "config_manager", None) if mw is not None else None
+
     def start_download_extension(self):
         ext_url = (self.info or {}).get("ext_url") or FALLBACK_EXT_URL
         ext_name = (self.info or {}).get("ext_name") or "FlowCue-Extension.7z"
         ext_size = (self.info or {}).get("ext_size") or 0
 
-        default_dir = Path.home() / "Downloads"
-        if not default_dir.exists():
-            default_dir = Path.home() / "Desktop"
-        default_path = str(default_dir / ext_name)
+        from services.extension_sync import discover_local_extension_dirs, read_extension_version
+        cm = self._get_config_manager()
+        known_dirs = discover_local_extension_dirs(config_manager=cm)
+        default_ext_dir = ""
+        if cm and getattr(cm, "custom_extension_dir", ""):
+            default_ext_dir = cm.custom_extension_dir
+        elif known_dirs:
+            default_ext_dir = str(known_dirs[0])
 
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "选择最新插件压缩包保存位置",
-            default_path,
-            "压缩包文件 (*.7z *.zip);;所有文件 (*.*)"
+        cur_ext_hint = ""
+        if default_ext_dir and Path(default_ext_dir).is_dir():
+            cur_v = read_extension_version(default_ext_dir)
+            cur_ext_hint = f"\n\n已检测到本地插件目录：\n{default_ext_dir}" + (f"（当前版本 v{cur_v}）" if cur_v else "")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("更新 / 下载最新浏览器插件")
+        box.setText(
+            "请选择插件更新方式："
+            f"{cur_ext_hint}\n\n"
+            "• 推荐选择【📂 直接更新插件安装目录】：自动下载并解压覆盖到浏览器加载的插件文件夹，版本号立即变为最新！"
         )
-        if not save_path:
+        btn_dir = box.addButton("📂 直接更新插件安装目录（推荐）", QMessageBox.ButtonRole.AcceptRole)
+        btn_archive = box.addButton("💾 另存为压缩包 (.7z)", QMessageBox.ButtonRole.ActionRole)
+        btn_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_dir)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is btn_cancel or clicked is None:
             return
+
+        self._ext_unpack_target_dir = ""
+        if clicked is btn_dir:
+            start_browse = default_ext_dir if (default_ext_dir and Path(default_ext_dir).exists()) else str(Path.home() / "Desktop")
+            chosen_dir = QFileDialog.getExistingDirectory(
+                self,
+                "选择浏览器已加载的 FlowCue 插件文件夹（将自动解压覆盖更新）",
+                start_browse,
+            )
+            if not chosen_dir:
+                return
+            chosen_path = Path(chosen_dir)
+            # 若用户选到了外层目录（如 D:\Antigravity\FlowCue\FlowCue 或 D:\Antigravity\FlowCue），而其下已有 FlowCue插件 子目录且外层自身没有 manifest.json，智能定位到插件子目录
+            if not (chosen_path / "manifest.json").is_file():
+                for sub_name in ("FlowCue插件", "extension"):
+                    if (chosen_path / sub_name / "manifest.json").is_file():
+                        chosen_path = chosen_path / sub_name
+                        break
+            self._ext_unpack_target_dir = str(chosen_path)
+            if cm is not None:
+                cm.custom_extension_dir = self._ext_unpack_target_dir
+                cm.save()
+            import tempfile
+            save_path = str(Path(tempfile.gettempdir()) / f"FlowCue_Ext_Update_{os.getpid()}_{ext_name}")
+        else:
+            default_dir = Path.home() / "Downloads"
+            if not default_dir.exists():
+                default_dir = Path.home() / "Desktop"
+            default_path = str(default_dir / ext_name)
+            save_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "选择最新插件压缩包保存位置",
+                default_path,
+                "压缩包文件 (*.7z *.zip);;所有文件 (*.*)"
+            )
+            if not save_path:
+                return
 
         self.btn_download_ext.setEnabled(False)
         self.btn_check.setEnabled(False)
         self.bar.setVisible(True)
         self.bar.setValue(0)
-        self.lbl_status.setText("正在下载最新浏览器插件压缩包…")
+        self.lbl_status.setText("正在下载最新浏览器插件…")
         self.ext_dl_thread = DownloadUpdateThread(
             ext_url, ext_name, ext_size, dest_path=save_path,
             sha256=(self.info or {}).get("ext_sha256", ""), asset_id=(self.info or {}).get("ext_asset_id", 0))
@@ -171,11 +229,52 @@ class UpdateDialog(QDialog):
         self.bar.setVisible(False)
         self.btn_check.setEnabled(True)
         self.btn_download_ext.setEnabled(True)
+        unpack_dir = getattr(self, "_ext_unpack_target_dir", "")
+
         if not ok:
+            # 若用户选择了直接更新本地插件目录，但 GitHub 下载超时，可用软件内置最新插件直接同步兜底！
+            if unpack_dir:
+                from services.extension_sync import get_bundled_extension_dir, sync_extension_files
+                bundled = get_bundled_extension_dir()
+                if bundled:
+                    sync_ok, ver_or_err = sync_extension_files(bundled, unpack_dir, force_version=__version__)
+                    if sync_ok:
+                        self.lbl_status.setText(f"✅ 云端连接超时，已使用软件内置插件直接更新至 v{ver_or_err}：{unpack_dir}")
+                        QMessageBox.information(
+                            self,
+                            "插件目录已更新",
+                            f"GitHub 下载超时，已自动将本软件内置的最新插件（v{ver_or_err}）同步覆盖到：\n{unpack_dir}\n\n"
+                            "📌 最后一步：\n"
+                            "请打开浏览器 chrome://extensions 页面，点击 FlowCue 插件卡片右下角的 🔄「刷新」按钮，再刷新网页即可看到最新版本号！",
+                        )
+                        return
             self.lbl_status.setText(f"❌ 插件下载失败：{msg}")
             self._show_download_failed_hint()
             QMessageBox.warning(self, "下载失败", f"最新插件下载失败：\n{msg}\n\n可点击「🌐 浏览器下载」在 GitHub 发布页手动下载。")
             return
+
+        if unpack_dir:
+            from services.extension_sync import extract_extension_archive_to_dir
+            ex_ok, ver_or_err = extract_extension_archive_to_dir(msg, unpack_dir)
+            try:
+                Path(msg).unlink(missing_ok=True)
+            except Exception:
+                pass
+            if ex_ok:
+                self.lbl_status.setText(f"✅ 插件目录已成功更新至 v{ver_or_err}：{unpack_dir}")
+                QMessageBox.information(
+                    self,
+                    "插件自动更新完成",
+                    f"🎉 已成功将最新插件（v{ver_or_err}）解压覆盖到：\n{unpack_dir}\n\n"
+                    "软件已记住该插件路径，后续升级软件时也会自动为您同步最新版本号！\n\n"
+                    "📌 最后一步：\n"
+                    "请打开浏览器 chrome://extensions 页面，点击 FlowCue 插件卡片右下角的 🔄「刷新」按钮，再刷新一次 Flow / Vids 网页即可生效！",
+                )
+                return
+            else:
+                self.lbl_status.setText(f"❌ 解压更新插件目录失败：{ver_or_err}")
+                QMessageBox.warning(self, "解压失败", f"插件压缩包已下载，但自动覆盖目录失败：\n{ver_or_err}")
+                return
 
         self.lbl_status.setText(f"✅ 最新插件已下载至：{msg}")
         reply = QMessageBox.information(
@@ -183,9 +282,8 @@ class UpdateDialog(QDialog):
             "插件下载完成",
             f"最新浏览器插件压缩包已成功下载到：\n{msg}\n\n"
             "📌 使用方法：\n"
-            "1. 解压该压缩包到任意固定文件夹（或直接覆盖旧插件文件夹）；\n"
-            "2. 打开浏览器 chrome://extensions 页面，开启右上角「开发者模式」；\n"
-            "3. 点击「加载已解压的扩展程序」选择解压后的文件夹（若已加载过，直接点插件卡片右下角的 🔄 刷新按钮即可）！\n\n"
+            "1. 解压该压缩包覆盖您原来的插件文件夹（切勿新建不同目录而忘记切换浏览器加载路径）；\n"
+            "2. 打开浏览器 chrome://extensions 页面，点击插件卡片右下角的 🔄 刷新按钮即可更新版本号！\n\n"
             "是否立即打开所在文件夹？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes

@@ -159,6 +159,17 @@ class MainWindow(QMainWindow):
 
         self.load_initial_state()
         QTimer.singleShot(500, self._check_and_install_runtime_on_startup)
+        QTimer.singleShot(1200, self._auto_sync_local_extensions_on_startup)
+
+    def _auto_sync_local_extensions_on_startup(self):
+        """静默检查本地已安装的解压版浏览器插件文件夹，自动将其同步为当前软件最新插件版本。"""
+        try:
+            from services.extension_sync import auto_sync_local_extension_dirs
+            synced = auto_sync_local_extension_dirs(config_manager=self.config_manager)
+            for path, old_v, new_v in synced:
+                print(f"[MainWindow] Auto-synced local extension dir: {path} (v{old_v} -> v{new_v})")
+        except Exception as e:
+            print(f"[MainWindow] _auto_sync_local_extensions_on_startup warning: {e}")
 
     def _check_and_install_runtime_on_startup(self):
         """首次启动检测是否已安装 FFmpeg 与 VideoKit (批量Reels/素材快速审核) 运行环境。
@@ -450,6 +461,18 @@ class MainWindow(QMainWindow):
         )
         self.btn_top_multi_select.clicked.connect(self.open_current_project_bulk_edit)
         top_row2.addWidget(self.btn_top_multi_select)
+
+        self.btn_top_table_import = QPushButton("📋 表格复制导入")
+        self.btn_top_table_import.setObjectName("btn_top_table_import")
+        self.btn_top_table_import.setStyleSheet(row1_blue_qss)
+        self.btn_top_table_import.setToolTip(
+            "选中左侧单个任务后，从剪贴板表格一键导入「断行后的文案 + 图片名称」：\n"
+            "• 仅支持针对单个选中任务导入\n"
+            "• 时长按每句文案字符数自动计算，提示词保持原选择方式\n"
+            "• 严格按本次导入行数生成小任务（绝不多出空任务）"
+        )
+        self.btn_top_table_import.clicked.connect(self.open_current_project_table_import)
+        top_row2.addWidget(self.btn_top_table_import)
 
         self.btn_top_open_folder = QPushButton("📂 打开文件夹")
         self.btn_top_open_folder.setObjectName("btn_top_open_folder")
@@ -834,13 +857,19 @@ class MainWindow(QMainWindow):
             }
         """)
         
+        act_table_import = menu.addAction("📋 表格复制导入断行文案与图片")
+        menu.addSeparator()
         act_rename = menu.addAction("✏️ 重命名项目 (Rename)")
         act_copy_name = menu.addAction("📋 复制完整项目名称 (Copy Full Name)")
         menu.addSeparator()
         act_delete = menu.addAction("🗑️ 删除项目 (Delete)")
         
         action = menu.exec(self.list_projects.mapToGlobal(pos))
-        if action == act_rename:
+        if action == act_table_import:
+            self.list_projects.setCurrentItem(item)
+            self.on_project_clicked(item)
+            self.detail_widget.open_table_paste_import_dialog()
+        elif action == act_rename:
             self.rename_project(item)
         elif action == act_copy_name:
             self.on_project_double_clicked(item)
@@ -1264,6 +1293,36 @@ class MainWindow(QMainWindow):
         if not self._ensure_active_project_selected():
             return
         self.detail_widget.open_bulk_edit_dialog()
+
+    def open_current_project_table_import(self):
+        """Opens the single-task Table Copy-Paste Import dialog ONLY when the user has explicitly selected a single task."""
+        if hasattr(self, "main_tab_widget") and self.main_tab_widget.currentIndex() != 0:
+            self.main_tab_widget.setCurrentIndex(0)
+
+        selected_items = self.list_projects.selectedItems() if hasattr(self, "list_projects") else []
+        if len(selected_items) > 1:
+            QMessageBox.information(
+                self,
+                "仅支持单个任务",
+                "「表格复制导入」仅支持选中单个任务后导入断行文案与图片名称，请只选中一个任务后再操作。",
+            )
+            return
+
+        if selected_items:
+            item = selected_items[0]
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path and (not self.detail_widget.project_path or Path(self.detail_widget.project_path) != Path(path)):
+                self.on_project_clicked(item)
+
+        if not self.detail_widget or not self.detail_widget.project_model or not self.detail_widget.project_path:
+            QMessageBox.information(
+                self,
+                "请先选中任务",
+                "该功能仅支持用户选中任务后，针对单个任务导入断行文案和图片名称。\n\n请先在左侧项目列表中点击选中一个任务！",
+            )
+            return
+
+        self.detail_widget.open_table_paste_import_dialog()
 
     def open_current_project_quick_review(self):
         """Jumps to Visual Review tab for the current project."""

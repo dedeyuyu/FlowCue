@@ -52,6 +52,14 @@ class RunMixin:
                         proj_cache[proj_path_str] = None
                 proj_model = proj_cache.get(proj_path_str)
 
+            enable_end = False
+            downloads_dir = Path(proj_path_str) / "downloads" if proj_path_str else None
+            if proj_model is not None:
+                if proj_model.enable_end_frame is not None:
+                    enable_end = bool(proj_model.enable_end_frame)
+                else:
+                    enable_end = bool(getattr(cm, "enable_end_frame", False)) if cm else False
+
             for t in b.get("tasks") or []:
                 t["aspect_ratio"] = default_aspect
                 t["model"] = default_model
@@ -89,15 +97,59 @@ class RunMixin:
                         t["mode"] = default_mode
                         t["_mode_overridden"] = False
 
+                    # 同步首帧图片素材
+                    seg_img_name = (seg.get("image_name") or "").strip()
+                    if seg_img_name and downloads_dir is not None:
+                        cand_start = downloads_dir / seg_img_name
+                        if cand_start.is_file():
+                            new_start_path = str(cand_start.resolve())
+                            if t.get("local_image_path") != new_start_path:
+                                t.pop("image_data_url", None)
+                                t.pop("imageDataUrl", None)
+                            t["image_name"] = seg_img_name
+                            t["local_image_path"] = new_start_path
+
+                    # 同步尾帧图片素材（开启首尾帧且已选尾帧时强制使用 VIDEO_FRAMES）
+                    seg_end_name = (seg.get("end_image_name") or "").strip() if enable_end else ""
+                    cand_end = (downloads_dir / seg_end_name) if (seg_end_name and downloads_dir is not None) else None
+                    if cand_end is not None and cand_end.is_file():
+                        new_end_path = str(cand_end.resolve())
+                        if t.get("end_local_image_path") != new_end_path:
+                            t.pop("end_image_data_url", None)
+                            t.pop("endImageDataUrl", None)
+                        t["end_image_name"] = seg_end_name
+                        t["end_local_image_path"] = new_end_path
+                        t["mode"] = "VIDEO_FRAMES"
+                    else:
+                        t.pop("end_image_name", None)
+                        t.pop("end_local_image_path", None)
+                        t.pop("end_image_data_url", None)
+                        t.pop("endImageDataUrl", None)
+
                     if cm:
                         is_edge = (seg_idx == 0 or seg_idx == len(proj_model.spanish_segments) - 1)
                         t["duration"] = cm.get_duration_for_length(len(text), is_edge=is_edge)
                     elif seg.get("duration"):
                         t["duration"] = seg.get("duration")
                 else:
-                    if not t.get("_mode_overridden"):
+                    if t.get("end_image_name") or t.get("end_local_image_path"):
+                        t["mode"] = "VIDEO_FRAMES"
+                    elif not t.get("_mode_overridden"):
                         t["mode"] = default_mode
 
+            # 重新汇总本批次需要上传的全部首帧 + 尾帧图片路径
+            new_images = []
+            seen_imgs = set()
+            for t in b.get("tasks") or []:
+                for key in ("local_image_path", "end_local_image_path"):
+                    ip = (t.get(key) or "").strip()
+                    if ip and ip not in seen_imgs:
+                        seen_imgs.add(ip)
+                        new_images.append(ip)
+            prev_images = set(b.get("images") or [])
+            if any(ip not in prev_images for ip in new_images) and b.get("upload_state") == "成功":
+                b["upload_state"] = "未上传"
+            b["images"] = new_images
             b["points"] = sum(self._points_of(t) for t in (b.get("tasks") or []))
 
         if updated_prompts_count > 0:

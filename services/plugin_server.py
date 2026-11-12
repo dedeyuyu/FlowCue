@@ -95,12 +95,16 @@ class PluginServer(QObject):
     def _is_allowed_origin(self, origin):
         """Verifies if the incoming WebSocket connection Origin is authorized to prevent CSWSH."""
         if not origin:
-            return True  # Native desktop / test clients do not supply an Origin header
+            return True  # Native desktop / Service Worker / test clients may omit Origin
         import urllib.parse
         try:
             parsed = urllib.parse.urlparse(origin)
+            scheme = (parsed.scheme or "").lower()
             host = (parsed.hostname or "").lower()
-            if origin.startswith("chrome-extension://") or origin.startswith("file://"):
+            if (
+                origin.startswith(("chrome-extension://", "edge-extension://", "moz-extension://", "extension://", "file://"))
+                or scheme.endswith("-extension")
+            ):
                 return True
             allowed_hosts = {"labs.google", "flow.google.com", "docs.google.com", "localhost", "127.0.0.1", "::1", "[::1]"}
             if host in allowed_hosts or host.endswith(".labs.google") or host.endswith(".flow.google.com") or host == "docs.google.com":
@@ -317,6 +321,7 @@ class PluginServer(QObject):
         if msg_type == "bg_status":
             info["bg_ok"] = bool(msg.get("ok")) and bool(msg.get("native_drag", True))
             info["bg_version"] = msg.get("version", "")
+            info["ext_version"] = msg.get("ext_version", "")
             info["bg_error"] = msg.get("error", "") or ("" if msg.get("native_drag", True) else "浏览器不支持 debugger 接口")
             self.client_updated_signal.emit(info)
             return
@@ -453,28 +458,44 @@ class PluginServer(QObject):
         import base64
         from pathlib import Path
 
+        def _encode_img_data_url(path_str: str) -> str:
+            if not path_str:
+                return ""
+            try:
+                p = Path(path_str)
+                if p.is_file() and p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                    if p.stat().st_size <= 50 * 1024 * 1024:
+                        ext = p.suffix.lower().replace(".", "")
+                        if ext == "jpg":
+                            ext = "jpeg"
+                        mime = f"image/{ext}"
+                        with open(p, "rb") as f:
+                            b64_str = base64.b64encode(f.read()).decode("utf-8")
+                            return f"data:{mime};base64,{b64_str}"
+                    else:
+                        logger.warning(f"Image {path_str} exceeds 50MB limit, skipping base64 encoding")
+            except Exception as err:
+                logger.warning(f"Failed to read image {path_str} for base64 encoding: {err}")
+            return ""
+
         processed_tasks = []
         for task in tasks_data:
             task_copy = dict(task)
             img_path = task_copy.get("local_image_path")
-            
-            if img_path:
-                try:
-                    p = Path(img_path)
-                    if p.is_file() and p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
-                        # Limit to 50MB to prevent memory exhaustion
-                        if p.stat().st_size <= 50 * 1024 * 1024:
-                            ext = p.suffix.lower().replace(".", "")
-                            if ext == "jpg":
-                                ext = "jpeg"
-                            mime = f"image/{ext}"
-                            with open(p, "rb") as f:
-                                b64_str = base64.b64encode(f.read()).decode("utf-8")
-                                task_copy["image_data_url"] = f"data:{mime};base64,{b64_str}"
-                        else:
-                            logger.warning(f"Image {img_path} exceeds 50MB limit, skipping base64 encoding")
-                except Exception as err:
-                    logger.warning(f"Failed to read image {img_path} for base64 encoding: {err}")
+            if img_path and not task_copy.get("image_data_url"):
+                b64_url = _encode_img_data_url(img_path)
+                if b64_url:
+                    task_copy["image_data_url"] = b64_url
+
+            end_img_path = task_copy.get("end_local_image_path")
+            if end_img_path and not task_copy.get("end_image_data_url"):
+                end_b64_url = _encode_img_data_url(end_img_path)
+                if end_b64_url:
+                    task_copy["end_image_data_url"] = end_b64_url
+                    task_copy["endImageDataUrl"] = end_b64_url
+
+            if end_img_path or task_copy.get("end_image_name"):
+                task_copy["mode"] = "VIDEO_FRAMES"
 
             processed_tasks.append(task_copy)
 

@@ -145,14 +145,15 @@ class SegmentCardGridViewport(QWidget):
     """
     高性能断句图片多排网格画布：
     - 直接使用 QPainter 绘制每张断句卡片（以图片为主体 + 序号角标 + 预设标签 + 文案摘要），支持上百个断句 60fps 丝滑缩放与框选！
+    - 开启「首尾帧模式」时，每张卡片的图片区自动分为上下两个独立可选板块（上：📸首帧，下：🎬尾帧），共享底部的模板/运镜预设与文案。
     - 支持：
       1. Ctrl + 鼠标滚轮：实时无级调整卡片尺寸（card_width 130px ~ 440px），自动计算每行排列数量
-      2. 鼠标左键单击：单选卡片
-      3. Ctrl + 左键单击：切换单个卡片选中状态
-      4. Shift + 左键单击：范围连选 [anchor .. clicked]
-      5. 鼠标左键拖拽（橡皮筋框选）：画出半透明选框，自动选中框内所有断句卡片（按住 Ctrl/Shift 拖拽可追加框选）
+      2. 鼠标左键单击：单选卡片（首尾帧模式下单选对应的首帧或尾帧板块）
+      3. Ctrl + 左键单击：切换单个卡片/板块选中状态
+      4. Shift + 左键单击：范围连选 [anchor .. clicked]（首尾帧模式下同类型板块连选只选中对应首帧或尾帧板块）
+      5. 鼠标左键拖拽（橡皮筋框选）：画出半透明选框，自动选中框内所有卡片/上下板块（按住 Ctrl/Shift 拖拽可追加框选）
     """
-    selection_changed = pyqtSignal(list)      # sorted list of selected indices
+    selection_changed = pyqtSignal(list)      # sorted list of selected card indices
     zoom_changed = pyqtSignal(int)            # new card_width
     card_double_clicked = pyqtSignal(int)     # segment index
 
@@ -164,19 +165,31 @@ class SegmentCardGridViewport(QWidget):
         self.margin = 14
 
         self.selected_indices = set()
+        self.selected_slots = set()   # set of (idx, "start" | "end")
         self.anchor_index = 0
+        self.anchor_slot = (0, "start")
         self.hover_index = -1
+        self.hover_slot = (-1, "")
 
         self._is_dragging_box = False
         self._drag_origin = QPoint()
         self._drag_current = QPoint()
-        self._drag_base_selection = set()
-        self._pressed_index = -1
+        self._drag_base_slots = set()
+        self._pressed_slot = (-1, "")
         self._press_modifiers = Qt.KeyboardModifier.NoModifier
 
-        self._card_rects = []  # list of QRect for each segment
+        self._card_rects = []   # list of QRect for each segment
+        self._slot_rects = []   # list of {"start": QRect, "end": QRect | None} for each segment
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _is_end_frame_mode(self) -> bool:
+        return bool(getattr(self.dialog, "end_frame_mode", False))
+
+    def _sync_indices_from_slots(self):
+        if not self._is_end_frame_mode():
+            self.selected_slots = {(idx, "start") for idx, _ in self.selected_slots}
+        self.selected_indices = {idx for idx, _ in self.selected_slots}
 
     def set_card_width(self, width: int, emit_signal: bool = True):
         clamped = max(130, min(440, int(width)))
@@ -193,32 +206,52 @@ class SegmentCardGridViewport(QWidget):
             return []
         return self.dialog.project_model.spanish_segments or []
 
+    def _compute_slot_image_height(self) -> int:
+        if self._is_end_frame_mode():
+            return max(86, int(self.card_width * 0.60))
+        return int(self.card_width * 0.72)
+
     def _compute_card_height(self) -> int:
-        # Image area takes ~68% height + metadata/tags/text area ~92px
-        img_h = int(self.card_width * 0.72)
-        return img_h + 94
+        slot_h = self._compute_slot_image_height()
+        if self._is_end_frame_mode():
+            # 上板块(首帧) + 中间分隔带(8px) + 下板块(尾帧) + 底部共享预设与文案(94px)
+            return 6 + slot_h + 8 + slot_h + 94
+        return slot_h + 94
 
     def recalculate_layout(self):
         segs = self._get_segments()
         count = len(segs)
         if count == 0:
             self._card_rects = []
+            self._slot_rects = []
             self.setMinimumHeight(260)
             return
 
         avail_w = max(200, self.width() - self.margin * 2)
         cols = max(1, (avail_w + self.card_gap) // (self.card_width + self.card_gap))
         card_h = self._compute_card_height()
+        slot_h = self._compute_slot_image_height()
+        end_mode = self._is_end_frame_mode()
 
         rects = []
+        slot_rects = []
         for idx in range(count):
             r = idx // cols
             c = idx % cols
             x = self.margin + c * (self.card_width + self.card_gap)
             y = self.margin + r * (card_h + self.card_gap)
-            rects.append(QRect(x, y, self.card_width, card_h))
+            crect = QRect(x, y, self.card_width, card_h)
+            rects.append(crect)
+            if end_mode:
+                s_rect = QRect(crect.left() + 6, crect.top() + 6, crect.width() - 12, slot_h)
+                e_rect = QRect(crect.left() + 6, s_rect.bottom() + 9, crect.width() - 12, slot_h)
+                slot_rects.append({"start": s_rect, "end": e_rect})
+            else:
+                s_rect = QRect(crect.left() + 6, crect.top() + 6, crect.width() - 12, slot_h - 6)
+                slot_rects.append({"start": s_rect, "end": None})
 
         self._card_rects = rects
+        self._slot_rects = slot_rects
         total_rows = (count + cols - 1) // cols
         total_h = self.margin * 2 + total_rows * card_h + max(0, total_rows - 1) * self.card_gap + 20
         self.setMinimumHeight(max(300, total_h))
@@ -227,39 +260,86 @@ class SegmentCardGridViewport(QWidget):
         super().resizeEvent(event)
         self.recalculate_layout()
 
+    def _slot_at_pos(self, pos: QPoint):
+        end_mode = self._is_end_frame_mode()
+        for idx, crect in enumerate(self._card_rects):
+            if not crect.contains(pos):
+                continue
+            if end_mode and idx < len(self._slot_rects):
+                sr = self._slot_rects[idx]
+                e_rect = sr.get("end")
+                s_rect = sr.get("start")
+                if e_rect is not None and e_rect.contains(pos):
+                    return idx, "end"
+                if s_rect is not None and s_rect.contains(pos):
+                    return idx, "start"
+                # 点击中间分隔条或底部预设/文案区：按离上下板块位置归属，底部文案区默认选中首帧板块以便快捷改预设
+                if e_rect is not None and pos.y() >= e_rect.top() and pos.y() <= e_rect.bottom() + 4:
+                    return idx, "end"
+            return idx, "start"
+        return -1, ""
+
     def _index_at_pos(self, pos: QPoint) -> int:
-        for idx, rect in enumerate(self._card_rects):
-            if rect.contains(pos):
-                return idx
-        return -1
+        idx, _ = self._slot_at_pos(pos)
+        return idx
 
     def select_all(self):
         segs = self._get_segments()
-        self.selected_indices = set(range(len(segs)))
+        if self._is_end_frame_mode():
+            self.selected_slots = {(i, "start") for i in range(len(segs))} | {(i, "end") for i in range(len(segs))}
+        else:
+            self.selected_slots = {(i, "start") for i in range(len(segs))}
+        self._sync_indices_from_slots()
+        self.update()
+        self.selection_changed.emit(sorted(self.selected_indices))
+
+    def select_all_by_slot(self, slot_role: str):
+        segs = self._get_segments()
+        role = "end" if (slot_role == "end" and self._is_end_frame_mode()) else "start"
+        self.selected_slots = {(i, role) for i in range(len(segs))}
+        if segs:
+            self.anchor_index = 0
+            self.anchor_slot = (0, role)
+        self._sync_indices_from_slots()
         self.update()
         self.selection_changed.emit(sorted(self.selected_indices))
 
     def clear_selection(self):
+        self.selected_slots.clear()
         self.selected_indices.clear()
         self.update()
         self.selection_changed.emit([])
 
     def invert_selection(self):
         segs = self._get_segments()
-        all_set = set(range(len(segs)))
-        self.selected_indices = all_set - self.selected_indices
+        if self._is_end_frame_mode():
+            all_slots = {(i, "start") for i in range(len(segs))} | {(i, "end") for i in range(len(segs))}
+            self.selected_slots = all_slots - self.selected_slots
+        else:
+            all_slots = {(i, "start") for i in range(len(segs))}
+            self.selected_slots = all_slots - {(i, "start") for i in self.selected_indices}
+        self._sync_indices_from_slots()
         self.update()
         self.selection_changed.emit(sorted(self.selected_indices))
 
     def set_selected_indices(self, indices, emit_signal: bool = True):
         segs = self._get_segments()
         total = len(segs)
-        self.selected_indices = {i for i in indices if 0 <= i < total}
+        valid = {i for i in indices if 0 <= i < total}
+        self.selected_slots = {(i, "start") for i in valid}
+        self._sync_indices_from_slots()
         if self.selected_indices:
             self.anchor_index = min(self.selected_indices)
+            self.anchor_slot = (self.anchor_index, "start")
         self.update()
         if emit_signal:
             self.selection_changed.emit(sorted(self.selected_indices))
+
+    def on_end_frame_mode_changed(self):
+        self._sync_indices_from_slots()
+        self.recalculate_layout()
+        self.update()
+        self.selection_changed.emit(sorted(self.selected_indices))
 
     def wheelEvent(self, event):
         modifiers = event.modifiers()
@@ -278,14 +358,14 @@ class SegmentCardGridViewport(QWidget):
             self._drag_origin = pos
             self._drag_current = pos
             self._is_dragging_box = False
-            self._pressed_index = self._index_at_pos(pos)
+            self._pressed_slot = self._slot_at_pos(pos)
             self._press_modifiers = event.modifiers()
             if (self._press_modifiers & Qt.KeyboardModifier.ControlModifier) or (
                 self._press_modifiers & Qt.KeyboardModifier.ShiftModifier
             ):
-                self._drag_base_selection = set(self.selected_indices)
+                self._drag_base_slots = set(self.selected_slots)
             else:
-                self._drag_base_selection = set()
+                self._drag_base_slots = set()
             event.accept()
             return
         super().mousePressEvent(event)
@@ -299,29 +379,56 @@ class SegmentCardGridViewport(QWidget):
             if self._is_dragging_box:
                 self._drag_current = pos
                 box = QRect(self._drag_origin, self._drag_current).normalized()
-                hit = {idx for idx, r in enumerate(self._card_rects) if box.intersects(r)}
-                new_sel = self._drag_base_selection | hit
-                if new_sel != self.selected_indices:
-                    self.selected_indices = new_sel
+                hit_slots = set()
+                if self._is_end_frame_mode():
+                    for idx, sr in enumerate(self._slot_rects):
+                        s_rect = sr.get("start")
+                        e_rect = sr.get("end")
+                        if s_rect is not None and box.intersects(s_rect):
+                            hit_slots.add((idx, "start"))
+                        if e_rect is not None and box.intersects(e_rect):
+                            hit_slots.add((idx, "end"))
+                        # 若框选仅扫过卡片底部文案区，默认归入首帧板块
+                        if (
+                            idx < len(self._card_rects)
+                            and box.intersects(self._card_rects[idx])
+                            and (idx, "start") not in hit_slots
+                            and (idx, "end") not in hit_slots
+                        ):
+                            hit_slots.add((idx, "start"))
+                else:
+                    for idx, r in enumerate(self._card_rects):
+                        if box.intersects(r):
+                            hit_slots.add((idx, "start"))
+                new_slots = self._drag_base_slots | hit_slots
+                if new_slots != self.selected_slots:
+                    self.selected_slots = new_slots
+                    self._sync_indices_from_slots()
                     self.selection_changed.emit(sorted(self.selected_indices))
                 self.update()
                 event.accept()
                 return
 
-        hov = self._index_at_pos(pos)
-        if hov != self.hover_index:
-            self.hover_index = hov
+        hov_idx, hov_role = self._slot_at_pos(pos)
+        if (hov_idx, hov_role) != self.hover_slot or hov_idx != self.hover_index:
+            self.hover_index = hov_idx
+            self.hover_slot = (hov_idx, hov_role)
             self.update()
-            if hov >= 0:
+            if hov_idx >= 0:
                 segs = self._get_segments()
-                if hov < len(segs):
-                    seg = segs[hov]
-                    tpl_name, mot_name, mode_name, dur_label = self.dialog.get_segment_display_badges(hov, seg)
+                if hov_idx < len(segs):
+                    seg = segs[hov_idx]
+                    tpl_name, mot_name, mode_name, dur_label = self.dialog.get_segment_display_badges(hov_idx, seg)
                     img_name = seg.get("image_name") or "未绑定"
                     end_img = seg.get("end_image_name") or ""
-                    end_line = f"\n🎬 尾帧图片: {end_img}" if end_img else ""
+                    if self._is_end_frame_mode():
+                        panel_hint = "【当前悬停：下板块 · 🎬 尾帧】" if hov_role == "end" else "【当前悬停：上板块 · 📸 首帧】"
+                        end_line = f"\n🎬 尾帧图片: {end_img or '未选择 (默认不自动分配)'}"
+                    else:
+                        panel_hint = ""
+                        end_line = f"\n🎬 尾帧图片: {end_img}" if end_img else ""
                     tip = (
-                        f"【第 {hov + 1:02d} 句】\n"
+                        f"【第 {hov_idx + 1:02d} 句】{(' ' + panel_hint) if panel_hint else ''}\n"
                         f"📸 首帧图片: {img_name}{end_line}\n"
                         f"📐 模板预设: {tpl_name}\n"
                         f"🎥 运镜预设: {mot_name}\n"
@@ -339,32 +446,58 @@ class SegmentCardGridViewport(QWidget):
                 event.accept()
                 return
 
-            idx = self._pressed_index
+            idx, role = self._pressed_slot
+            if not self._is_end_frame_mode() and idx >= 0:
+                role = "start"
             mods = self._press_modifiers
             if idx < 0:
                 if not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
+                    self.selected_slots.clear()
                     self.selected_indices.clear()
                     self.selection_changed.emit([])
                     self.update()
             else:
+                target_slot = (idx, role or "start")
                 if mods & Qt.KeyboardModifier.ShiftModifier:
-                    start = min(self.anchor_index, idx)
-                    end = max(self.anchor_index, idx)
-                    range_set = set(range(start, end + 1))
+                    anc_idx, anc_role = self.anchor_slot if self.anchor_slot[0] >= 0 else (self.anchor_index, target_slot[1])
+                    if not self._is_end_frame_mode():
+                        anc_role = "start"
+                    start_i = min(anc_idx, idx)
+                    end_i = max(anc_idx, idx)
+                    if not self._is_end_frame_mode() or anc_role == target_slot[1]:
+                        # 相同板块（如首帧→首帧，或尾帧→尾帧）：仅连选该板块！
+                        slot_set = {(i, target_slot[1]) for i in range(start_i, end_i + 1)}
+                    else:
+                        # 跨首帧与尾帧连选：按线性板块顺序选中
+                        segs_len = len(self._get_segments())
+                        ordered = []
+                        for i in range(segs_len):
+                            ordered.append((i, "start"))
+                            ordered.append((i, "end"))
+                        try:
+                            p1 = ordered.index((anc_idx, anc_role))
+                            p2 = ordered.index(target_slot)
+                            lo, hi = min(p1, p2), max(p1, p2)
+                            slot_set = set(ordered[lo:hi + 1])
+                        except ValueError:
+                            slot_set = {(i, target_slot[1]) for i in range(start_i, end_i + 1)}
                     if mods & Qt.KeyboardModifier.ControlModifier:
-                        self.selected_indices |= range_set
+                        self.selected_slots |= slot_set
                     else:
-                        self.selected_indices = range_set
+                        self.selected_slots = slot_set
                 elif mods & Qt.KeyboardModifier.ControlModifier:
-                    if idx in self.selected_indices:
-                        self.selected_indices.remove(idx)
+                    if target_slot in self.selected_slots:
+                        self.selected_slots.remove(target_slot)
                     else:
-                        self.selected_indices.add(idx)
+                        self.selected_slots.add(target_slot)
                     self.anchor_index = idx
+                    self.anchor_slot = target_slot
                 else:
-                    self.selected_indices = {idx}
+                    self.selected_slots = {target_slot}
                     self.anchor_index = idx
+                    self.anchor_slot = target_slot
 
+                self._sync_indices_from_slots()
                 self.selection_changed.emit(sorted(self.selected_indices))
                 self.update()
             event.accept()
@@ -400,22 +533,26 @@ class SegmentCardGridViewport(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "当前任务暂无切分断句")
             return
 
-        if len(self._card_rects) != len(segs):
+        end_mode = self._is_end_frame_mode()
+        if len(self._card_rects) != len(segs) or len(self._slot_rects) != len(segs):
             self.recalculate_layout()
 
         clip_rect = event.rect()
-        img_h = int(self.card_width * 0.72)
 
-        font_idx = QFont("Microsoft YaHei", 10, QFont.Weight.Bold)
+        font_idx = QFont("Microsoft YaHei", 9 if end_mode else 10, QFont.Weight.Bold)
         font_tag = QFont("Microsoft YaHei", 8, QFont.Weight.Bold)
         font_text = QFont("Microsoft YaHei", 9)
+        fm_idx = QFontMetrics(font_idx)
+        fm_tag = QFontMetrics(font_tag)
 
         for idx, card_rect in enumerate(self._card_rects):
             if not card_rect.intersects(clip_rect):
                 continue
 
             seg = segs[idx]
-            is_sel = idx in self.selected_indices
+            is_start_sel = (idx, "start") in self.selected_slots
+            is_end_sel = end_mode and ((idx, "end") in self.selected_slots)
+            is_sel = is_start_sel or is_end_sel
             is_hov = idx == self.hover_index
 
             # Check if segment has individual preset override (follows unified -> card_color_info is None)
@@ -423,90 +560,205 @@ class SegmentCardGridViewport(QWidget):
 
             # 1. Card background & border
             if card_color_info is not None:
-                # 单独选择了预设的任务卡片：显示该预设指定的浅色（未指定时默认浅粉红色 #FCE7F3）
                 bg_color = QColor(card_color_info["dark_bg"] if is_dark else card_color_info["bg"])
                 if is_sel:
-                    border_color = QColor("#3B82F6" if is_dark else "#2563EB")
+                    border_color = QColor("#7C3AED" if (is_end_sel and not is_start_sel) else ("#3B82F6" if is_dark else "#2563EB"))
                 elif is_hov:
                     border_color = QColor("#F59E0B")
                 else:
                     border_color = QColor(card_color_info["dark_border"] if is_dark else card_color_info["border"])
-                border_width = 3 if is_sel else (2 if is_hov else 2)
+                border_width = 3 if is_sel else 2
             else:
-                # 遵循统一模板与统一运镜：不增加额外颜色
                 if is_dark:
                     bg_color = QColor("#1E293B") if is_sel else (QColor("#2E2A1E") if is_hov else QColor("#242429"))
-                    border_color = QColor("#3B82F6") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#3F3F46"))
+                    border_color = QColor("#A855F7" if (is_end_sel and not is_start_sel) else "#3B82F6") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#3F3F46"))
                 else:
-                    bg_color = QColor("#EFF6FF") if is_sel else (QColor("#FFFBEB") if is_hov else QColor("#FFFFFF"))
-                    border_color = QColor("#2563EB") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#CBD5E1"))
+                    bg_color = QColor("#F5F3FF" if (is_end_sel and not is_start_sel) else "#EFF6FF") if is_sel else (QColor("#FFFBEB") if is_hov else QColor("#FFFFFF"))
+                    border_color = QColor("#7C3AED" if (is_end_sel and not is_start_sel) else "#2563EB") if is_sel else (QColor("#F59E0B") if is_hov else QColor("#CBD5E1"))
                 border_width = 3 if is_sel else (2 if is_hov else 1)
 
             painter.setPen(QPen(border_color, border_width))
             painter.setBrush(QBrush(bg_color))
             painter.drawRoundedRect(card_rect.adjusted(1, 1, -1, -1), 8, 8)
 
-            # 2. Image box (Primary visual focus!)
-            img_rect = QRect(card_rect.left() + 6, card_rect.top() + 6, card_rect.width() - 12, img_h - 6)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#0F172A")))
-            painter.drawRoundedRect(img_rect, 6, 6)
-
-            pm = self.dialog.get_segment_pixmap(idx, seg)
-            if not pm.isNull():
-                scaled = pm.scaled(
-                    img_rect.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                px = img_rect.left() + (img_rect.width() - scaled.width()) // 2
-                py = img_rect.top() + (img_rect.height() - scaled.height()) // 2
-                painter.drawPixmap(px, py, scaled)
-            else:
-                painter.setPen(QColor("#64748B"))
-                painter.setFont(font_text)
-                painter.drawText(img_rect, Qt.AlignmentFlag.AlignCenter, "📷 无关联图片")
-
-            # 3. Top-left #Index + checkbox indicator overlay on image
-            badge_str = f"{'☑' if is_sel else '☐'} #{idx + 1:02d}"
-            painter.setFont(font_idx)
-            fm_idx = QFontMetrics(font_idx)
-            bw = fm_idx.horizontalAdvance(badge_str) + 14
-            bh = 22
-            idx_rect = QRect(img_rect.left() + 6, img_rect.top() + 6, bw, bh)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#2563EB") if is_sel else QColor(15, 23, 42, 200)))
-            painter.drawRoundedRect(idx_rect, 5, 5)
-            painter.setPen(QColor("#FFFFFF"))
-            painter.drawText(idx_rect, Qt.AlignmentFlag.AlignCenter, badge_str)
-
-            # 4. Top-right duration badge on image
             tpl_name, mot_name, mode_name, dur_label = self.dialog.get_segment_display_badges(idx, seg)
-            painter.setFont(font_tag)
-            fm_tag = QFontMetrics(font_tag)
-            dw = fm_tag.horizontalAdvance(dur_label) + 10
-            dur_rect = QRect(img_rect.right() - dw - 6, img_rect.top() + 6, dw, 20)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#DC2626") if "超时" in dur_label else QColor(15, 23, 42, 200)))
-            painter.drawRoundedRect(dur_rect, 4, 4)
-            painter.setPen(QColor("#FFFFFF"))
-            painter.drawText(dur_rect, Qt.AlignmentFlag.AlignCenter, dur_label)
+            sr = self._slot_rects[idx]
+            start_rect = sr["start"]
+            end_rect = sr["end"]
 
-            # 5. Bottom of image: Image filename bar
-            img_name = seg.get("image_name") or "未指定图片"
-            end_name = seg.get("end_image_name") or ""
-            img_label_str = f"📸 {img_name}" + (f" ➔ 🎬 {end_name}" if end_name else "")
-            name_bar_rect = QRect(img_rect.left(), img_rect.bottom() - 21, img_rect.width(), 22)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(15, 23, 42, 195)))
-            painter.drawRoundedRect(name_bar_rect, 4, 4)
-            painter.setPen(QColor("#F8FAFC"))
-            painter.setFont(font_tag)
-            elided_img = fm_tag.elidedText(img_label_str, Qt.TextElideMode.ElideMiddle, name_bar_rect.width() - 10)
-            painter.drawText(name_bar_rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_img)
+            if not end_mode:
+                # ── 单图模式（未开启首尾帧模式）──
+                img_rect = start_rect
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor("#0F172A")))
+                painter.drawRoundedRect(img_rect, 6, 6)
 
-            # 6. Preset badges row (Template / Motion / Mode)
-            tags_y = img_rect.bottom() + 5
+                pm = self.dialog.get_segment_pixmap(idx, seg)
+                if not pm.isNull():
+                    scaled = pm.scaled(
+                        img_rect.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                    px = img_rect.left() + (img_rect.width() - scaled.width()) // 2
+                    py = img_rect.top() + (img_rect.height() - scaled.height()) // 2
+                    painter.drawPixmap(px, py, scaled)
+                else:
+                    painter.setPen(QColor("#64748B"))
+                    painter.setFont(font_text)
+                    painter.drawText(img_rect, Qt.AlignmentFlag.AlignCenter, "📷 无关联图片")
+
+                # Top-left #Index + checkbox indicator overlay
+                badge_str = f"{'☑' if is_sel else '☐'} #{idx + 1:02d}"
+                painter.setFont(font_idx)
+                bw = fm_idx.horizontalAdvance(badge_str) + 14
+                idx_rect = QRect(img_rect.left() + 6, img_rect.top() + 6, bw, 22)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor("#2563EB") if is_sel else QColor(15, 23, 42, 200)))
+                painter.drawRoundedRect(idx_rect, 5, 5)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(idx_rect, Qt.AlignmentFlag.AlignCenter, badge_str)
+
+                # Top-right duration badge
+                painter.setFont(font_tag)
+                dw = fm_tag.horizontalAdvance(dur_label) + 10
+                dur_rect = QRect(img_rect.right() - dw - 6, img_rect.top() + 6, dw, 20)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor("#DC2626") if "超时" in dur_label else QColor(15, 23, 42, 200)))
+                painter.drawRoundedRect(dur_rect, 4, 4)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(dur_rect, Qt.AlignmentFlag.AlignCenter, dur_label)
+
+                # Bottom of image: Image filename bar
+                img_name = seg.get("image_name") or "未指定图片"
+                img_label_str = f"📸 {img_name}"
+                name_bar_rect = QRect(img_rect.left(), img_rect.bottom() - 21, img_rect.width(), 22)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(15, 23, 42, 195)))
+                painter.drawRoundedRect(name_bar_rect, 4, 4)
+                painter.setPen(QColor("#F8FAFC"))
+                painter.setFont(font_tag)
+                elided_img = fm_tag.elidedText(img_label_str, Qt.TextElideMode.ElideMiddle, name_bar_rect.width() - 10)
+                painter.drawText(name_bar_rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_img)
+                tags_y = img_rect.bottom() + 5
+            else:
+                # ── 首尾帧双板块模式（上：📸首帧板块，下：🎬尾帧板块）──
+                is_start_hov = self.hover_slot == (idx, "start")
+                is_end_hov = self.hover_slot == (idx, "end")
+
+                # [A] 上板块：首帧 (Start Frame)
+                s_border = QColor("#2563EB") if is_start_sel else (QColor("#F59E0B") if is_start_hov else QColor("#475569"))
+                s_bw = 3 if is_start_sel else (2 if is_start_hov else 1)
+                painter.setPen(QPen(s_border, s_bw))
+                painter.setBrush(QBrush(QColor("#0F172A")))
+                painter.drawRoundedRect(start_rect, 6, 6)
+
+                pm_start = self.dialog.get_segment_pixmap(idx, seg)
+                if not pm_start.isNull():
+                    scaled_s = pm_start.scaled(
+                        start_rect.adjusted(2, 2, -2, -2).size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                    px = start_rect.left() + (start_rect.width() - scaled_s.width()) // 2
+                    py = start_rect.top() + (start_rect.height() - scaled_s.height()) // 2
+                    painter.drawPixmap(px, py, scaled_s)
+                else:
+                    painter.setPen(QColor("#94A3B8"))
+                    painter.setFont(font_tag)
+                    painter.drawText(start_rect, Qt.AlignmentFlag.AlignCenter, "📸 未选择首帧")
+
+                s_badge = f"{'☑' if is_start_sel else '☐'} #{idx + 1:02d} 首帧"
+                painter.setFont(font_idx)
+                s_bw_px = fm_idx.horizontalAdvance(s_badge) + 12
+                s_idx_rect = QRect(start_rect.left() + 5, start_rect.top() + 5, s_bw_px, 21)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor("#2563EB") if is_start_sel else QColor(15, 23, 42, 210)))
+                painter.drawRoundedRect(s_idx_rect, 4, 4)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(s_idx_rect, Qt.AlignmentFlag.AlignCenter, s_badge)
+
+                # Top-right duration badge on upper panel
+                painter.setFont(font_tag)
+                dw = fm_tag.horizontalAdvance(dur_label) + 10
+                dur_rect = QRect(start_rect.right() - dw - 5, start_rect.top() + 5, dw, 20)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor("#DC2626") if "超时" in dur_label else QColor(15, 23, 42, 205)))
+                painter.drawRoundedRect(dur_rect, 4, 4)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(dur_rect, Qt.AlignmentFlag.AlignCenter, dur_label)
+
+                img_name = seg.get("image_name") or "未指定首帧"
+                s_bar_rect = QRect(start_rect.left() + 1, start_rect.bottom() - 20, start_rect.width() - 2, 20)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(37, 99, 235, 215) if is_start_sel else QColor(15, 23, 42, 200)))
+                painter.drawRoundedRect(s_bar_rect, 4, 4)
+                painter.setPen(QColor("#F8FAFC"))
+                painter.setFont(font_tag)
+                elided_s = fm_tag.elidedText(f"📸 首帧: {img_name}", Qt.TextElideMode.ElideMiddle, s_bar_rect.width() - 10)
+                painter.drawText(s_bar_rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_s)
+
+                # [B] 上下板块分界线
+                div_y = (start_rect.bottom() + end_rect.top()) // 2
+                painter.setPen(QPen(QColor("#94A3B8" if not is_dark else "#52525B"), 1, Qt.PenStyle.DashLine))
+                painter.drawLine(card_rect.left() + 10, div_y, card_rect.right() - 10, div_y)
+
+                # [C] 下板块：尾帧 (End Frame) — 默认不自动分配，留空由用户手动选择
+                end_name = (seg.get("end_image_name") or "").strip()
+                pm_end = self.dialog.get_segment_end_pixmap(idx, seg) if end_name else QPixmap()
+                has_end = bool(end_name and not pm_end.isNull())
+
+                if is_end_sel:
+                    e_pen = QPen(QColor("#7C3AED"), 3, Qt.PenStyle.SolidLine)
+                elif is_end_hov:
+                    e_pen = QPen(QColor("#F59E0B"), 2, Qt.PenStyle.SolidLine)
+                elif has_end:
+                    e_pen = QPen(QColor("#8B5CF6"), 1, Qt.PenStyle.SolidLine)
+                else:
+                    e_pen = QPen(QColor("#64748B" if not is_dark else "#52525B"), 1, Qt.PenStyle.DashLine)
+
+                painter.setPen(e_pen)
+                painter.setBrush(QBrush(QColor("#0F172A") if has_end else QColor("#1E293B" if is_dark else "#F1F5F9")))
+                painter.drawRoundedRect(end_rect, 6, 6)
+
+                if has_end:
+                    scaled_e = pm_end.scaled(
+                        end_rect.adjusted(2, 2, -2, -2).size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                    epx = end_rect.left() + (end_rect.width() - scaled_e.width()) // 2
+                    epy = end_rect.top() + (end_rect.height() - scaled_e.height()) // 2
+                    painter.drawPixmap(epx, epy, scaled_e)
+                else:
+                    painter.setPen(QColor("#7C3AED" if is_end_sel else ("#A1A1AA" if is_dark else "#64748B")))
+                    painter.setFont(font_tag)
+                    empty_hint = "🎬 未选尾帧\n点击此板块后点上方资源图"
+                    painter.drawText(end_rect.adjusted(6, 18, -6, -18), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, empty_hint)
+
+                e_badge = f"{'☑' if is_end_sel else '☐'} #{idx + 1:02d} 尾帧"
+                painter.setFont(font_idx)
+                e_bw_px = fm_idx.horizontalAdvance(e_badge) + 12
+                e_idx_rect = QRect(end_rect.left() + 5, end_rect.top() + 5, e_bw_px, 21)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor("#7C3AED") if is_end_sel else (QColor("#5B21B6") if has_end else QColor(71, 85, 105, 200))))
+                painter.drawRoundedRect(e_idx_rect, 4, 4)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(e_idx_rect, Qt.AlignmentFlag.AlignCenter, e_badge)
+
+                e_bar_rect = QRect(end_rect.left() + 1, end_rect.bottom() - 20, end_rect.width() - 2, 20)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(124, 58, 237, 220) if is_end_sel else (QColor(30, 27, 75, 205) if has_end else QColor(51, 65, 85, 185))))
+                painter.drawRoundedRect(e_bar_rect, 4, 4)
+                painter.setPen(QColor("#F8FAFC"))
+                painter.setFont(font_tag)
+                e_bar_label = f"🎬 尾帧: {end_name}" if end_name else "🎬 尾帧: 未选择"
+                elided_e = fm_tag.elidedText(e_bar_label, Qt.TextElideMode.ElideMiddle, e_bar_rect.width() - 10)
+                painter.drawText(e_bar_rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_e)
+
+                tags_y = end_rect.bottom() + 5
+
+            # 6. Preset badges row (Template / Motion / Mode) — 开启首尾帧后仍旧只有一个描述词预设、一个运镜预设、一个文案
             has_custom_tpl = tpl_color_info is not None
             has_custom_mot = mot_color_info is not None
             has_custom_mode = bool(seg.get("mode_overridden"))
@@ -1257,6 +1509,7 @@ class SegmentVisualBatchManagerDialog(QDialog):
         self._pixmap_cache = {}
         self._project_list = []
         self._resource_expanded = True
+        self.end_frame_mode = False
 
         self.setWindowTitle("🖼️ 多选与图片预设可视化管理 — 支持 Ctrl+滚轮缩放图片 · 鼠标拖拽框选 · 点击资源图批量更换 · 直接切换任务")
         self.setWindowFlags(
@@ -1371,9 +1624,21 @@ class SegmentVisualBatchManagerDialog(QDialog):
         preset_outer.setContentsMargins(10, 7, 10, 7)
         preset_outer.setSpacing(6)
 
-        # Row 2A: Selection controls & Zoom slider
+        # Row 2A: Selection controls & End-Frame Mode Toggle & Zoom slider
         sel_row = QHBoxLayout()
         sel_row.setSpacing(6)
+
+        self.btn_end_frame_mode = QPushButton("🎬 首尾帧模式：已关闭")
+        self.btn_end_frame_mode.setCheckable(True)
+        self.btn_end_frame_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_end_frame_mode.setToolTip(
+            "开启/关闭「首尾帧模式」：\n"
+            "• 开启后：每张断句卡片分为上下两个独立板块（上：📸首帧，下：🎬尾帧）\n"
+            "• 默认自动分配首帧图片，尾帧默认留空不自动分配，由您点击下板块后自由选择资源图\n"
+            "• 开启后每张卡片仍共享同一个描述词模板、同一个运镜预设和同一句文案"
+        )
+        self.btn_end_frame_mode.toggled.connect(self._on_end_frame_mode_toggled)
+        sel_row.addWidget(self.btn_end_frame_mode)
 
         self.lbl_selection_info = QLabel("已选 0 / 0 个断句图片")
         self.lbl_selection_info.setStyleSheet(
@@ -1387,6 +1652,20 @@ class SegmentVisualBatchManagerDialog(QDialog):
         btn_sel_all.clicked.connect(lambda: self.grid_viewport.select_all())
         sel_row.addWidget(btn_sel_all)
 
+        self.btn_sel_all_start = QPushButton("📸 全选首帧")
+        self.btn_sel_all_start.setToolTip("仅选中所有卡片的上半板块（📸 首帧），便于批量更换首帧图片")
+        self.btn_sel_all_start.setStyleSheet("QPushButton { background: #1D4ED8; color: white; font-weight: bold; padding: 4px 9px; border-radius: 4px; border: none; } QPushButton:hover { background: #1E40AF; }")
+        self.btn_sel_all_start.clicked.connect(lambda: self.grid_viewport.select_all_by_slot("start"))
+        self.btn_sel_all_start.setVisible(False)
+        sel_row.addWidget(self.btn_sel_all_start)
+
+        self.btn_sel_all_end = QPushButton("🎬 全选尾帧")
+        self.btn_sel_all_end.setToolTip("仅选中所有卡片的下半板块（🎬 尾帧），便于批量设置或清空尾帧图片")
+        self.btn_sel_all_end.setStyleSheet("QPushButton { background: #7C3AED; color: white; font-weight: bold; padding: 4px 9px; border-radius: 4px; border: none; } QPushButton:hover { background: #6D28D9; }")
+        self.btn_sel_all_end.clicked.connect(lambda: self.grid_viewport.select_all_by_slot("end"))
+        self.btn_sel_all_end.setVisible(False)
+        sel_row.addWidget(self.btn_sel_all_end)
+
         btn_sel_inv = QPushButton("🔄 反选")
         btn_sel_inv.setStyleSheet("QPushButton { background: #FFFFFF; color: #1E40AF; font-weight: bold; padding: 4px 10px; border-radius: 4px; border: 1px solid #93C5FD; } QPushButton:hover { background: #DBEAFE; }")
         btn_sel_inv.clicked.connect(lambda: self.grid_viewport.invert_selection())
@@ -1397,9 +1676,9 @@ class SegmentVisualBatchManagerDialog(QDialog):
         btn_sel_none.clicked.connect(lambda: self.grid_viewport.clear_selection())
         sel_row.addWidget(btn_sel_none)
 
-        lbl_hint = QLabel("💡 支持：鼠标拖拽直接框选 · Ctrl+点击多选 · Shift+点击连选 · 按住 Ctrl+鼠标滚轮 缩放图片")
-        lbl_hint.setStyleSheet("font-size: 12px; color: #1E3A8A; border: none;")
-        sel_row.addWidget(lbl_hint)
+        self.lbl_sel_hint = QLabel("💡 拖拽框选 · Ctrl+点击多选 · Shift+连选 · Ctrl+滚轮缩放")
+        self.lbl_sel_hint.setStyleSheet("font-size: 12px; color: #1E3A8A; border: none;")
+        sel_row.addWidget(self.lbl_sel_hint)
 
         sel_row.addStretch()
 
@@ -1560,13 +1839,9 @@ class SegmentVisualBatchManagerDialog(QDialog):
         self.btn_toggle_resource.clicked.connect(self._toggle_resource_panel)
         res_header.addWidget(self.btn_toggle_resource)
 
-        lbl_res_tip = QLabel("👆 先在下方多选断句图片，再点击下方任意「资源图」即可一键批量更换所选断句的图片！")
-        lbl_res_tip.setStyleSheet("font-size: 12px; font-weight: bold; color: #0F766E; border: none;")
-        res_header.addWidget(lbl_res_tip)
-
-        self.chk_assign_end_frame = QCheckBox("🎬 更换为尾帧图片 (不勾选则更换首帧图片)")
-        self.chk_assign_end_frame.setStyleSheet("font-size: 12px; font-weight: bold; color: #7C3AED;")
-        res_header.addWidget(self.chk_assign_end_frame)
+        self.lbl_res_tip = QLabel("👆 先在下方多选断句图片，再点击任意「资源图」即可一键批量更换所选断句的图片！")
+        self.lbl_res_tip.setStyleSheet("font-size: 12px; font-weight: bold; color: #0F766E; border: none;")
+        res_header.addWidget(self.lbl_res_tip)
 
         res_header.addStretch()
 
@@ -1578,13 +1853,13 @@ class SegmentVisualBatchManagerDialog(QDialog):
         btn_add_res_img.clicked.connect(self._on_add_local_images_to_resources)
         res_header.addWidget(btn_add_res_img)
 
-        btn_clear_seg_img = QPushButton("🚫 清空所选断句图片")
-        btn_clear_seg_img.setStyleSheet(
+        self.btn_clear_seg_img = QPushButton("🚫 清空所选板块图片")
+        self.btn_clear_seg_img.setStyleSheet(
             "QPushButton { background: #EF4444; color: white; font-weight: bold; padding: 4px 10px; border-radius: 4px; border: none; }"
             "QPushButton:hover { background: #DC2626; }"
         )
-        btn_clear_seg_img.clicked.connect(lambda: self._on_resource_card_clicked(""))
-        res_header.addWidget(btn_clear_seg_img)
+        self.btn_clear_seg_img.clicked.connect(lambda: self._on_resource_card_clicked(""))
+        res_header.addWidget(self.btn_clear_seg_img)
 
         btn_refresh_res = QPushButton("🔄 刷新资源图")
         btn_refresh_res.setStyleSheet(
@@ -1731,11 +2006,80 @@ class SegmentVisualBatchManagerDialog(QDialog):
     # ───────────────────────────────────────────────────────────────────────
     # 绑定当前任务的数据、预设下拉框、资源图库与断句网格
     # ───────────────────────────────────────────────────────────────────────
+    def _refresh_end_frame_mode_ui(self):
+        self.btn_end_frame_mode.blockSignals(True)
+        self.btn_end_frame_mode.setChecked(self.end_frame_mode)
+        if self.end_frame_mode:
+            self.btn_end_frame_mode.setText("🎬 首尾帧模式：已开启")
+            self.btn_end_frame_mode.setStyleSheet(
+                "QPushButton { background: #7C3AED; color: white; font-weight: bold; padding: 4px 12px; border-radius: 5px; border: 2px solid #5B21B6; }"
+                "QPushButton:hover { background: #6D28D9; }"
+            )
+            self.btn_sel_all_start.setVisible(True)
+            self.btn_sel_all_end.setVisible(True)
+            self.lbl_res_tip.setText(
+                "👆 首尾帧模式已开启：每张卡片分为【上：📸首帧】与【下：🎬尾帧（默认空）】，点击或框选对应板块后再点「资源图」即可分别更换！"
+            )
+            self.lbl_res_tip.setStyleSheet("font-size: 12px; font-weight: bold; color: #6D28D9; border: none;")
+        else:
+            self.btn_end_frame_mode.setText("🎬 首尾帧模式：已关闭")
+            self.btn_end_frame_mode.setStyleSheet(
+                "QPushButton { background: #FFFFFF; color: #5B21B6; font-weight: bold; padding: 4px 12px; border-radius: 5px; border: 1px solid #C4B5FD; }"
+                "QPushButton:hover { background: #F5F3FF; }"
+            )
+            self.btn_sel_all_start.setVisible(False)
+            self.btn_sel_all_end.setVisible(False)
+            self.lbl_res_tip.setText(
+                "👆 先在下方多选断句图片，再点击任意「资源图」即可一键批量更换图片！（如需尾帧请点击上方「🎬 首尾帧模式」）"
+            )
+            self.lbl_res_tip.setStyleSheet("font-size: 12px; font-weight: bold; color: #0F766E; border: none;")
+        self.btn_end_frame_mode.blockSignals(False)
+
+    def _on_end_frame_mode_toggled(self, checked: bool):
+        self.end_frame_mode = bool(checked)
+        self._refresh_end_frame_mode_ui()
+
+        if self.project_model:
+            self.project_model.enable_end_frame = self.end_frame_mode
+            try:
+                self.project_model.save()
+            except Exception as e:
+                print(f"[SegmentVisualBatchManager] save enable_end_frame error: {e}")
+
+        if self.detail_widget and self.detail_widget.project_model is self.project_model:
+            self.detail_widget.enable_end_frame = self.end_frame_mode
+            if hasattr(self.detail_widget, "chk_enable_end_frame"):
+                self.detail_widget.chk_enable_end_frame.blockSignals(True)
+                self.detail_widget.chk_enable_end_frame.setChecked(self.end_frame_mode)
+                self.detail_widget.chk_enable_end_frame.blockSignals(False)
+            if hasattr(self.detail_widget, "container_end_image"):
+                self.detail_widget.container_end_image.setVisible(self.end_frame_mode)
+            if hasattr(self.detail_widget, "table_segments"):
+                for r in range(self.detail_widget.table_segments.rowCount()):
+                    self.detail_widget.refresh_table_row_index_label(r)
+
+        self.grid_viewport.on_end_frame_mode_changed()
+        self._populate_resource_images()
+        self._update_bottom_summary()
+        if self.end_frame_mode:
+            self._flash_save_badge("✅ 已开启「首尾帧模式」：每张卡片已拆分为上下两个独立板块（尾帧默认不自动分配，请按需自由选择）")
+        else:
+            self._flash_save_badge("✅ 已关闭「首尾帧模式」：已恢复单图卡片视图")
+
     def _bind_current_project(self, initial_selected_rows=None):
         if not self.project_model:
             return
 
-        # 确保每个断句已解析默认关联的首帧图片
+        # 同步当前任务的首尾帧模式开关状态（默认不自动分配尾帧）
+        if self.project_model.enable_end_frame is not None:
+            self.end_frame_mode = bool(self.project_model.enable_end_frame)
+        elif self.detail_widget is not None:
+            self.end_frame_mode = bool(getattr(self.detail_widget, "enable_end_frame", False))
+        else:
+            self.end_frame_mode = bool(getattr(self.config_manager, "enable_end_frame", False)) if self.config_manager else False
+        self._refresh_end_frame_mode_ui()
+
+        # 确保每个断句已解析默认关联的首帧图片（尾帧绝不自动分配）
         segs = self.project_model.spanish_segments or []
         all_imgs = self._list_resource_images()
         for idx, seg in enumerate(segs):
@@ -1800,6 +2144,17 @@ class SegmentVisualBatchManagerDialog(QDialog):
             return QPixmap()
         return _load_qpixmap_fast(str(fp), self._pixmap_cache)
 
+    def get_segment_end_pixmap(self, idx: int, seg: dict) -> QPixmap:
+        if not self.project_path:
+            return QPixmap()
+        end_name = (seg.get("end_image_name") or "").strip()
+        if not end_name:
+            return QPixmap()
+        fp = self.project_path / "downloads" / end_name
+        if not fp.exists():
+            return QPixmap()
+        return _load_qpixmap_fast(str(fp), self._pixmap_cache)
+
     def get_segment_display_badges(self, idx: int, seg: dict):
         """返回 (tpl_name, motion_name, mode_name, duration_label)"""
         tpl_id = seg.get("template_id") or ""
@@ -1823,7 +2178,10 @@ class SegmentVisualBatchManagerDialog(QDialog):
 
         default_mode_code = getattr(self.config_manager, "default_generation_mode", "VIDEO_FRAMES") if self.config_manager else "VIDEO_FRAMES"
         eff_mode = seg.get("mode", default_mode_code) if seg.get("mode_overridden") else default_mode_code
-        mode_name = "素材模式" if eff_mode == "VIDEO_REFERENCES" else "帧模式"
+        if self.end_frame_mode and (seg.get("end_image_name") or "").strip():
+            mode_name = "首尾帧"
+        else:
+            mode_name = "素材模式" if eff_mode == "VIDEO_REFERENCES" else "帧模式"
 
         dur_val = seg.get("duration")
         if dur_val:
@@ -2002,9 +2360,13 @@ class SegmentVisualBatchManagerDialog(QDialog):
         segs = self.project_model.spanish_segments if self.project_model else []
         usage_map = {}
         for s in segs:
-            im_n = s.get("image_name") or ""
+            im_n = (s.get("image_name") or "").strip()
             if im_n:
                 usage_map[im_n] = usage_map.get(im_n, 0) + 1
+            if self.end_frame_mode:
+                end_n = (s.get("end_image_name") or "").strip()
+                if end_n:
+                    usage_map[end_n] = usage_map.get(end_n, 0) + 1
 
         if not imgs:
             lbl_empty = QLabel("📂 当前任务 downloads/ 目录下暂无图片资源，可点击右上角「➕ 添加本地图片到资源库」导入。")
@@ -2050,38 +2412,47 @@ class SegmentVisualBatchManagerDialog(QDialog):
             self._flash_save_badge(f"✅ 已导入 {copied} 张图片到任务资源库")
 
     def _on_resource_card_clicked(self, image_name: str):
-        rows = sorted(self.grid_viewport.selected_indices)
-        if not rows:
-            QMessageBox.information(
-                self,
-                "请先选择断句图片",
-                "请先在下方网格中点击或拖拽框选需要更换图片的断句卡片，然后再点击上方的资源图！"
+        selected_slots = sorted(self.grid_viewport.selected_slots)
+        if not selected_slots:
+            msg = (
+                "请先在下方网格中点击或拖拽框选需要更换图片的【上板块·📸首帧】或【下板块·🎬尾帧】，然后再点击上方的资源图！"
+                if self.end_frame_mode
+                else "请先在下方网格中点击或拖拽框选需要更换图片的断句卡片，然后再点击上方的资源图！"
             )
+            QMessageBox.information(self, "请先选择断句板块", msg)
             return
         if not self.project_model:
             return
 
         segs = self.project_model.spanish_segments
-        assign_end = self.chk_assign_end_frame.isChecked()
-        if assign_end and self.detail_widget and not getattr(self.detail_widget, "enable_end_frame", False):
-            self.detail_widget.chk_enable_end_frame.setChecked(True)
+        changed_rows = set()
+        start_cnt = 0
+        end_cnt = 0
 
-        for r in rows:
+        for r, role in selected_slots:
             if 0 <= r < len(segs):
-                if assign_end:
+                if self.end_frame_mode and role == "end":
                     segs[r]["end_image_name"] = image_name
-                    # 尾帧自动联动下一句首帧
-                    if r + 1 < len(segs) and image_name:
-                        segs[r + 1]["image_name"] = image_name
+                    end_cnt += 1
                 else:
                     segs[r]["image_name"] = image_name
+                    start_cnt += 1
+                changed_rows.add(r)
 
+        rows = sorted(changed_rows)
         self._save_and_sync_detail_widget(rows)
         self._populate_resource_images()
         self.grid_viewport.update()
-        target_label = "尾帧图片" if assign_end else "首帧图片"
-        disp = image_name if image_name else "无图片"
-        self._flash_save_badge(f"✅ 已将 {len(rows)} 个断句的{target_label}批量更换为: {disp}")
+        disp = image_name if image_name else "无图片(已清空)"
+        if self.end_frame_mode:
+            parts = []
+            if start_cnt:
+                parts.append(f"📸首帧 {start_cnt} 个")
+            if end_cnt:
+                parts.append(f"🎬尾帧 {end_cnt} 个")
+            self._flash_save_badge(f"✅ 已将 {' + '.join(parts)} 更换为: {disp}")
+        else:
+            self._flash_save_badge(f"✅ 已将 {len(rows)} 个断句的首帧图片批量更换为: {disp}")
 
     # ───────────────────────────────────────────────────────────────────────
     # 顶部预设选项卡批量修改回调
@@ -2370,12 +2741,22 @@ class SegmentVisualBatchManagerDialog(QDialog):
         total = len(self.project_model.spanish_segments) if self.project_model else 0
         sel_cnt = len(selected_rows)
         if sel_cnt > 0:
-            preview = "、".join(f"#{r + 1:02d}" for r in selected_rows[:12])
-            if sel_cnt > 12:
-                preview += f" 等共 {sel_cnt} 句"
-            self.lbl_selection_info.setText(f"✅ 已选 {sel_cnt} / {total} 个断句 ({preview})")
+            if self.end_frame_mode:
+                s_cnt = sum(1 for _, role in self.grid_viewport.selected_slots if role == "start")
+                e_cnt = sum(1 for _, role in self.grid_viewport.selected_slots if role == "end")
+                self.lbl_selection_info.setText(
+                    f"✅ 已选 {sel_cnt}/{total} 句 (📸首帧 {s_cnt} · 🎬尾帧 {e_cnt})"
+                )
+            else:
+                preview = "、".join(f"#{r + 1:02d}" for r in selected_rows[:12])
+                if sel_cnt > 12:
+                    preview += f" 等共 {sel_cnt} 句"
+                self.lbl_selection_info.setText(f"✅ 已选 {sel_cnt} / {total} 个断句 ({preview})")
         else:
-            self.lbl_selection_info.setText(f"已选 0 / {total} 个断句图片")
+            if self.end_frame_mode:
+                self.lbl_selection_info.setText(f"已选 0 / {total} 句 (可点选上:首帧 / 下:尾帧)")
+            else:
+                self.lbl_selection_info.setText(f"已选 0 / {total} 个断句图片")
 
         # 同步选中状态回 ProjectDetailWidget 的表格
         if self.detail_widget and hasattr(self.detail_widget, "table_segments"):
@@ -2407,7 +2788,9 @@ class SegmentVisualBatchManagerDialog(QDialog):
         imgs = self._list_resource_images()
         custom_tpl_cnt = sum(1 for s in segs if s.get("template_id"))
         custom_mot_cnt = sum(1 for s in segs if s.get("motion_id"))
+        end_cnt = sum(1 for s in segs if (s.get("end_image_name") or "").strip())
+        end_part = f"  |  🎬 首尾帧模式：已开启（已配尾帧 {end_cnt}/{len(segs)} 句）" if self.end_frame_mode else ""
         self.lbl_bottom_summary.setText(
             f"📊 当前任务：{self.project_model.project_id}  |  共 {len(segs)} 个断句  |  "
-            f"任务资源图：{len(imgs)} 张  |  独立模板断句：{custom_tpl_cnt} 句  |  独立运镜断句：{custom_mot_cnt} 句"
+            f"任务资源图：{len(imgs)} 张  |  独立模板断句：{custom_tpl_cnt} 句  |  独立运镜断句：{custom_mot_cnt} 句{end_part}"
         )

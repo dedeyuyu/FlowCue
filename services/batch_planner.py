@@ -12,10 +12,11 @@ from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from models.project_model import ProjectModel
+from models.project_model import ProjectModel, parse_image_index
 from services.text_processor import TextProcessor
 
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_PURE_IMG_INDEX_RE = re.compile(r'^(?:FC)?0*(\d+)$', re.IGNORECASE)
 
 
 def list_project_images(project_path):
@@ -30,15 +31,61 @@ def list_project_images(project_path):
     return imgs
 
 
+def match_explicit_image(explicit_name, all_imgs):
+    """在本地图片列表中匹配用户指定/表格导入的图片名（支持精确名、忽略大小写、无后缀名、纯序号如 1 / 01 / FC0001）。"""
+    raw = str(explicit_name or "").strip().strip('"\'')
+    if not raw or not all_imgs:
+        return None
+    clean_name = Path(raw.replace("\\", "/")).name.strip()
+    if not clean_name:
+        return None
+
+    # 1. 精确文件名匹配
+    for img in all_imgs:
+        if img.name == clean_name:
+            return img
+
+    # 2. 忽略大小写完整文件名匹配
+    low = clean_name.lower()
+    for img in all_imgs:
+        if img.name.lower() == low:
+            return img
+
+    # 3. 去扩展名（stem）匹配，例如导入 "FC0003" 或 "03" 匹配 "FC0003.jpg" / "03.png"
+    target_stem = Path(clean_name).stem.lower()
+    if target_stem:
+        for img in all_imgs:
+            if img.stem.lower() == target_stem:
+                return img
+
+    # 4. 序号等价匹配，例如导入 "3" / "03" / "FC3" / "03.jpg" 匹配 "FC0003.jpg" / "3.png"
+    want_idx = parse_image_index(clean_name)
+    if want_idx is None:
+        m = _PURE_IMG_INDEX_RE.match(target_stem or clean_name)
+        if m:
+            want_idx = int(m.group(1))
+    if want_idx is not None:
+        for img in all_imgs:
+            if parse_image_index(img.name) == want_idx:
+                return img
+        s1, s2 = str(want_idx), f"{want_idx:02d}"
+        for img in all_imgs:
+            st = img.stem
+            if st in (s1, s2) or st.startswith((f"{s1}_", f"{s2}_", f"{s1}-", f"{s2}-")):
+                return img
+
+    return None
+
+
 def resolve_image_name(idx, seg, all_imgs):
     """与 ProjectDetailWidget.resolve_segment_image_and_data 相同的匹配规则（只返回文件名）。"""
     if not all_imgs:
         return ""
     explicit = (seg.get("image_name") or "").strip() if isinstance(seg, dict) else ""
     if explicit:
-        for img in all_imgs:
-            if img.name == explicit:
-                return img.name
+        matched = match_explicit_image(explicit, all_imgs)
+        if matched is not None:
+            return matched.name
     s1, s2 = f"{idx + 1}", f"{idx + 1:02d}"
     for img in all_imgs:
         st = img.stem
@@ -200,6 +247,7 @@ def compute_project_batches(project_model, project_path, template_manager, confi
             if cand is not None and cand.is_file():
                 task_dict["end_image_name"] = end_name
                 task_dict["end_local_image_path"] = str(cand.resolve())
+                task_dict["mode"] = "VIDEO_FRAMES"
         all_tasks.append(task_dict)
 
     if not all_tasks:

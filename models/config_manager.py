@@ -177,6 +177,9 @@ class ConfigManager:
 
         # UI Theme mode ("light" or "dark")
         self.theme_mode = self.DEFAULT_THEME_MODE
+
+        # Remembered local unpacked browser extension directory for auto-sync
+        self.custom_extension_dir = ""
         
         self._load_dotenv()
         self.load()
@@ -327,6 +330,7 @@ class ConfigManager:
 
                     raw_theme = str(data.get("theme_mode", self.DEFAULT_THEME_MODE)).lower()
                     self.theme_mode = "dark" if raw_theme == "dark" else "light"
+                    self.custom_extension_dir = str(data.get("custom_extension_dir", "") or "").strip()
             except Exception as e:
                 print(f"Error loading config: {e}")
 
@@ -378,6 +382,7 @@ class ConfigManager:
             "default_video_model": self.default_video_model,
             "import_columns": list(self.import_columns) if getattr(self, "import_columns", None) else list(self.DEFAULT_IMPORT_COLUMNS),
             "theme_mode": getattr(self, "theme_mode", self.DEFAULT_THEME_MODE),
+            "custom_extension_dir": getattr(self, "custom_extension_dir", "") or data.get("custom_extension_dir", ""),
         })
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:

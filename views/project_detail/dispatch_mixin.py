@@ -477,6 +477,7 @@ class DispatchMixin:
                 task_dict["end_local_image_path"] = end_local_image_path
                 task_dict["end_image_data_url"] = end_image_data_url
                 task_dict["endImageDataUrl"] = end_image_data_url
+                task_dict["mode"] = "VIDEO_FRAMES"
 
             all_unprocessed_tasks.append(task_dict)
 

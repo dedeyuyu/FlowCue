@@ -43,6 +43,79 @@ class BulkEditMixin:
             if cur is not None:
                 self.on_table_selection_changed(cur, None)
 
+    def open_table_paste_import_dialog(self):
+        """针对当前选中的单个项目任务，从剪贴板表格导入「断行后的文案」与「图片名称」。"""
+        if not self.project_model or not self.project_path:
+            QMessageBox.information(
+                self,
+                "请先选中任务",
+                "该功能仅支持针对单个任务导入断行文案与图片名称。\n\n请先在左侧项目列表中点击选中一个任务！",
+            )
+            return
+
+        from views.table_segment_import_dialog import TableSegmentImportDialog
+
+        old_count = len(self.project_model.spanish_segments or [])
+        dlg = TableSegmentImportDialog(
+            project_model=self.project_model,
+            project_path=self.project_path,
+            config_manager=self.config_manager,
+            template_manager=self.template_manager,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_segments = dlg.build_new_segments()
+        if not new_segments:
+            return
+
+        # 严格用本次导入的 N 条有效分句替换原分句列表（例如原 15 条、导入 10 条 -> 精确变为 10 条，绝不残留多余空任务）
+        self.project_model.spanish_segments = new_segments
+        if not (self.project_model.spanish_text or "").strip():
+            self.project_model.spanish_text = "\n".join(s["text"] for s in new_segments)
+            if hasattr(self, "txt_spanish"):
+                self.txt_spanish.setPlainText(self.project_model.spanish_text)
+
+        if hasattr(self, "copied_rows"):
+            self.copied_rows.clear()
+        if hasattr(self, "dispatched_indices"):
+            self.dispatched_indices.clear()
+        self.failed_skip_indices = set()
+        self.segment_retry_counts = {}
+        self.current_prop_row = -1
+        self._compare_dirty = True
+
+        self.project_model.save()
+        self.populate_segments_table()
+
+        if self.table_segments.rowCount() > 0:
+            self.table_segments.selectRow(0)
+            first_item = self.table_segments.item(0, 0)
+            if first_item is not None:
+                self.table_segments.setCurrentItem(first_item)
+        else:
+            self.on_table_selection_changed(None, None)
+
+        # 刷新左侧项目列表的视频完整性状态颜色
+        main_win = self.window()
+        if main_win is not None and hasattr(main_win, "storage_manager") and hasattr(main_win, "_start_project_status_scan"):
+            try:
+                base_path = main_win.storage_manager.get_base_path()
+                if base_path:
+                    main_win._start_project_status_scan(main_win.storage_manager.list_projects(), base_path)
+            except Exception:
+                pass
+
+        QMessageBox.information(
+            self,
+            "表格导入成功",
+            f"✅ 已成功为任务「{self.project_model.project_id}」导入 {len(new_segments)} 个分句小任务（原 {old_count} 个）！\n\n"
+            "• 时长已根据每句文案字符数自动计算；\n"
+            "• 提示词继续沿用当前模板与运镜预设；\n"
+            "• 多余的旧分句已自动清理，无空任务残留。",
+        )
+
     def copy_segments_as_table(self):
         """把当前项目全部分句按 序号 / 文案 / 字数 / 时长 / 提示词 5 列复制为表格（TSV）格式。"""
         rows_cnt = self.table_segments.rowCount()

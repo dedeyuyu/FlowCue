@@ -458,10 +458,10 @@ class BatchExportDialog(QDialog):
             QMessageBox.warning(self, "提示", "本批次没有关联图片素材！")
             return
         
-        # Get the downloads directory from any task's local_image_path
+        # Get the downloads directory from any task's local_image_path or end_local_image_path
         downloads_dir = ""
         for item in batch:
-            local_path = item.get("local_image_path", "")
+            local_path = item.get("local_image_path", "") or item.get("end_local_image_path", "")
             if local_path:
                 downloads_dir = str(Path(local_path).parent)
                 break

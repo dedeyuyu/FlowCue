@@ -4,11 +4,15 @@
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 后台版本握手：用于检测「网页脚本已更新但插件后台仍是旧版本」的情况
   if (message.action === "getBgVersion") {
+    const loadedVer = (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "";
+    if (message.checkDiskUpdate) {
+      checkDiskManifestAndAutoReload(loadedVer).catch(() => {});
+    }
     // relay: true 表示本后台带有「WebSocket 中转」处理器（chrome.runtime.onConnect "flowcue-ws"），页面据此决定是否走中转
     sendResponse({
       version: "1.3.3-hosted-relay",
       relay: true,
-      ext_version: (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "",
+      ext_version: loadedVer,
       nativeDrag: !!(chrome.debugger && chrome.debugger.attach)
     });
     return;
@@ -229,6 +233,38 @@ async function getInstanceInfoUnsafe() {
     extension_id: chrome.runtime.id,
     user_agent: navigator.userAgent
   };
+}
+
+// ===== 本地已解压插件目录更新自检：磁盘 manifest.json 版本升级后自动 reload 刷新 chrome://extensions 版本号 =====
+let diskCheckInFlight = false;
+async function checkDiskManifestAndAutoReload(loadedVer) {
+  if (diskCheckInFlight || !loadedVer || !chrome.runtime.reload) return;
+  diskCheckInFlight = true;
+  try {
+    const resp = await fetch(chrome.runtime.getURL("manifest.json"), { cache: "no-store" });
+    if (!resp.ok) return;
+    const diskManifest = await resp.json();
+    const diskVer = String((diskManifest && diskManifest.version) || "").trim();
+    if (!diskVer || diskVer === loadedVer) return;
+
+    const stored = await chrome.storage.local.get(["flowcue_auto_reloaded_ver"]);
+    if (stored && stored.flowcue_auto_reloaded_ver === diskVer) return;
+
+    // 若当前本扩展有正在进行中的视频下载，暂缓重载以免中断下载
+    const activeDls = await chrome.downloads.search({ state: "in_progress" });
+    if (Array.isArray(activeDls) && activeDls.some(d => d && d.byExtensionId === chrome.runtime.id)) {
+      return;
+    }
+
+    await chrome.storage.local.set({ flowcue_auto_reloaded_ver: diskVer });
+    console.log(`[Background] 🔄 检测到本地插件目录已升级 (${loadedVer} -> ${diskVer})，自动重载扩展以刷新版本号...`);
+    setTimeout(() => {
+      try { chrome.runtime.reload(); } catch (_) {}
+    }, 300);
+  } catch (_) {
+  } finally {
+    diskCheckInFlight = false;
+  }
 }
 
 // 2.0 原生文件拖放（移植自 FlowStudio 插件的已验证方案）

@@ -16,6 +16,8 @@ class UploadMixin:
         if not self.plan:
             QMessageBox.information(self, "提示", "请先完成步骤 1 的任务分配。")
             return
+        if hasattr(self, "_sync_latest_project_presets"):
+            self._sync_latest_project_presets(self.batches)
         jobs = []   # [(entry, paths)]
         missing_local = 0
         for cid, entry in self.plan.items():
